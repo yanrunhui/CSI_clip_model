@@ -1,0 +1,13 @@
+train:
+  data_path: artifacts/d2los.pt
+  output_dir: artifacts/pretrain_d2los
+  save_every: 50
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  epochs: 100
+  temperature: 0.07
+  warmup_epochs: 5
+  min_lr: 1.0e-5
+  prototype_weight: 1.0
+  text_prototype_weight: 1.0

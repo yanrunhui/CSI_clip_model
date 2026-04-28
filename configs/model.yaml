@@ -1,0 +1,21 @@
+model:
+  d_token: 8
+  d_model: 384
+  d_clip: 256
+  n_heads: 6
+  n_layers: 6
+  d_ff: 1536
+  dropout: 0.1
+text:
+  vocab_size: 300
+  max_len: 48
+  d_model: 256
+  n_heads: 4
+  n_layers: 3
+  d_clip: 256
+  token_dropout: 0.1
+obs_classifier:
+  n_array_types: 2
+  n_ant_bins: 3
+  n_freq_bins: 3
+  n_bw_bins: 3

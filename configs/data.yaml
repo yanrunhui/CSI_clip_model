@@ -1,0 +1,12 @@
+dataset:
+  path: ./artifacts/preprocessed_samples.pt
+  max_caption_len: 48
+  n_freq_bins: 3
+  n_bw_bins: 3
+  group_size: 4
+  num_groups_per_batch: 32
+preprocess:
+  target_nf: 128
+  patch_1d: 4
+  patch_2d: [2, 2]
+  n_rx: 1
