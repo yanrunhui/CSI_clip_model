@@ -15,5 +15,5 @@ train:
   aux_regression_weight: 0.0
   multipositive_distance_threshold: 0.25
   multipositive_positive_mode: semantic_and_physics
+  min_class_size: 1
   min_class_size_for_multipositive: 2
-  sampler: random

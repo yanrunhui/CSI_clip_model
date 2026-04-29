@@ -8,7 +8,7 @@ from functools import partial
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,21 +91,11 @@ def build_prototype_bank(
     )
 
 
-def build_class_balanced_sampler(samples) -> WeightedRandomSampler:
-    key_counts = Counter(sample.semantic_key for sample in samples)
-    weights = torch.tensor(
-        [1.0 / key_counts[sample.semantic_key] for sample in samples],
-        dtype=torch.double,
-    )
-    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
-
 def build_components_from_samples(
     samples,
     device: torch.device,
     batch_size: int = 128,
     temperature: float = 0.07,
-    sampler: str = "random",
 ):
     source_samples = samples if isinstance(samples, list) else samples.samples
     tokenizer = CaptionTokenizer()
@@ -119,14 +109,10 @@ def build_components_from_samples(
     ) = build_prototype_bank(source_samples, tokenizer)
 
     dataset = SyntheticCSIDataset(source_samples) if isinstance(samples, list) else samples
-    if sampler not in ("random", "class_balanced"):
-        raise ValueError(f"Unsupported sampler={sampler!r}")
-    data_sampler = build_class_balanced_sampler(source_samples) if sampler == "class_balanced" else None
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=data_sampler is None,
-        sampler=data_sampler,
+        shuffle=True,
         collate_fn=partial(collate_fn, tokenizer=tokenizer, max_caption_len=48),
     )
 
@@ -150,6 +136,18 @@ def build_components_from_samples(
     return loader, model, tokenizer, prototype_bank
 
 
+def filter_samples_by_min_class_size(samples, min_class_size: int):
+    if min_class_size <= 1:
+        return samples
+    key_counts = Counter(sample.semantic_key for sample in samples)
+    filtered = [sample for sample in samples if key_counts[sample.semantic_key] >= min_class_size]
+    if not filtered:
+        raise ValueError(
+            f"No samples remain after filtering semantic classes with min_class_size={min_class_size}."
+        )
+    return filtered
+
+
 def build_demo_components(device: torch.device):
     caption_generator = CaptionGenerator()
     samples = build_synthetic_samples(128, caption_generator=caption_generator)
@@ -161,15 +159,23 @@ def build_real_components(
     device: torch.device,
     batch_size: int = 128,
     temperature: float = 0.07,
-    sampler: str = "random",
+    min_class_size: int = 1,
 ):
     dataset = PreprocessedCSIDataset.from_pt(data_path)
+    samples = filter_samples_by_min_class_size(dataset.samples, min_class_size=min_class_size)
+    if len(samples) != len(dataset.samples):
+        before_counts = Counter(sample.semantic_key for sample in dataset.samples)
+        after_counts = Counter(sample.semantic_key for sample in samples)
+        print(
+            f"filtered classes with min_class_size={min_class_size}: "
+            f"samples {len(dataset.samples)} -> {len(samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
     return build_components_from_samples(
-        dataset.samples,
+        samples,
         device=device,
         batch_size=batch_size,
         temperature=temperature,
-        sampler=sampler,
     )
 
 
@@ -234,7 +240,7 @@ def run_real_pretrain(
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
     min_class_size_for_multipositive: int,
-    sampler: str,
+    min_class_size: int,
     output_dir: str,
     save_every: int,
 ) -> None:
@@ -243,7 +249,7 @@ def run_real_pretrain(
         device=device,
         batch_size=batch_size,
         temperature=temperature,
-        sampler=sampler,
+        min_class_size=min_class_size,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = build_lr_scheduler(
@@ -286,7 +292,7 @@ def run_real_pretrain(
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
         f"min_class_size_for_multipositive={min_class_size_for_multipositive} "
-        f"sampler={sampler}"
+        f"min_class_size={min_class_size}"
     )
 
     output_path = Path(output_dir)
@@ -337,8 +343,8 @@ def run_real_pretrain(
                         "multipositive_distance_threshold": multipositive_distance_threshold,
                         "multipositive_positive_mode": multipositive_positive_mode,
                         "min_class_size_for_multipositive": min_class_size_for_multipositive,
+                        "min_class_size": min_class_size,
                         "multipositive_positive_count_mean": mean_positive_count,
-                        "sampler": sampler,
                         "lr": scheduler.get_last_lr()[0],
                     }
                 )
@@ -368,7 +374,7 @@ def run_real_pretrain(
                     "multipositive_distance_threshold": multipositive_distance_threshold,
                     "multipositive_positive_mode": multipositive_positive_mode,
                     "min_class_size_for_multipositive": min_class_size_for_multipositive,
-                    "sampler": sampler,
+                    "min_class_size": min_class_size,
                     "phase": f"csi_clip_{text_mode}_text",
                 },
             }
@@ -400,8 +406,12 @@ def main() -> None:
         "--multipositive-positive-mode",
         choices=["semantic_and_physics", "semantic_or_physics", "semantic", "physics"],
     )
+    parser.add_argument(
+        "--min-class-size",
+        type=int,
+        help="Drop semantic classes with fewer than this many samples before training.",
+    )
     parser.add_argument("--min-class-size-for-multipositive", type=int)
-    parser.add_argument("--sampler", choices=["random", "class_balanced"])
     parser.add_argument("--output-dir", type=str)
     parser.add_argument("--save-every", type=int)
     args = parser.parse_args()
@@ -459,7 +469,11 @@ def main() -> None:
         if args.min_class_size_for_multipositive is not None
         else int(cfg_get(train_cfg, "min_class_size_for_multipositive", 2))
     )
-    sampler = args.sampler if args.sampler is not None else str(cfg_get(train_cfg, "sampler", "random"))
+    min_class_size = (
+        args.min_class_size
+        if args.min_class_size is not None
+        else int(cfg_get(train_cfg, "min_class_size", 1))
+    )
     output_dir = args.output_dir if args.output_dir is not None else str(cfg_get(train_cfg, "output_dir", "artifacts/pretrain_csi_clip"))
     save_every = args.save_every if args.save_every is not None else int(cfg_get(train_cfg, "save_every", 1))
 
@@ -494,7 +508,7 @@ def main() -> None:
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
-            sampler=sampler,
+            min_class_size=min_class_size,
             output_dir=output_dir,
             save_every=save_every,
         )

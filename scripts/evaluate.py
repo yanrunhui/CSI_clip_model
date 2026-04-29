@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from functools import partial
 from pathlib import Path
 
@@ -99,6 +100,26 @@ def _infer_text_mode(checkpoint: dict | None, override: str | None) -> str:
     return "prototype"
 
 
+def _infer_min_class_size(checkpoint: dict | None, override: int | None) -> int:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        return int(checkpoint.get("args", {}).get("min_class_size", 1))
+    return 1
+
+
+def filter_samples_by_min_class_size(samples, min_class_size: int):
+    if min_class_size <= 1:
+        return samples
+    key_counts = Counter(sample.semantic_key for sample in samples)
+    filtered = [sample for sample in samples if key_counts[sample.semantic_key] >= min_class_size]
+    if not filtered:
+        raise ValueError(
+            f"No samples remain after filtering semantic classes with min_class_size={min_class_size}."
+        )
+    return filtered
+
+
 @torch.no_grad()
 def evaluate(
     data_path: str,
@@ -106,17 +127,28 @@ def evaluate(
     batch_size: int,
     device: torch.device,
     text_mode_override: str | None = None,
+    min_class_size_override: int | None = None,
 ) -> None:
     dataset = PreprocessedCSIDataset.from_pt(data_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False) if checkpoint_path else None
     text_mode = _infer_text_mode(checkpoint, text_mode_override)
-    tokenizer = build_tokenizer(dataset.samples, checkpoint)
+    min_class_size = _infer_min_class_size(checkpoint, min_class_size_override)
+    samples = filter_samples_by_min_class_size(dataset.samples, min_class_size=min_class_size)
+    if len(samples) != len(dataset.samples):
+        before_counts = Counter(sample.semantic_key for sample in dataset.samples)
+        after_counts = Counter(sample.semantic_key for sample in samples)
+        print(
+            f"filtered classes with min_class_size={min_class_size}: "
+            f"samples {len(dataset.samples)} -> {len(samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
+    tokenizer = build_tokenizer(samples, checkpoint)
     prototype_keys, prototype_token_ids, prototype_token_mask, prototype_label_map = build_prototype_bank(
-        dataset.samples,
+        samples,
         tokenizer,
     )
     loader = DataLoader(
-        dataset,
+        PreprocessedCSIDataset(samples),
         batch_size=batch_size,
         shuffle=False,
         collate_fn=partial(collate_fn, tokenizer=tokenizer, max_caption_len=48),
@@ -218,6 +250,7 @@ def evaluate(
     print(f"eval_text_to_prototype_loss={float(text_prototype_loss):.4f}")
     print(f"logit_scale={logit_scale:.4f}")
     print(f"text_mode={text_mode}")
+    print(f"min_class_size={min_class_size}")
     print(f"semantic_prototypes={len(prototype_keys)}")
     _print_retrieval_metrics(text_metric_prefix, logits, text_labels)
     _print_physics_regression_metrics(
@@ -382,9 +415,21 @@ def main() -> None:
     parser.add_argument("--checkpoint")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--text-mode", choices=["prototype", "instance", "multipositive"])
+    parser.add_argument(
+        "--min-class-size",
+        type=int,
+        help="Drop semantic classes with fewer than this many samples before evaluation. Defaults to checkpoint args.",
+    )
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    evaluate(args.data_path, args.checkpoint, args.batch_size, device, text_mode_override=args.text_mode)
+    evaluate(
+        args.data_path,
+        args.checkpoint,
+        args.batch_size,
+        device,
+        text_mode_override=args.text_mode,
+        min_class_size_override=args.min_class_size,
+    )
 
 
 if __name__ == "__main__":
