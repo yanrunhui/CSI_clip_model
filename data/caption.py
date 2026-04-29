@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import random
+from typing import Any
 
 from .semantic_key import SemanticKey, semantic_field_choices
 
@@ -237,6 +239,80 @@ class CaptionGenerator:
             "and first path arrival sector is {first_angle}. "
             "Reflection count is {reflection} and diffraction count is {diffraction}."
         ).format(**slots)
+
+    @staticmethod
+    def _finite_float(value: Any) -> float | None:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _format_value(value: Any, unit: str = "", scale: float = 1.0, decimals: int = 1) -> str:
+        finite = CaptionGenerator._finite_float(value)
+        if finite is None:
+            return "unknown"
+        scaled = finite * scale
+        formatted = f"{scaled:.{decimals}f}".rstrip("0").rstrip(".")
+        return f"{formatted} {unit}".strip()
+
+    @staticmethod
+    def _format_count(value: Any) -> str:
+        finite = CaptionGenerator._finite_float(value)
+        if finite is None:
+            return "unknown"
+        return str(max(int(round(finite)), 0))
+
+    def generate_instance(
+        self,
+        key: SemanticKey,
+        *,
+        n_paths: int,
+        delay_spread_s: float,
+        azimuth_spread_deg: float,
+        k_factor_db: float,
+        first_path_delay_s: float,
+        first_path_power_dbw: float,
+        first_path_aoa_az_deg: float,
+        reflection_count: int,
+        diffraction_count: int,
+        config_key: str | None = None,
+        subcarrier_spacing_hz: float | None = None,
+    ) -> str:
+        config_clause = f", {config_key}" if config_key else ""
+        spacing_clause = ""
+        if subcarrier_spacing_hz is not None:
+            spacing_clause = f" SCS {self._format_value(subcarrier_spacing_hz, 'Hz', decimals=1)}."
+        return (
+            f"Instance channel: {key.env_type} {key.los_status}{config_clause}, "
+            f"{self._format_count(n_paths)} paths. "
+            f"Delay spread {self._format_value(delay_spread_s, 'ns', scale=1e9)}; "
+            f"azimuth spread {self._format_value(azimuth_spread_deg, 'deg')}; "
+            f"K-factor {self._format_value(k_factor_db, 'dB')}. "
+            f"First path delay {self._format_value(first_path_delay_s, 'ns', scale=1e9)}, "
+            f"power {self._format_value(first_path_power_dbw, 'dBW')}, "
+            f"AoA {self._format_value(first_path_aoa_az_deg, 'deg')}. "
+            f"Interactions: {self._format_count(reflection_count)} reflections, "
+            f"{self._format_count(diffraction_count)} diffractions."
+            f"{spacing_clause}"
+        )
+
+    def generate_instance_from_sample(self, sample: Any) -> str:
+        return self.generate_instance(
+            sample.semantic_key,
+            n_paths=getattr(sample, "n_paths", 0),
+            delay_spread_s=getattr(sample, "delay_spread_s", 0.0),
+            azimuth_spread_deg=getattr(sample, "azimuth_spread_deg", 0.0),
+            k_factor_db=getattr(sample, "k_factor_db", 0.0),
+            first_path_delay_s=getattr(sample, "first_path_delay_s", math.nan),
+            first_path_power_dbw=getattr(sample, "first_path_power_dbw", math.nan),
+            first_path_aoa_az_deg=getattr(sample, "first_path_aoa_az_deg", math.nan),
+            reflection_count=getattr(sample, "reflection_count", 0),
+            diffraction_count=getattr(sample, "diffraction_count", 0),
+            config_key=getattr(sample, "config_key", None),
+            subcarrier_spacing_hz=getattr(sample, "subcarrier_spacing_hz", None),
+        )
 
     def generate(self, key: SemanticKey, semantic_field: str = "all") -> str:
         if semantic_field not in semantic_field_choices():

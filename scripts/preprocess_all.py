@@ -70,6 +70,7 @@ class LoadedScenarioDataset:
     phase: np.ndarray
     inter: np.ndarray
     ch_params: dict
+    group_ids: list[str] | None = None
 
 
 @dataclass
@@ -525,13 +526,66 @@ def _selected_rx_indices(
     rx_records: np.ndarray,
     max_rx_per_source: int | None,
     remaining_samples: int | None,
+    sampling: str = "sequential",
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     indices = np.flatnonzero(rx_records["path_count"] > 0)
+    if sampling == "uniform" and indices.size > 0:
+        rng = rng or np.random.default_rng()
+        sample_count = indices.size
+        if max_rx_per_source is not None:
+            sample_count = min(sample_count, max_rx_per_source)
+        if remaining_samples is not None:
+            sample_count = min(sample_count, remaining_samples)
+        if sample_count < indices.size:
+            indices = rng.choice(indices, size=sample_count, replace=False)
+            indices.sort()
+        return indices
     if max_rx_per_source is not None:
         indices = indices[:max_rx_per_source]
     if remaining_samples is not None:
         indices = indices[:remaining_samples]
     return indices
+
+
+def _source_group_id(d2los_root: Path, propbin_path: Path, rx_idx: int) -> str:
+    map_name = next((parent.name for parent in propbin_path.parents if parent.name.startswith("map_")), "map_unknown")
+    source_name = propbin_path.name.split(".")[0]
+    return f"{d2los_root.name}-{map_name}-{source_name}-rx_{int(rx_idx)}"
+
+
+def _uniform_file_allocations(
+    propbin_files: list[Path],
+    max_samples: int,
+    max_rx_per_source: int | None,
+    seed: int,
+) -> dict[Path, int]:
+    if max_samples <= 0:
+        return {}
+    cap_per_file = max_rx_per_source if max_rx_per_source is not None else max_samples
+    if cap_per_file <= 0:
+        return {}
+
+    rng = np.random.default_rng(seed)
+    shuffled = list(propbin_files)
+    rng.shuffle(shuffled)
+    allocations: dict[Path, int] = {}
+    remaining = max_samples
+
+    while remaining > 0 and shuffled:
+        made_progress = False
+        for path in shuffled:
+            if remaining <= 0:
+                break
+            current = allocations.get(path, 0)
+            if current >= cap_per_file:
+                continue
+            allocations[path] = current + 1
+            remaining -= 1
+            made_progress = True
+        if not made_progress:
+            break
+    return allocations
 
 
 def load_d2los_dataset(
@@ -545,6 +599,8 @@ def load_d2los_dataset(
     total_subcarriers: int,
     tx_power_dbm: float,
     tx_spacing: float = 0.5,
+    sampling: str = "sequential",
+    sample_seed: int = 0,
 ) -> LoadedScenarioDataset:
     if not d2los_root.exists():
         raise FileNotFoundError(f"D2Los root not found: {d2los_root}")
@@ -561,6 +617,8 @@ def load_d2los_dataset(
     )
     if not propbin_files:
         raise FileNotFoundError(f"No source_*.propbin(.gz) files found under {d2los_root}")
+    if sampling not in ("sequential", "uniform"):
+        raise ValueError(f"Unsupported D2Los sampling mode: {sampling}")
 
     selected_subcarriers = np.arange(total_subcarriers, dtype=np.int64)
     rx_shape = (1, 1)
@@ -575,7 +633,21 @@ def load_d2los_dataset(
     inter_codes: list[np.ndarray] = []
     los_values: list[int] = []
     num_paths: list[int] = []
+    group_ids: list[str] = []
     skipped_propbin_files = 0
+    rng = np.random.default_rng(sample_seed)
+    file_allocations = (
+        _uniform_file_allocations(
+            propbin_files=propbin_files,
+            max_samples=max_samples,
+            max_rx_per_source=max_rx_per_source,
+            seed=sample_seed,
+        )
+        if sampling == "uniform" and max_samples is not None
+        else None
+    )
+    if file_allocations is not None:
+        propbin_files = [path for path in propbin_files if file_allocations.get(path, 0) > 0]
 
     for propbin_path in propbin_files:
         if max_samples is not None and len(channels) >= max_samples:
@@ -586,11 +658,16 @@ def load_d2los_dataset(
             skipped_propbin_files += 1
             warnings.warn(f"Skipping unreadable RayVerse propbin file {propbin_path}: {exc}")
             continue
-        remaining = None if max_samples is None else max_samples - len(channels)
+        if file_allocations is not None:
+            remaining = min(file_allocations.get(propbin_path, 0), max_samples - len(channels))
+        else:
+            remaining = None if max_samples is None else max_samples - len(channels)
         rx_indices = _selected_rx_indices(
             propbin.rx_records,
             max_rx_per_source=max_rx_per_source,
             remaining_samples=remaining,
+            sampling=sampling,
+            rng=rng,
         )
         if rx_indices.size == 0:
             continue
@@ -641,6 +718,7 @@ def load_d2los_dataset(
             inter_codes.append(_interactions_as_reflection_code(interaction_counts))
             los_values.append(1 if np.any(interaction_counts == 0) else 0)
             num_paths.append(count)
+            group_ids.append(_source_group_id(d2los_root, propbin_path, int(rx_idx)))
 
             if max_samples is not None and len(channels) >= max_samples:
                 break
@@ -670,7 +748,10 @@ def load_d2los_dataset(
             "ue_antenna": {"shape": list(rx_shape), "spacing": tx_spacing},
             "ofdm": {"bandwidth": bandwidth_hz, "subcarriers": total_subcarriers},
             "selected_subcarriers": selected_subcarriers,
+            "d2los_sampling": sampling,
+            "d2los_sample_seed": sample_seed,
         },
+        group_ids=group_ids,
     )
 
 
@@ -1049,6 +1130,20 @@ def preprocess_deepmimo_dataset(
         from data.semantic_key import build_semantic_key
 
         semantic_key = build_semantic_key(observables)
+        instance_caption = caption_generator.generate_instance(
+            semantic_key,
+            n_paths=int(observables["n_paths"]),
+            delay_spread_s=float(observables["delay_spread"]),
+            azimuth_spread_deg=float(observables["azimuth_spread_deg"]),
+            k_factor_db=float(observables["k_factor_db"]),
+            first_path_delay_s=float(observables["first_path_delay"]),
+            first_path_power_dbw=float(observables["first_path_power_dbw"]),
+            first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
+            reflection_count=int(observables["reflection_count"]),
+            diffraction_count=int(observables["diffraction_count"]),
+            config_key=config_key,
+            subcarrier_spacing_hz=subcarrier_spacing_hz,
+        )
         samples.append(
             PreprocessedSample(
                 tokens=tokens,
@@ -1058,7 +1153,11 @@ def preprocess_deepmimo_dataset(
                 freq_bin=freq_bin,
                 bw_bin=bw_bin,
                 subcarrier_spacing_hz=subcarrier_spacing_hz,
-                group_id=f"{scenario}-rx-{idx}",
+                group_id=(
+                    dataset.group_ids[idx]
+                    if getattr(dataset, "group_ids", None) is not None
+                    else f"{scenario}-rx-{idx}"
+                ),
                 semantic_key=semantic_key,
                 config_label=0,
                 obs_array_label=array_label,
@@ -1066,6 +1165,7 @@ def preprocess_deepmimo_dataset(
                 obs_freq_label=freq_bin,
                 obs_bw_label=bw_bin,
                 prop_caption=caption_generator.generate(semantic_key),
+                instance_caption=instance_caption,
                 n_paths=int(observables["n_paths"]),
                 delay_spread_s=float(observables["delay_spread"]),
                 azimuth_spread_deg=float(observables["azimuth_spread_deg"]),
@@ -1102,6 +1202,14 @@ def main() -> None:
     parser.add_argument("--max-maps", type=int, help="D2Los only: maximum number of map_* directories.")
     parser.add_argument("--max-sources-per-map", type=int, help="D2Los only: maximum source files per map.")
     parser.add_argument("--max-rx-per-source", type=int, help="D2Los only: maximum RX points per source file.")
+    parser.add_argument(
+        "--d2los-sampling",
+        type=str,
+        choices=["sequential", "uniform"],
+        default="sequential",
+        help="D2Los only: sequential keeps old file-order sampling; uniform spreads samples across source files.",
+    )
+    parser.add_argument("--d2los-sample-seed", type=int, default=0, help="D2Los uniform sampling seed.")
     parser.add_argument("--tx-shape", type=int, nargs=2, default=[8, 8], help="D2Los synthetic TX array shape.")
     parser.add_argument("--bandwidth-hz", type=float, default=100e6, help="D2Los synthetic OFDM bandwidth.")
     parser.add_argument("--total-subcarriers", type=int, default=128, help="D2Los synthetic OFDM subcarriers.")
@@ -1153,6 +1261,8 @@ def main() -> None:
             bandwidth_hz=args.bandwidth_hz,
             total_subcarriers=args.total_subcarriers,
             tx_power_dbm=args.tx_power_dbm,
+            sampling=args.d2los_sampling,
+            sample_seed=args.d2los_sample_seed,
         )
         scenario_name = scenario_name or d2los_root.name
     else:

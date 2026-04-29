@@ -21,6 +21,8 @@ That command builds a synthetic batch, runs a forward pass, computes losses, and
 
 ## D2Los / RayVerse data
 
+RayVerse dataset repository: https://github.com/UNIC-Lab/RayVerse.git
+
 Convert the imported `D2Los_Data` tree to the unified training `.pt` format first:
 
 ```bash

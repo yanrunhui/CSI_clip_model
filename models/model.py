@@ -13,6 +13,7 @@ class CSIClip(nn.Module):
         num_prototypes: int | None = None,
         embed_dim: int = 256,
         temperature: float = 0.07,
+        num_physics_targets: int = 9,
         output_dict: bool = True,
     ):
         super().__init__()
@@ -20,6 +21,7 @@ class CSIClip(nn.Module):
         self.csi = csi_encoder
         self.text = text_encoder
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+        self.physics_head = nn.Linear(embed_dim, num_physics_targets)
         self.prototypes = None
         if num_prototypes is not None:
             self.prototypes = nn.Parameter(torch.randn(num_prototypes, embed_dim) * 0.02)
@@ -57,6 +59,9 @@ class CSIClip(nn.Module):
         if self.prototypes is None:
             raise RuntimeError("This CSIClip instance was created without learnable prototypes.")
         return F.normalize(self.prototypes, dim=-1) if normalize else self.prototypes
+
+    def predict_physics(self, csi_features: torch.Tensor) -> torch.Tensor:
+        return self.physics_head(csi_features)
 
     def forward(self, batch: dict[str, torch.Tensor | dict[str, torch.Tensor] | list[str]]):
         csi_features = self.encode_csi(
