@@ -20,9 +20,11 @@ from data.dataset import (
     PHYSICS_TARGET_OFFSETS,
     PHYSICS_TARGET_SCALES,
     PreprocessedCSIDataset,
+    apply_semantic_key_mode,
     collate_fn,
+    semantic_key_mode_choices,
 )
-from data.semantic_key import SemanticKey
+from data.semantic_key import SemanticKey, default_attribute_fields, semantic_key_field_choices
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
 from models.model import CSIClip
@@ -108,6 +110,45 @@ def _infer_min_class_size(checkpoint: dict | None, override: int | None) -> int:
     return 1
 
 
+def _infer_semantic_key_mode(checkpoint: dict | None, override: str | None) -> str:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        return str(checkpoint.get("args", {}).get("semantic_key_mode", "full"))
+    return "full"
+
+
+def _infer_attribute_fields(checkpoint: dict | None, override: tuple[str, ...] | None = None) -> tuple[str, ...]:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        fields = checkpoint.get("args", {}).get("attribute_classifier_fields")
+        if fields:
+            return tuple(str(field) for field in fields)
+    return default_attribute_fields()
+
+
+def build_attribute_label_maps(samples, fields: tuple[str, ...]) -> dict[str, dict[str, int]]:
+    label_maps = {}
+    for field in fields:
+        values = sorted({str(getattr(sample.semantic_key, field)) for sample in samples})
+        label_maps[field] = {value: idx for idx, value in enumerate(values)}
+    return label_maps
+
+
+def _load_model_state_compatible(model: torch.nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    model_state = model.state_dict()
+    compatible_state = {
+        name: value
+        for name, value in state_dict.items()
+        if name in model_state and model_state[name].shape == value.shape
+    }
+    skipped = sorted(set(state_dict) - set(compatible_state))
+    model.load_state_dict(compatible_state, strict=False)
+    if skipped:
+        print(f"skipped_incompatible_checkpoint_keys={','.join(skipped)}")
+
+
 def filter_samples_by_min_class_size(samples, min_class_size: int):
     if min_class_size <= 1:
         return samples
@@ -128,18 +169,30 @@ def evaluate(
     device: torch.device,
     text_mode_override: str | None = None,
     min_class_size_override: int | None = None,
+    semantic_key_mode_override: str | None = None,
+    attribute_fields_override: tuple[str, ...] | None = None,
 ) -> None:
     dataset = PreprocessedCSIDataset.from_pt(data_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False) if checkpoint_path else None
     text_mode = _infer_text_mode(checkpoint, text_mode_override)
     min_class_size = _infer_min_class_size(checkpoint, min_class_size_override)
-    samples = filter_samples_by_min_class_size(dataset.samples, min_class_size=min_class_size)
-    if len(samples) != len(dataset.samples):
+    semantic_key_mode = _infer_semantic_key_mode(checkpoint, semantic_key_mode_override)
+    attribute_fields = _infer_attribute_fields(checkpoint, attribute_fields_override)
+    mode_samples = apply_semantic_key_mode(dataset.samples, semantic_key_mode)
+    if semantic_key_mode != "full":
         before_counts = Counter(sample.semantic_key for sample in dataset.samples)
+        after_counts = Counter(sample.semantic_key for sample in mode_samples)
+        print(
+            f"semantic_key_mode={semantic_key_mode}: "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
+    samples = filter_samples_by_min_class_size(mode_samples, min_class_size=min_class_size)
+    if len(samples) != len(mode_samples):
+        before_counts = Counter(sample.semantic_key for sample in mode_samples)
         after_counts = Counter(sample.semantic_key for sample in samples)
         print(
             f"filtered classes with min_class_size={min_class_size}: "
-            f"samples {len(dataset.samples)} -> {len(samples)}, "
+            f"samples {len(mode_samples)} -> {len(samples)}, "
             f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
         )
     tokenizer = build_tokenizer(samples, checkpoint)
@@ -147,6 +200,7 @@ def evaluate(
         samples,
         tokenizer,
     )
+    attribute_label_maps = build_attribute_label_maps(samples, attribute_fields)
     loader = DataLoader(
         PreprocessedCSIDataset(samples),
         batch_size=batch_size,
@@ -158,12 +212,19 @@ def evaluate(
         PhysicsTextEncoder(vocab_size=max(tokenizer.next_id + 8, 300)),
         num_prototypes=len(prototype_keys),
         embed_dim=256,
+        num_physics_targets=len(PHYSICS_TARGET_NAMES),
+        attribute_num_classes={
+            field: len(label_map)
+            for field, label_map in attribute_label_maps.items()
+        },
     ).to(device)
     if checkpoint is not None:
-        model.load_state_dict(checkpoint["model_state"], strict=False)
+        _load_model_state_compatible(model, checkpoint["model_state"])
     model.eval()
 
     all_csi_features = []
+    all_attribute_logits = {field: [] for field in attribute_label_maps}
+    all_attribute_labels = {field: [] for field in attribute_label_maps}
     all_instance_text_features = []
     all_physics_predictions = []
     all_physics_targets = []
@@ -184,6 +245,14 @@ def evaluate(
             normalize=True,
         )
         all_csi_features.append(csi_features.cpu())
+        if attribute_label_maps:
+            attribute_logits = model.predict_attributes(csi_features)
+            for field, label_map in attribute_label_maps.items():
+                all_attribute_logits[field].append(attribute_logits[field].cpu())
+                all_attribute_labels[field].extend(
+                    label_map[str(getattr(key, field))]
+                    for key in batch["semantic_keys"]
+                )
         physics_predictions = model.predict_physics(csi_features)
         all_physics_predictions.append(physics_predictions.cpu())
         all_physics_targets.append(batch["physics_targets"].cpu())
@@ -206,6 +275,16 @@ def evaluate(
     ).cpu()
     prototype_features = model.encode_prototypes(normalize=True).cpu()
     csi_features = torch.cat(all_csi_features, dim=0)
+    attribute_logits = {
+        field: torch.cat(chunks, dim=0)
+        for field, chunks in all_attribute_logits.items()
+        if chunks
+    }
+    attribute_labels = {
+        field: torch.tensor(values, dtype=torch.long)
+        for field, values in all_attribute_labels.items()
+        if values
+    }
     physics_predictions = torch.cat(all_physics_predictions, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
@@ -250,9 +329,18 @@ def evaluate(
     print(f"eval_text_to_prototype_loss={float(text_prototype_loss):.4f}")
     print(f"logit_scale={logit_scale:.4f}")
     print(f"text_mode={text_mode}")
+    print(f"semantic_key_mode={semantic_key_mode}")
     print(f"min_class_size={min_class_size}")
     print(f"semantic_prototypes={len(prototype_keys)}")
+    if checkpoint is not None and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0:
+        print(f"attribute_classifier_fields={','.join(attribute_fields)}")
     _print_retrieval_metrics(text_metric_prefix, logits, text_labels)
+    if checkpoint is not None and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0:
+        _print_attribute_classifier_metrics(
+            attribute_logits,
+            attribute_labels,
+            attribute_label_maps,
+        )
     _print_physics_regression_metrics(
         physics_predictions=physics_predictions,
         physics_raw_targets=physics_raw_targets,
@@ -309,6 +397,76 @@ def _print_retrieval_metrics(prefix: str, logits: torch.Tensor, labels: torch.Te
         print(f"{prefix}_R@{k}={hits:.4f}")
     print(f"{prefix}_MRR={float((1.0 / target_ranks.float()).mean()):.4f}")
     print(f"{prefix}_mean_rank={float(target_ranks.float().mean()):.2f}")
+
+
+def _safe_pearson(x: torch.Tensor, y: torch.Tensor) -> float:
+    if x.numel() < 2:
+        return 0.0
+    x = x.float() - x.float().mean()
+    y = y.float() - y.float().mean()
+    denom = torch.linalg.vector_norm(x) * torch.linalg.vector_norm(y)
+    if float(denom) == 0.0:
+        return 0.0
+    return float((x * y).sum() / denom)
+
+
+def _print_attribute_classifier_metrics(
+    attribute_logits: dict[str, torch.Tensor],
+    attribute_labels: dict[str, torch.Tensor],
+    attribute_label_maps: dict[str, dict[str, int]],
+) -> None:
+    for field, logits in attribute_logits.items():
+        labels = attribute_labels[field]
+        predictions = logits.argmax(dim=1)
+        label_map = attribute_label_maps[field]
+        id_to_value = {idx: value for value, idx in label_map.items()}
+        num_classes = len(label_map)
+        confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
+        for true_label, pred_label in zip(labels.tolist(), predictions.tolist()):
+            confusion[int(true_label), int(pred_label)] += 1
+
+        class_sizes = confusion.sum(dim=1)
+        class_correct = confusion.diag()
+        nonempty = class_sizes > 0
+        class_accuracy = torch.zeros(num_classes, dtype=torch.float32)
+        class_accuracy[nonempty] = class_correct[nonempty].float() / class_sizes[nonempty].float()
+        top1 = (predictions == labels).float().mean()
+        macro_acc = class_accuracy[nonempty].mean() if bool(nonempty.any()) else torch.zeros(())
+        majority_label = int(class_sizes.argmax().item())
+        majority_acc = float(class_sizes[majority_label]) / max(int(class_sizes.sum().item()), 1)
+
+        print(f"attribute_classifier_{field}_loss={float(F.cross_entropy(logits, labels)):.4f}")
+        print(f"attribute_classifier_{field}_top1={float(top1):.4f}")
+        print(f"attribute_classifier_{field}_macro_top1={float(macro_acc):.4f}")
+        print(f"attribute_classifier_{field}_majority_baseline_R@1={majority_acc:.4f}")
+        print(f"attribute_classifier_{field}_majority_value={id_to_value[majority_label]}")
+        print(
+            f"attribute_classifier_{field}_class_size_accuracy_pearson="
+            f"{_safe_pearson(class_sizes[nonempty].float(), class_accuracy[nonempty]):.4f}"
+        )
+        for class_idx in range(num_classes):
+            print(
+                f"attribute_classifier_{field}_value_{id_to_value[class_idx]}="
+                f"size:{int(class_sizes[class_idx])} "
+                f"acc:{float(class_accuracy[class_idx]):.4f}"
+            )
+
+        offdiag = confusion.clone()
+        offdiag.fill_diagonal_(0)
+        flat_counts = offdiag.flatten()
+        top_confusions = torch.argsort(flat_counts, descending=True)
+        printed = 0
+        for flat_idx_tensor in top_confusions:
+            count = int(flat_counts[int(flat_idx_tensor)].item())
+            if count <= 0 or printed >= min(5, num_classes * num_classes):
+                break
+            true_label = int(flat_idx_tensor.item() // num_classes)
+            pred_label = int(flat_idx_tensor.item() % num_classes)
+            printed += 1
+            print(
+                f"attribute_classifier_{field}_confusion_pair_rank_{printed}="
+                f"true:{id_to_value[true_label]} pred:{id_to_value[pred_label]} count:{count}"
+            )
 
 
 def _print_semantic_retrieval_metrics(
@@ -398,15 +556,38 @@ def _print_physics_regression_metrics(
 ) -> None:
     raw_predictions = physics_predictions * PHYSICS_TARGET_SCALES + PHYSICS_TARGET_OFFSETS
     errors = (raw_predictions - physics_raw_targets).abs()
-    masked_errors = torch.where(physics_masks, errors, torch.zeros_like(errors))
-    total_mae = masked_errors.sum() / physics_masks.sum().clamp(min=1)
-    print(f"physics_regression_MAE_mean={float(total_mae):.4f}")
+    mae_values = []
+    angle_sin_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_sin")
+    angle_cos_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_cos")
     for idx, name in enumerate(PHYSICS_TARGET_NAMES):
+        if name in {"first_path_aoa_az_sin", "first_path_aoa_az_cos"}:
+            continue
         mask = physics_masks[:, idx]
         if not bool(mask.any()):
             continue
         mae = errors[:, idx][mask].mean()
+        mae_values.append(mae)
         print(f"physics_regression_{name}_MAE={float(mae):.4f}")
+    angle_mask = physics_masks[:, angle_sin_idx] & physics_masks[:, angle_cos_idx]
+    if bool(angle_mask.any()):
+        pred_angle = torch.atan2(
+            raw_predictions[:, angle_sin_idx],
+            raw_predictions[:, angle_cos_idx],
+        )
+        target_angle = torch.atan2(
+            physics_raw_targets[:, angle_sin_idx],
+            physics_raw_targets[:, angle_cos_idx],
+        )
+        delta = pred_angle - target_angle
+        circular_errors = torch.rad2deg(torch.atan2(torch.sin(delta), torch.cos(delta)).abs())
+        circular_mae = circular_errors[angle_mask].mean()
+        mae_values.append(circular_mae)
+        print(f"physics_regression_first_path_aoa_az_deg_MAE={float(circular_mae):.4f}")
+    if mae_values:
+        total_mae = torch.stack(mae_values).mean()
+    else:
+        total_mae = torch.zeros(())
+    print(f"physics_regression_MAE_mean={float(total_mae):.4f}")
 
 
 def main() -> None:
@@ -416,9 +597,20 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--text-mode", choices=["prototype", "instance", "multipositive"])
     parser.add_argument(
+        "--semantic-key-mode",
+        choices=semantic_key_mode_choices(),
+        help="Semantic key granularity for evaluation. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
         "--min-class-size",
         type=int,
         help="Drop semantic classes with fewer than this many samples before evaluation. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
+        "--attribute-classifier-fields",
+        nargs="+",
+        choices=semantic_key_field_choices(),
+        help="SemanticKey fields for attribute classifier evaluation. Defaults to checkpoint args.",
     )
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -429,6 +621,8 @@ def main() -> None:
         device,
         text_mode_override=args.text_mode,
         min_class_size_override=args.min_class_size,
+        semantic_key_mode_override=args.semantic_key_mode,
+        attribute_fields_override=tuple(args.attribute_classifier_fields) if args.attribute_classifier_fields else None,
     )
 
 

@@ -103,6 +103,25 @@ SEMANTIC_FIELD_KEY_FIELDS = {
     "interaction": ("reflection_bin", "diffraction_bin"),
 }
 
+SEMANTIC_KEY_FIELDS = tuple(SemanticKey.__dataclass_fields__)
+
+DEFAULT_ATTRIBUTE_FIELDS = (
+    "los_status",
+    "path_richness",
+    "k_factor_bin",
+    "first_delay_bin",
+    "first_power_bin",
+    "first_angle_bin",
+)
+
+
+def semantic_key_field_choices() -> tuple[str, ...]:
+    return SEMANTIC_KEY_FIELDS
+
+
+def default_attribute_fields() -> tuple[str, ...]:
+    return DEFAULT_ATTRIBUTE_FIELDS
+
 
 def semantic_field_choices() -> tuple[str, ...]:
     return tuple(SEMANTIC_FIELD_KEY_FIELDS)

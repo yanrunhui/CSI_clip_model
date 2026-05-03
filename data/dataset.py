@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import torch
@@ -10,6 +10,16 @@ from .caption import CaptionGenerator
 from .semantic_key import SemanticKey
 from .tokenizer import CaptionTokenizer
 
+SEMANTIC_KEY_MODES = (
+    "full",
+    "coarse",
+    "coarse_delay",
+    "coarse_angle",
+    "coarse_k",
+    "coarse_k_angle",
+    "coarse_interaction",
+)
+
 PHYSICS_TARGET_NAMES = (
     "n_paths",
     "delay_spread_ns",
@@ -17,18 +27,25 @@ PHYSICS_TARGET_NAMES = (
     "k_factor_db",
     "first_path_delay_ns",
     "first_path_power_dbw",
-    "first_path_aoa_az_deg",
+    "first_path_aoa_az_sin",
+    "first_path_aoa_az_cos",
     "reflection_count",
     "diffraction_count",
 )
 
+PHYSICS_AUX_TARGET_ALIASES = {
+    "first_path_aoa_az_deg": ("first_path_aoa_az_sin", "first_path_aoa_az_cos"),
+}
+
+PHYSICS_AUX_TARGET_CHOICES = ("all", *PHYSICS_TARGET_NAMES, *PHYSICS_AUX_TARGET_ALIASES)
+
 PHYSICS_TARGET_SCALES = torch.tensor(
-    [10.0, 200.0, 90.0, 20.0, 3000.0, 30.0, 180.0, 10.0, 10.0],
+    [10.0, 200.0, 90.0, 20.0, 3000.0, 30.0, 1.0, 1.0, 10.0, 10.0],
     dtype=torch.float32,
 )
 
 PHYSICS_TARGET_OFFSETS = torch.tensor(
-    [0.0, 0.0, 0.0, 0.0, 0.0, -100.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0, -100.0, 0.0, 0.0, 0.0, 0.0],
     dtype=torch.float32,
 )
 
@@ -91,6 +108,12 @@ def _finite_or_nan(value: float | int) -> float:
 
 
 def physics_raw_values(sample: PreprocessedSample) -> torch.Tensor:
+    first_path_aoa_az_deg = _finite_or_nan(sample.first_path_aoa_az_deg)
+    first_path_aoa_az_rad = (
+        math.radians(first_path_aoa_az_deg)
+        if math.isfinite(first_path_aoa_az_deg)
+        else math.nan
+    )
     return torch.tensor(
         [
             _finite_or_nan(sample.n_paths),
@@ -99,7 +122,8 @@ def physics_raw_values(sample: PreprocessedSample) -> torch.Tensor:
             _finite_or_nan(sample.k_factor_db),
             _finite_or_nan(sample.first_path_delay_s) * 1e9,
             _finite_or_nan(sample.first_path_power_dbw),
-            _finite_or_nan(sample.first_path_aoa_az_deg),
+            math.sin(first_path_aoa_az_rad) if math.isfinite(first_path_aoa_az_rad) else math.nan,
+            math.cos(first_path_aoa_az_rad) if math.isfinite(first_path_aoa_az_rad) else math.nan,
             _finite_or_nan(sample.reflection_count),
             _finite_or_nan(sample.diffraction_count),
         ],
@@ -113,6 +137,73 @@ def normalize_physics_targets(raw_targets: torch.Tensor) -> tuple[torch.Tensor, 
     normalized = (safe_targets - PHYSICS_TARGET_OFFSETS) / PHYSICS_TARGET_SCALES
     normalized = torch.where(mask, normalized, torch.zeros_like(normalized))
     return normalized, mask
+
+
+def semantic_key_mode_choices() -> tuple[str, ...]:
+    return SEMANTIC_KEY_MODES
+
+
+def physics_aux_target_choices() -> tuple[str, ...]:
+    return PHYSICS_AUX_TARGET_CHOICES
+
+
+def expand_physics_aux_targets(targets: tuple[str, ...]) -> tuple[str, ...]:
+    if targets == ("all",):
+        return targets
+    expanded: list[str] = []
+    for target in targets:
+        expanded.extend(PHYSICS_AUX_TARGET_ALIASES.get(target, (target,)))
+    return tuple(dict.fromkeys(expanded))
+
+
+def semantic_key_for_mode(key: SemanticKey, mode: str) -> SemanticKey:
+    if mode == "full":
+        return key
+    if mode in {
+        "coarse",
+        "coarse_delay",
+        "coarse_angle",
+        "coarse_k",
+        "coarse_k_angle",
+        "coarse_interaction",
+    }:
+        return SemanticKey(
+            env_type=key.env_type,
+            los_status=key.los_status,
+            path_richness=key.path_richness,
+            ds_bin=key.ds_bin if mode == "coarse_delay" else "any",
+            as_az_bin=key.as_az_bin if mode in {"coarse_angle", "coarse_k_angle"} else "any",
+            k_factor_bin=key.k_factor_bin if mode in {"coarse_k", "coarse_k_angle"} else "any",
+            first_delay_bin=key.first_delay_bin,
+            first_power_bin=key.first_power_bin,
+            first_angle_bin=key.first_angle_bin,
+            reflection_bin=key.reflection_bin if mode == "coarse_interaction" else "any",
+            diffraction_bin=key.diffraction_bin if mode == "coarse_interaction" else "any",
+        )
+    raise ValueError(
+        f"Unsupported semantic_key_mode={mode!r}. "
+        f"Choose from: {', '.join(semantic_key_mode_choices())}"
+    )
+
+
+def apply_semantic_key_mode(samples: list[PreprocessedSample], mode: str) -> list[PreprocessedSample]:
+    if mode == "full":
+        return samples
+    generator = CaptionGenerator()
+    remapped = []
+    for sample in samples:
+        key = semantic_key_for_mode(sample.semantic_key, mode)
+        remapped_sample = replace(
+            sample,
+            semantic_key=key,
+            prop_caption=generator.generate(key),
+        )
+        remapped_sample = replace(
+            remapped_sample,
+            instance_caption=generator.generate_instance_from_sample(remapped_sample),
+        )
+        remapped.append(remapped_sample)
+    return remapped
 
 
 class SyntheticCSIDataset(Dataset[PreprocessedSample]):

@@ -16,8 +16,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data.caption import CaptionGenerator
-from data.dataset import PreprocessedCSIDataset, SyntheticCSIDataset, build_synthetic_samples, collate_fn
-from data.semantic_key import SemanticKey
+from data.dataset import (
+    PHYSICS_TARGET_NAMES,
+    PreprocessedCSIDataset,
+    SyntheticCSIDataset,
+    apply_semantic_key_mode,
+    build_synthetic_samples,
+    collate_fn,
+    expand_physics_aux_targets,
+    physics_aux_target_choices,
+    semantic_key_mode_choices,
+)
+from data.semantic_key import SemanticKey, default_attribute_fields, semantic_key_field_choices
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
 from models.model import CSIClip
@@ -38,6 +48,51 @@ def load_train_config(path: str | None) -> dict:
 def cfg_get(config: dict, key: str, fallback):
     value = config.get(key, fallback)
     return fallback if value is None else value
+
+
+def parse_aux_regression_targets(value) -> tuple[str, ...]:
+    if value is None:
+        return ("all",)
+    if isinstance(value, str):
+        targets = tuple(part.strip() for part in value.split(",") if part.strip())
+    else:
+        targets = tuple(str(part) for part in value)
+    if not targets:
+        return ("all",)
+    if "all" in targets:
+        if len(targets) > 1:
+            raise ValueError("--aux-regression-targets cannot combine 'all' with specific targets.")
+        return ("all",)
+    choices = physics_aux_target_choices()
+    unknown = [target for target in targets if target not in choices]
+    if unknown:
+        raise ValueError(
+            f"Unknown aux regression targets: {unknown}. "
+            f"Choose from: {', '.join(choices)}"
+        )
+    return expand_physics_aux_targets(targets)
+
+
+def aux_regression_indices(targets: tuple[str, ...]) -> tuple[int, ...] | None:
+    if targets == ("all",):
+        return None
+    return tuple(PHYSICS_TARGET_NAMES.index(target) for target in targets)
+
+
+def parse_attribute_fields(value) -> tuple[str, ...]:
+    if value is None:
+        return default_attribute_fields()
+    if isinstance(value, str):
+        fields = tuple(part.strip() for part in value.split(",") if part.strip())
+    else:
+        fields = tuple(str(part) for part in value)
+    unknown = [field for field in fields if field not in semantic_key_field_choices()]
+    if unknown:
+        raise ValueError(
+            f"Unknown attribute classifier fields: {unknown}. "
+            f"Choose from: {', '.join(semantic_key_field_choices())}"
+        )
+    return fields
 
 
 def semantic_key_sort_key(key: SemanticKey) -> tuple[str, ...]:
@@ -91,11 +146,27 @@ def build_prototype_bank(
     )
 
 
+def build_attribute_banks(samples, fields: tuple[str, ...]):
+    label_maps: dict[str, dict[str, int]] = {}
+    class_counts: dict[str, torch.Tensor] = {}
+    for field in fields:
+        values = sorted({str(getattr(sample.semantic_key, field)) for sample in samples})
+        label_map = {value: idx for idx, value in enumerate(values)}
+        counts = Counter(str(getattr(sample.semantic_key, field)) for sample in samples)
+        label_maps[field] = label_map
+        class_counts[field] = torch.tensor(
+            [counts[value] for value in values],
+            dtype=torch.long,
+        )
+    return label_maps, class_counts
+
+
 def build_components_from_samples(
     samples,
     device: torch.device,
     batch_size: int = 128,
     temperature: float = 0.07,
+    attribute_fields: tuple[str, ...] = (),
 ):
     source_samples = samples if isinstance(samples, list) else samples.samples
     tokenizer = CaptionTokenizer()
@@ -107,6 +178,10 @@ def build_components_from_samples(
         prototype_label_map,
         prototype_class_counts,
     ) = build_prototype_bank(source_samples, tokenizer)
+    attribute_label_maps, attribute_class_counts = build_attribute_banks(
+        source_samples,
+        attribute_fields,
+    )
 
     dataset = SyntheticCSIDataset(source_samples) if isinstance(samples, list) else samples
     loader = DataLoader(
@@ -124,6 +199,11 @@ def build_components_from_samples(
         num_prototypes=len(prototype_keys),
         embed_dim=256,
         temperature=temperature,
+        num_physics_targets=len(PHYSICS_TARGET_NAMES),
+        attribute_num_classes={
+            field: len(label_map)
+            for field, label_map in attribute_label_maps.items()
+        },
     ).to(device)
     prototype_bank = {
         "keys": prototype_keys,
@@ -132,6 +212,8 @@ def build_components_from_samples(
         "token_mask": prototype_token_mask,
         "label_map": prototype_label_map,
         "class_counts": prototype_class_counts,
+        "attribute_label_maps": attribute_label_maps,
+        "attribute_class_counts": attribute_class_counts,
     }
     return loader, model, tokenizer, prototype_bank
 
@@ -148,10 +230,20 @@ def filter_samples_by_min_class_size(samples, min_class_size: int):
     return filtered
 
 
-def build_demo_components(device: torch.device):
+def build_demo_components(
+    device: torch.device,
+    semantic_key_mode: str = "full",
+    attribute_fields: tuple[str, ...] = (),
+):
     caption_generator = CaptionGenerator()
     samples = build_synthetic_samples(128, caption_generator=caption_generator)
-    return build_components_from_samples(samples, device=device, batch_size=32)
+    samples = apply_semantic_key_mode(samples, semantic_key_mode)
+    return build_components_from_samples(
+        samples,
+        device=device,
+        batch_size=32,
+        attribute_fields=attribute_fields,
+    )
 
 
 def build_real_components(
@@ -160,15 +252,25 @@ def build_real_components(
     batch_size: int = 128,
     temperature: float = 0.07,
     min_class_size: int = 1,
+    semantic_key_mode: str = "full",
+    attribute_fields: tuple[str, ...] = (),
 ):
     dataset = PreprocessedCSIDataset.from_pt(data_path)
-    samples = filter_samples_by_min_class_size(dataset.samples, min_class_size=min_class_size)
-    if len(samples) != len(dataset.samples):
+    mode_samples = apply_semantic_key_mode(dataset.samples, semantic_key_mode)
+    if semantic_key_mode != "full":
         before_counts = Counter(sample.semantic_key for sample in dataset.samples)
+        after_counts = Counter(sample.semantic_key for sample in mode_samples)
+        print(
+            f"semantic_key_mode={semantic_key_mode}: "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
+    samples = filter_samples_by_min_class_size(mode_samples, min_class_size=min_class_size)
+    if len(samples) != len(mode_samples):
+        before_counts = Counter(sample.semantic_key for sample in mode_samples)
         after_counts = Counter(sample.semantic_key for sample in samples)
         print(
             f"filtered classes with min_class_size={min_class_size}: "
-            f"samples {len(dataset.samples)} -> {len(samples)}, "
+            f"samples {len(mode_samples)} -> {len(samples)}, "
             f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
         )
     return build_components_from_samples(
@@ -176,18 +278,29 @@ def build_real_components(
         device=device,
         batch_size=batch_size,
         temperature=temperature,
+        attribute_fields=attribute_fields,
     )
 
 
 def run_smoke_test(
     device: torch.device,
     text_mode: str = "prototype",
+    csi_to_text_weight: float = 1.0,
+    attribute_classifier_weight: float = 0.0,
+    attribute_classifier_fields: tuple[str, ...] = (),
+    attribute_classifier_class_weight: str = "none",
     aux_regression_weight: float = 0.0,
+    aux_regression_targets: tuple[str, ...] = ("all",),
     multipositive_distance_threshold: float = 0.25,
     multipositive_positive_mode: str = "semantic_and_physics",
     min_class_size_for_multipositive: int = 2,
+    semantic_key_mode: str = "full",
 ) -> None:
-    loader, model, _, prototype_bank = build_demo_components(device)
+    loader, model, _, prototype_bank = build_demo_components(
+        device,
+        semantic_key_mode=semantic_key_mode,
+        attribute_fields=attribute_classifier_fields,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
     scheduler = build_lr_scheduler(optimizer, total_epochs=2, warmup_epochs=1)
     trainer = Trainer(
@@ -198,6 +311,8 @@ def run_smoke_test(
         prototype_token_mask=prototype_bank["token_mask"],
         prototype_label_map=prototype_bank["label_map"],
         prototype_class_counts=prototype_bank["class_counts"],
+        attribute_label_maps=prototype_bank["attribute_label_maps"],
+        attribute_class_counts=prototype_bank["attribute_class_counts"],
     )
 
     for epoch in range(1, 3):
@@ -208,7 +323,11 @@ def run_smoke_test(
                 cfg=TrainConfig(
                     epochs=2,
                     text_mode=text_mode,
+                    csi_to_text_weight=csi_to_text_weight,
+                    attribute_classifier_weight=attribute_classifier_weight,
+                    attribute_classifier_class_weight=attribute_classifier_class_weight,
                     aux_regression_weight=aux_regression_weight,
+                    aux_regression_indices=aux_regression_indices(aux_regression_targets),
                     multipositive_distance_threshold=multipositive_distance_threshold,
                     multipositive_positive_mode=multipositive_positive_mode,
                     min_class_size_for_multipositive=min_class_size_for_multipositive,
@@ -234,13 +353,19 @@ def run_real_pretrain(
     warmup_epochs: int,
     min_lr: float,
     prototype_weight: float,
+    csi_to_text_weight: float,
     text_prototype_weight: float,
     text_mode: str,
+    attribute_classifier_weight: float,
+    attribute_classifier_fields: tuple[str, ...],
+    attribute_classifier_class_weight: str,
     aux_regression_weight: float,
+    aux_regression_targets: tuple[str, ...],
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
     min_class_size_for_multipositive: int,
     min_class_size: int,
+    semantic_key_mode: str,
     output_dir: str,
     save_every: int,
 ) -> None:
@@ -250,6 +375,8 @@ def run_real_pretrain(
         batch_size=batch_size,
         temperature=temperature,
         min_class_size=min_class_size,
+        semantic_key_mode=semantic_key_mode,
+        attribute_fields=attribute_classifier_fields,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = build_lr_scheduler(
@@ -262,10 +389,14 @@ def run_real_pretrain(
         lr=lr,
         weight_decay=weight_decay,
         epochs=epochs,
+        csi_to_text_weight=csi_to_text_weight,
         prototype_weight=prototype_weight,
         text_prototype_weight=text_prototype_weight,
         text_mode=text_mode,
+        attribute_classifier_weight=attribute_classifier_weight,
+        attribute_classifier_class_weight=attribute_classifier_class_weight,
         aux_regression_weight=aux_regression_weight,
+        aux_regression_indices=aux_regression_indices(aux_regression_targets),
         multipositive_distance_threshold=multipositive_distance_threshold,
         multipositive_positive_mode=multipositive_positive_mode,
         min_class_size_for_multipositive=min_class_size_for_multipositive,
@@ -278,6 +409,8 @@ def run_real_pretrain(
         prototype_token_mask=prototype_bank["token_mask"],
         prototype_label_map=prototype_bank["label_map"],
         prototype_class_counts=prototype_bank["class_counts"],
+        attribute_label_maps=prototype_bank["attribute_label_maps"],
+        attribute_class_counts=prototype_bank["attribute_class_counts"],
     )
 
     print(f"training on {data_path}")
@@ -287,12 +420,18 @@ def run_real_pretrain(
     )
     print(
         f"semantic_prototypes={len(prototype_bank['keys'])} "
+        f"csi_to_text_weight={csi_to_text_weight} "
         f"prototype_weight={prototype_weight} text_prototype_weight={text_prototype_weight} "
-        f"text_mode={text_mode} aux_regression_weight={aux_regression_weight} "
+        f"text_mode={text_mode} "
+        f"attribute_classifier_weight={attribute_classifier_weight} "
+        f"attribute_classifier_fields={','.join(attribute_classifier_fields)} "
+        f"attribute_classifier_class_weight={attribute_classifier_class_weight} "
+        f"aux_regression_weight={aux_regression_weight} "
+        f"aux_regression_targets={','.join(aux_regression_targets)} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
         f"min_class_size_for_multipositive={min_class_size_for_multipositive} "
-        f"min_class_size={min_class_size}"
+        f"min_class_size={min_class_size} semantic_key_mode={semantic_key_mode}"
     )
 
     output_path = Path(output_dir)
@@ -315,6 +454,7 @@ def run_real_pretrain(
         mean_csi_to_text = sum(m["loss_csi_to_text"] for m in epoch_metrics) / len(epoch_metrics)
         mean_csi_to_prototype = sum(m["loss_csi_to_prototype"] for m in epoch_metrics) / len(epoch_metrics)
         mean_text_to_prototype = sum(m["loss_text_to_prototype"] for m in epoch_metrics) / len(epoch_metrics)
+        mean_attribute_classifier = sum(m.get("loss_attribute_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_positive_count = sum(m.get("multipositive_positive_count_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_logit_scale = sum(m["logit_scale"] for m in epoch_metrics) / len(epoch_metrics)
@@ -322,7 +462,9 @@ def run_real_pretrain(
             f"epoch={epoch} steps={len(epoch_metrics)} "
             f"loss={mean_total:.4f} contrastive={mean_contrastive:.4f} "
             f"csi_to_text={mean_csi_to_text:.4f} csi_to_proto={mean_csi_to_prototype:.4f} "
-            f"text_to_proto={mean_text_to_prototype:.4f} aux_reg={mean_aux_regression:.4f} "
+            f"text_to_proto={mean_text_to_prototype:.4f} "
+            f"attr_cls={mean_attribute_classifier:.4f} "
+            f"aux_reg={mean_aux_regression:.4f} "
             f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
         )
         with log_path.open("a", encoding="utf-8") as f:
@@ -333,17 +475,24 @@ def run_real_pretrain(
                         "steps": len(epoch_metrics),
                         "loss_total": mean_total,
                         "contrastive_loss": mean_contrastive,
+                        "csi_to_text_weight": csi_to_text_weight,
                         "loss_csi_to_text": mean_csi_to_text,
                         "loss_csi_to_prototype": mean_csi_to_prototype,
                         "loss_text_to_prototype": mean_text_to_prototype,
+                        "loss_attribute_classifier": mean_attribute_classifier,
                         "loss_aux_regression": mean_aux_regression,
                         "logit_scale": mean_logit_scale,
                         "text_mode": text_mode,
+                        "attribute_classifier_weight": attribute_classifier_weight,
+                        "attribute_classifier_fields": list(attribute_classifier_fields),
+                        "attribute_classifier_class_weight": attribute_classifier_class_weight,
                         "aux_regression_weight": aux_regression_weight,
+                        "aux_regression_targets": list(aux_regression_targets),
                         "multipositive_distance_threshold": multipositive_distance_threshold,
                         "multipositive_positive_mode": multipositive_positive_mode,
                         "min_class_size_for_multipositive": min_class_size_for_multipositive,
                         "min_class_size": min_class_size,
+                        "semantic_key_mode": semantic_key_mode,
                         "multipositive_positive_count_mean": mean_positive_count,
                         "lr": scheduler.get_last_lr()[0],
                     }
@@ -367,14 +516,20 @@ def run_real_pretrain(
                     "temperature": temperature,
                     "warmup_epochs": warmup_epochs,
                     "min_lr": min_lr,
+                    "csi_to_text_weight": csi_to_text_weight,
                     "prototype_weight": prototype_weight,
                     "text_prototype_weight": text_prototype_weight,
                     "text_mode": text_mode,
+                    "attribute_classifier_weight": attribute_classifier_weight,
+                    "attribute_classifier_fields": list(attribute_classifier_fields),
+                    "attribute_classifier_class_weight": attribute_classifier_class_weight,
                     "aux_regression_weight": aux_regression_weight,
+                    "aux_regression_targets": list(aux_regression_targets),
                     "multipositive_distance_threshold": multipositive_distance_threshold,
                     "multipositive_positive_mode": multipositive_positive_mode,
                     "min_class_size_for_multipositive": min_class_size_for_multipositive,
                     "min_class_size": min_class_size,
+                    "semantic_key_mode": semantic_key_mode,
                     "phase": f"csi_clip_{text_mode}_text",
                 },
             }
@@ -397,10 +552,30 @@ def main() -> None:
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--warmup-epochs", type=int)
     parser.add_argument("--min-lr", type=float)
+    parser.add_argument("--csi-to-text-weight", type=float)
     parser.add_argument("--prototype-weight", type=float)
     parser.add_argument("--text-prototype-weight", type=float)
     parser.add_argument("--text-mode", choices=["prototype", "instance", "multipositive"])
+    parser.add_argument("--semantic-key-mode", choices=semantic_key_mode_choices())
+    parser.add_argument("--attribute-classifier-weight", type=float)
+    parser.add_argument(
+        "--attribute-classifier-fields",
+        nargs="+",
+        choices=semantic_key_field_choices(),
+        help="SemanticKey fields supervised by multi-head attribute classification.",
+    )
+    parser.add_argument(
+        "--attribute-classifier-class-weight",
+        choices=["none", "balanced"],
+        help="Optional per-attribute class weighting. balanced uses clipped inverse-sqrt frequency weights.",
+    )
     parser.add_argument("--aux-regression-weight", type=float)
+    parser.add_argument(
+        "--aux-regression-targets",
+        nargs="+",
+        choices=physics_aux_target_choices(),
+        help="Physics targets used by aux regression. Defaults to train config, or all.",
+    )
     parser.add_argument("--multipositive-distance-threshold", type=float)
     parser.add_argument(
         "--multipositive-positive-mode",
@@ -438,6 +613,11 @@ def main() -> None:
         else int(cfg_get(train_cfg, "warmup_epochs", 5))
     )
     min_lr = args.min_lr if args.min_lr is not None else float(cfg_get(train_cfg, "min_lr", 1e-5))
+    csi_to_text_weight = (
+        args.csi_to_text_weight
+        if args.csi_to_text_weight is not None
+        else float(cfg_get(train_cfg, "csi_to_text_weight", 1.0))
+    )
     prototype_weight = (
         args.prototype_weight
         if args.prototype_weight is not None
@@ -449,10 +629,37 @@ def main() -> None:
         else float(cfg_get(train_cfg, "text_prototype_weight", 1.0))
     )
     text_mode = args.text_mode if args.text_mode is not None else str(cfg_get(train_cfg, "text_mode", "prototype"))
+    semantic_key_mode = (
+        args.semantic_key_mode
+        if args.semantic_key_mode is not None
+        else str(cfg_get(train_cfg, "semantic_key_mode", "full"))
+    )
+    attribute_classifier_weight = (
+        args.attribute_classifier_weight
+        if args.attribute_classifier_weight is not None
+        else float(cfg_get(train_cfg, "attribute_classifier_weight", 0.0))
+    )
+    attribute_classifier_fields = parse_attribute_fields(
+        args.attribute_classifier_fields
+        if args.attribute_classifier_fields is not None
+        else cfg_get(train_cfg, "attribute_classifier_fields", default_attribute_fields())
+    )
+    attribute_classifier_class_weight = (
+        args.attribute_classifier_class_weight
+        if args.attribute_classifier_class_weight is not None
+        else str(cfg_get(train_cfg, "attribute_classifier_class_weight", "none"))
+    )
+    if attribute_classifier_class_weight not in ("none", "balanced"):
+        raise ValueError("--attribute-classifier-class-weight must be one of: none, balanced")
     aux_regression_weight = (
         args.aux_regression_weight
         if args.aux_regression_weight is not None
         else float(cfg_get(train_cfg, "aux_regression_weight", 0.0))
+    )
+    aux_regression_targets = parse_aux_regression_targets(
+        args.aux_regression_targets
+        if args.aux_regression_targets is not None
+        else cfg_get(train_cfg, "aux_regression_targets", "all")
     )
     multipositive_distance_threshold = (
         args.multipositive_distance_threshold
@@ -481,10 +688,16 @@ def main() -> None:
         run_smoke_test(
             device,
             text_mode=text_mode,
+            csi_to_text_weight=csi_to_text_weight,
+            attribute_classifier_weight=attribute_classifier_weight,
+            attribute_classifier_fields=attribute_classifier_fields,
+            attribute_classifier_class_weight=attribute_classifier_class_weight,
             aux_regression_weight=aux_regression_weight,
+            aux_regression_targets=aux_regression_targets,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
+            semantic_key_mode=semantic_key_mode,
         )
         return
 
@@ -501,14 +714,20 @@ def main() -> None:
             temperature=temperature,
             warmup_epochs=warmup_epochs,
             min_lr=min_lr,
+            csi_to_text_weight=csi_to_text_weight,
             prototype_weight=prototype_weight,
             text_prototype_weight=text_prototype_weight,
             text_mode=text_mode,
+            attribute_classifier_weight=attribute_classifier_weight,
+            attribute_classifier_fields=attribute_classifier_fields,
+            attribute_classifier_class_weight=attribute_classifier_class_weight,
             aux_regression_weight=aux_regression_weight,
+            aux_regression_targets=aux_regression_targets,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
             min_class_size=min_class_size,
+            semantic_key_mode=semantic_key_mode,
             output_dir=output_dir,
             save_every=save_every,
         )

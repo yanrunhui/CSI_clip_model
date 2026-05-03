@@ -21,10 +21,14 @@ class TrainConfig:
     lr: float = 3e-4
     weight_decay: float = 1e-2
     epochs: int = 100
+    csi_to_text_weight: float = 1.0
     prototype_weight: float = 1.0
     text_prototype_weight: float = 1.0
     text_mode: str = "prototype"
+    attribute_classifier_weight: float = 0.0
+    attribute_classifier_class_weight: str = "none"
     aux_regression_weight: float = 0.0
+    aux_regression_indices: tuple[int, ...] | None = None
     multipositive_distance_threshold: float = 0.25
     multipositive_positive_mode: str = "semantic_and_physics"
     min_class_size_for_multipositive: int = 2
@@ -40,6 +44,8 @@ class Trainer:
         prototype_token_mask: torch.Tensor,
         prototype_label_map: dict[object, int],
         prototype_class_counts: torch.Tensor | None = None,
+        attribute_label_maps: dict[str, dict[str, int]] | None = None,
+        attribute_class_counts: dict[str, torch.Tensor] | None = None,
         loss: PrototypeClipLoss | None = None,
     ):
         self.model = model
@@ -51,7 +57,29 @@ class Trainer:
         if prototype_class_counts is None:
             prototype_class_counts = torch.zeros(len(prototype_label_map), dtype=torch.long)
         self.prototype_class_counts = prototype_class_counts.to(device)
+        self.attribute_label_maps = attribute_label_maps or {}
+        self.attribute_class_counts = {
+            field: counts.to(device)
+            for field, counts in (attribute_class_counts or {}).items()
+        }
         self.loss = loss or PrototypeClipLoss()
+
+    def _attribute_targets(self, semantic_keys: list[object]) -> dict[str, torch.Tensor]:
+        targets = {}
+        for field, label_map in self.attribute_label_maps.items():
+            targets[field] = torch.tensor(
+                [label_map[str(getattr(key, field))] for key in semantic_keys],
+                device=self.device,
+                dtype=torch.long,
+            )
+        return targets
+
+    def _attribute_class_weight(self, field: str, dtype: torch.dtype) -> torch.Tensor | None:
+        counts = self.attribute_class_counts.get(field)
+        if counts is None:
+            return None
+        weights = torch.sqrt(counts.float().mean() / counts.float().clamp(min=1.0))
+        return weights.clamp(0.25, 4.0).to(device=self.device, dtype=dtype)
 
     @staticmethod
     def _multipositive_mask(
@@ -177,16 +205,45 @@ class Trainer:
             }
         else:
             raise ValueError(f"Unsupported text_mode={cfg.text_mode!r}")
+        if cfg.attribute_classifier_weight > 0:
+            attribute_logits = self.model.predict_attributes(csi_features)
+            attribute_targets = self._attribute_targets(batch["semantic_keys"])
+            attribute_losses = []
+            for field, targets in attribute_targets.items():
+                logits = attribute_logits[field]
+                class_weight = (
+                    self._attribute_class_weight(field, logits.dtype)
+                    if cfg.attribute_classifier_class_weight == "balanced"
+                    else None
+                )
+                field_loss = torch.nn.functional.cross_entropy(
+                    logits,
+                    targets,
+                    weight=class_weight,
+                )
+                losses[f"loss_attribute_{field}"] = field_loss
+                attribute_losses.append(field_loss)
+            if attribute_losses:
+                losses["loss_attribute_classifier"] = torch.stack(attribute_losses).mean()
         if physics_predictions is not None:
+            regression_predictions = physics_predictions
+            regression_targets = batch["physics_targets"]
+            regression_mask = batch["physics_target_mask"]
+            if cfg.aux_regression_indices:
+                indices = torch.tensor(cfg.aux_regression_indices, device=self.device, dtype=torch.long)
+                regression_predictions = regression_predictions.index_select(dim=1, index=indices)
+                regression_targets = regression_targets.index_select(dim=1, index=indices)
+                regression_mask = regression_mask.index_select(dim=1, index=indices)
             losses["loss_aux_regression"] = masked_regression_loss(
-                physics_predictions,
-                batch["physics_targets"],
-                batch["physics_target_mask"],
+                regression_predictions,
+                regression_targets,
+                regression_mask,
             )
         total_loss = (
-            losses["loss_csi_to_text"] +
+            cfg.csi_to_text_weight * losses["loss_csi_to_text"] +
             cfg.prototype_weight * losses["loss_csi_to_prototype"] +
             cfg.text_prototype_weight * losses["loss_text_to_prototype"] +
+            cfg.attribute_classifier_weight * losses.get("loss_attribute_classifier", torch.zeros((), device=self.device)) +
             cfg.aux_regression_weight * losses.get("loss_aux_regression", torch.zeros((), device=self.device))
         )
         total_loss.backward()
@@ -194,10 +251,12 @@ class Trainer:
         with torch.no_grad():
             self.model.logit_scale.clamp_(0, math.log(100))
         metrics = {name: float(value.detach()) for name, value in losses.items()}
+        metrics["csi_to_text_weight"] = float(cfg.csi_to_text_weight)
         metrics["prototype_weight"] = float(cfg.prototype_weight)
         metrics["text_prototype_weight"] = float(cfg.text_prototype_weight)
         metrics["text_mode_instance"] = float(cfg.text_mode == "instance")
         metrics["text_mode_multipositive"] = float(cfg.text_mode == "multipositive")
+        metrics["attribute_classifier_weight"] = float(cfg.attribute_classifier_weight)
         metrics["aux_regression_weight"] = float(cfg.aux_regression_weight)
         metrics["min_class_size_for_multipositive"] = float(cfg.min_class_size_for_multipositive)
         metrics["multipositive_positive_count_mean"] = (

@@ -13,7 +13,8 @@ class CSIClip(nn.Module):
         num_prototypes: int | None = None,
         embed_dim: int = 256,
         temperature: float = 0.07,
-        num_physics_targets: int = 9,
+        num_physics_targets: int = 10,
+        attribute_num_classes: dict[str, int] | None = None,
         output_dict: bool = True,
     ):
         super().__init__()
@@ -22,6 +23,12 @@ class CSIClip(nn.Module):
         self.text = text_encoder
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
         self.physics_head = nn.Linear(embed_dim, num_physics_targets)
+        self.attribute_classifiers = nn.ModuleDict(
+            {
+                field: nn.Linear(embed_dim, num_classes)
+                for field, num_classes in (attribute_num_classes or {}).items()
+            }
+        )
         self.prototypes = None
         if num_prototypes is not None:
             self.prototypes = nn.Parameter(torch.randn(num_prototypes, embed_dim) * 0.02)
@@ -62,6 +69,14 @@ class CSIClip(nn.Module):
 
     def predict_physics(self, csi_features: torch.Tensor) -> torch.Tensor:
         return self.physics_head(csi_features)
+
+    def predict_attributes(self, csi_features: torch.Tensor) -> dict[str, torch.Tensor]:
+        if not self.attribute_classifiers:
+            raise RuntimeError("This CSIClip instance was created without attribute classifiers.")
+        return {
+            field: classifier(csi_features)
+            for field, classifier in self.attribute_classifiers.items()
+        }
 
     def forward(self, batch: dict[str, torch.Tensor | dict[str, torch.Tensor] | list[str]]):
         csi_features = self.encode_csi(

@@ -154,16 +154,19 @@ SLOT_VOCAB = {
         "seven_plus": ["seven or more", "many"],
     },
     "ds": {
+        "any": ["any"],
         "low": ["low", "small"],
         "moderate": ["moderate", "medium"],
         "high": ["high", "large"],
     },
     "as_az": {
+        "any": ["any"],
         "narrow": ["narrow", "concentrated"],
         "moderate": ["moderate"],
         "wide": ["wide", "broad"],
     },
     "kf": {
+        "any": ["any"],
         "strong": ["strong", "dominant"],
         "moderate": ["moderate"],
         "weak": ["weak", "absent"],
@@ -188,6 +191,7 @@ SLOT_VOCAB = {
         "right": ["right-side"],
     },
     "interaction": {
+        "any": ["any"],
         "unknown": ["unknown"],
         "none": ["no"],
         "light": ["light"],
