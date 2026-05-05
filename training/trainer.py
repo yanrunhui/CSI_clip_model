@@ -5,6 +5,8 @@ import math
 
 import torch
 
+from data.semantic_key import AttributeRemap, semantic_key_attribute_value
+
 from .losses import (
     PrototypeClipLoss,
     cosine_alignment_loss,
@@ -27,8 +29,11 @@ class TrainConfig:
     text_mode: str = "prototype"
     attribute_classifier_weight: float = 0.0
     attribute_classifier_class_weight: str = "none"
+    attribute_classifier_logit_adjustment: float = 0.0
     aux_regression_weight: float = 0.0
     aux_regression_indices: tuple[int, ...] | None = None
+    freeze_csi: bool = False
+    freeze_text_prototypes: bool = False
     multipositive_distance_threshold: float = 0.25
     multipositive_positive_mode: str = "semantic_and_physics"
     min_class_size_for_multipositive: int = 2
@@ -46,6 +51,7 @@ class Trainer:
         prototype_class_counts: torch.Tensor | None = None,
         attribute_label_maps: dict[str, dict[str, int]] | None = None,
         attribute_class_counts: dict[str, torch.Tensor] | None = None,
+        attribute_remap: AttributeRemap | None = None,
         loss: PrototypeClipLoss | None = None,
     ):
         self.model = model
@@ -62,24 +68,59 @@ class Trainer:
             field: counts.to(device)
             for field, counts in (attribute_class_counts or {}).items()
         }
+        self.attribute_remap = attribute_remap or {}
         self.loss = loss or PrototypeClipLoss()
 
     def _attribute_targets(self, semantic_keys: list[object]) -> dict[str, torch.Tensor]:
         targets = {}
         for field, label_map in self.attribute_label_maps.items():
             targets[field] = torch.tensor(
-                [label_map[str(getattr(key, field))] for key in semantic_keys],
+                [
+                    label_map[semantic_key_attribute_value(key, field, self.attribute_remap)]
+                    for key in semantic_keys
+                ],
                 device=self.device,
                 dtype=torch.long,
             )
         return targets
 
-    def _attribute_class_weight(self, field: str, dtype: torch.dtype) -> torch.Tensor | None:
+    def _attribute_class_weight(
+        self,
+        field: str,
+        dtype: torch.dtype,
+        mode: str,
+    ) -> torch.Tensor | None:
         counts = self.attribute_class_counts.get(field)
         if counts is None:
             return None
-        weights = torch.sqrt(counts.float().mean() / counts.float().clamp(min=1.0))
+        exponent = 0.25 if mode == "mild" else 0.5
+        weights = (counts.float().mean() / counts.float().clamp(min=1.0)).pow(exponent)
         return weights.clamp(0.25, 4.0).to(device=self.device, dtype=dtype)
+
+    def _attribute_logit_adjustment(
+        self,
+        field: str,
+        dtype: torch.dtype,
+        strength: float,
+    ) -> torch.Tensor | None:
+        counts = self.attribute_class_counts.get(field)
+        if counts is None or strength <= 0.0:
+            return None
+        priors = counts.float() / counts.float().sum().clamp(min=1.0)
+        return (strength * priors.clamp(min=1e-6).log()).to(
+            device=self.device,
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def _grad_norm(module: torch.nn.Module) -> float:
+        squared_norm = 0.0
+        for parameter in module.parameters():
+            if parameter.grad is None:
+                continue
+            parameter_norm = parameter.grad.detach().float().norm(2)
+            squared_norm += float(parameter_norm * parameter_norm)
+        return math.sqrt(squared_norm)
 
     @staticmethod
     def _multipositive_mask(
@@ -127,16 +168,21 @@ class Trainer:
         del epoch
         batch = self._move_batch(batch)
         self.model.train()
+        if cfg.freeze_csi:
+            self.model.csi.eval()
+        if cfg.freeze_text_prototypes:
+            self.model.text.eval()
         self.optimizer.zero_grad(set_to_none=True)
-        csi_features = self.model.encode_csi(
+        csi_features_raw = self.model.encode_csi(
             batch["tokens"],
             batch["beam_positions"],
             batch["token_mask"],
             batch["freq_bin"],
             batch["bw_bin"],
             batch["subcarrier_spacing"],
-            normalize=True,
+            normalize=False,
         )
+        csi_features = torch.nn.functional.normalize(csi_features_raw, dim=-1)
         prototype_features = self.model.encode_prototypes(normalize=True)
         labels = torch.tensor(
             [self.prototype_label_map[key] for key in batch["semantic_keys"]],
@@ -146,7 +192,7 @@ class Trainer:
         logit_scale = self.model.logit_scale.exp()
         physics_predictions = None
         if cfg.aux_regression_weight > 0:
-            physics_predictions = self.model.predict_physics(csi_features)
+            physics_predictions = self.model.predict_physics(csi_features_raw)
 
         if cfg.text_mode == "prototype":
             text_features = self.model.encode_text(
@@ -206,25 +252,46 @@ class Trainer:
         else:
             raise ValueError(f"Unsupported text_mode={cfg.text_mode!r}")
         if cfg.attribute_classifier_weight > 0:
-            attribute_logits = self.model.predict_attributes(csi_features)
+            attribute_logits = self.model.predict_attributes(csi_features_raw)
             attribute_targets = self._attribute_targets(batch["semantic_keys"])
             attribute_losses = []
+            attribute_accuracies = []
+            attribute_logit_stds = []
             for field, targets in attribute_targets.items():
                 logits = attribute_logits[field]
                 class_weight = (
-                    self._attribute_class_weight(field, logits.dtype)
-                    if cfg.attribute_classifier_class_weight == "balanced"
+                    self._attribute_class_weight(
+                        field,
+                        logits.dtype,
+                        cfg.attribute_classifier_class_weight,
+                    )
+                    if cfg.attribute_classifier_class_weight in {"mild", "balanced"}
                     else None
                 )
                 field_loss = torch.nn.functional.cross_entropy(
-                    logits,
+                    logits + (
+                        self._attribute_logit_adjustment(
+                            field,
+                            logits.dtype,
+                            cfg.attribute_classifier_logit_adjustment,
+                        )
+                        if cfg.attribute_classifier_logit_adjustment > 0.0
+                        else 0.0
+                    ),
                     targets,
                     weight=class_weight,
                 )
                 losses[f"loss_attribute_{field}"] = field_loss
+                field_accuracy = (logits.argmax(dim=1) == targets).float().mean()
+                losses[f"accuracy_attribute_{field}"] = field_accuracy
+                losses[f"logit_std_attribute_{field}"] = logits.detach().float().std()
                 attribute_losses.append(field_loss)
+                attribute_accuracies.append(field_accuracy)
+                attribute_logit_stds.append(logits.detach().float().std())
             if attribute_losses:
                 losses["loss_attribute_classifier"] = torch.stack(attribute_losses).mean()
+                losses["accuracy_attribute_classifier"] = torch.stack(attribute_accuracies).mean()
+                losses["logit_std_attribute_classifier"] = torch.stack(attribute_logit_stds).mean()
         if physics_predictions is not None:
             regression_predictions = physics_predictions
             regression_targets = batch["physics_targets"]
@@ -247,16 +314,30 @@ class Trainer:
             cfg.aux_regression_weight * losses.get("loss_aux_regression", torch.zeros((), device=self.device))
         )
         total_loss.backward()
+        grad_metrics = {
+            "grad_norm_csi_encoder": self._grad_norm(self.model.csi),
+            "grad_norm_attribute_classifiers": (
+                self._grad_norm(self.model.attribute_classifiers)
+                if hasattr(self.model, "attribute_classifiers")
+                else 0.0
+            ),
+        }
         self.optimizer.step()
         with torch.no_grad():
             self.model.logit_scale.clamp_(0, math.log(100))
         metrics = {name: float(value.detach()) for name, value in losses.items()}
+        metrics.update(grad_metrics)
+        metrics["csi_feature_raw_std"] = float(csi_features_raw.detach().float().std())
+        metrics["csi_feature_normalized_std"] = float(csi_features.detach().float().std())
         metrics["csi_to_text_weight"] = float(cfg.csi_to_text_weight)
         metrics["prototype_weight"] = float(cfg.prototype_weight)
         metrics["text_prototype_weight"] = float(cfg.text_prototype_weight)
         metrics["text_mode_instance"] = float(cfg.text_mode == "instance")
         metrics["text_mode_multipositive"] = float(cfg.text_mode == "multipositive")
         metrics["attribute_classifier_weight"] = float(cfg.attribute_classifier_weight)
+        metrics["attribute_classifier_logit_adjustment"] = float(
+            cfg.attribute_classifier_logit_adjustment
+        )
         metrics["aux_regression_weight"] = float(cfg.aux_regression_weight)
         metrics["min_class_size_for_multipositive"] = float(cfg.min_class_size_for_multipositive)
         metrics["multipositive_positive_count_mean"] = (

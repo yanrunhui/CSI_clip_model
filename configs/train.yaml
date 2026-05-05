@@ -20,8 +20,26 @@ train:
     - k_factor_bin
     - first_delay_bin
     - first_power_bin
-    - first_angle_bin
-  attribute_classifier_class_weight: balanced
+  attribute_remap:
+    path_richness:
+      low:
+        - zero
+        - one
+        - two
+      mid:
+        - three
+        - four
+      high:
+        - five
+        - six
+        - seven_plus
+    k_factor_bin:
+      weak:
+        - weak
+      strong:
+        - strong
+  attribute_classifier_class_weight: mild
+  attribute_classifier_logit_adjustment: 0.0
   semantic_key_mode: coarse_k
   aux_regression_weight: 0.02
   aux_regression_targets:

@@ -184,6 +184,7 @@ SLOT_VOCAB = {
         "strong": ["strong"],
     },
     "first_angle": {
+        "any": ["any"],
         "unknown": ["unknown"],
         "front": ["front-side"],
         "left": ["left-side"],

@@ -104,6 +104,7 @@ SEMANTIC_FIELD_KEY_FIELDS = {
 }
 
 SEMANTIC_KEY_FIELDS = tuple(SemanticKey.__dataclass_fields__)
+DERIVED_SEMANTIC_KEY_FIELDS = ("k_factor_binary", "first_power_binary")
 
 DEFAULT_ATTRIBUTE_FIELDS = (
     "los_status",
@@ -116,7 +117,53 @@ DEFAULT_ATTRIBUTE_FIELDS = (
 
 
 def semantic_key_field_choices() -> tuple[str, ...]:
-    return SEMANTIC_KEY_FIELDS
+    return (*SEMANTIC_KEY_FIELDS, *DERIVED_SEMANTIC_KEY_FIELDS)
+
+
+AttributeRemap = Mapping[str, Mapping[str, tuple[str, ...] | list[str]]]
+
+
+def semantic_key_attribute_raw_value(key: SemanticKey, field: str) -> str:
+    if field == "k_factor_binary":
+        return key.k_factor_bin if key.k_factor_bin in {"weak", "strong"} else "moderate"
+    if field == "first_power_binary":
+        return key.first_power_bin if key.first_power_bin in {"weak", "strong"} else "moderate"
+    return str(getattr(key, field))
+
+
+def semantic_key_attribute_value(
+    key: SemanticKey,
+    field: str,
+    attribute_remap: AttributeRemap | None = None,
+) -> str:
+    raw_value = semantic_key_attribute_raw_value(key, field)
+    field_remap = (attribute_remap or {}).get(field, {})
+    for mapped_value, source_values in field_remap.items():
+        if raw_value in set(source_values):
+            return str(mapped_value)
+    return raw_value
+
+
+def implied_attribute_value_filters(
+    fields: tuple[str, ...],
+    attribute_remap: AttributeRemap | None = None,
+) -> dict[str, tuple[str, ...]]:
+    filters: dict[str, tuple[str, ...]] = {}
+    if "k_factor_binary" in fields:
+        filters["k_factor_binary"] = ("weak", "strong")
+    if "first_power_binary" in fields:
+        filters["first_power_binary"] = ("weak", "strong")
+    for field in fields:
+        field_remap = (attribute_remap or {}).get(field)
+        if field_remap:
+            filters[field] = tuple(
+                dict.fromkeys(
+                    str(source_value)
+                    for source_values in field_remap.values()
+                    for source_value in source_values
+                )
+            )
+    return filters
 
 
 def default_attribute_fields() -> tuple[str, ...]:

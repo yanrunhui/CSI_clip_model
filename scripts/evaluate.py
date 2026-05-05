@@ -24,7 +24,14 @@ from data.dataset import (
     collate_fn,
     semantic_key_mode_choices,
 )
-from data.semantic_key import SemanticKey, default_attribute_fields, semantic_key_field_choices
+from data.semantic_key import (
+    SemanticKey,
+    default_attribute_fields,
+    implied_attribute_value_filters,
+    semantic_key_attribute_raw_value,
+    semantic_key_attribute_value,
+    semantic_key_field_choices,
+)
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
 from models.model import CSIClip
@@ -118,6 +125,125 @@ def _infer_semantic_key_mode(checkpoint: dict | None, override: str | None) -> s
     return "full"
 
 
+def _infer_limit_samples(checkpoint: dict | None, override: int | None) -> int | None:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        limit_samples = checkpoint.get("args", {}).get("limit_samples")
+        if limit_samples is not None:
+            return int(limit_samples)
+    return None
+
+
+def _infer_limit_samples_by_attribute(checkpoint: dict | None, override: str | None) -> str | None:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        return checkpoint.get("args", {}).get("limit_samples_by_attribute")
+    return None
+
+
+def _infer_limit_samples_per_attribute_value(checkpoint: dict | None, override: int | None) -> int | None:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        value = checkpoint.get("args", {}).get("limit_samples_per_attribute_value")
+        if value is not None:
+            return int(value)
+    return None
+
+
+def parse_attribute_value_filters(value) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return {}
+    entries = [value] if isinstance(value, str) else value
+    filters: dict[str, tuple[str, ...]] = {}
+    if isinstance(entries, dict):
+        entries = [f"{field}={','.join(values) if isinstance(values, (list, tuple)) else values}" for field, values in entries.items()]
+    for entry in entries:
+        if "=" not in str(entry):
+            raise ValueError(
+                "--filter-attribute-values entries must use FIELD=VALUE[,VALUE...], "
+                f"got {entry!r}."
+            )
+        field, raw_values = str(entry).split("=", 1)
+        field = field.strip()
+        if field not in semantic_key_field_choices():
+            raise ValueError(
+                f"Unknown filter attribute field: {field!r}. "
+                f"Choose from: {', '.join(semantic_key_field_choices())}"
+            )
+        values = tuple(part.strip() for part in raw_values.split(",") if part.strip())
+        if not values:
+            raise ValueError(f"No values provided for filter attribute field {field!r}.")
+        filters[field] = values
+    return filters
+
+
+def _infer_filter_attribute_values(
+    checkpoint: dict | None,
+    override: dict[str, tuple[str, ...]] | None,
+) -> dict[str, tuple[str, ...]]:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        return parse_attribute_value_filters(
+            checkpoint.get("args", {}).get("filter_attribute_values")
+        )
+    return {}
+
+
+def format_attribute_value_filters(filters: dict[str, tuple[str, ...]]) -> str:
+    if not filters:
+        return "none"
+    return ";".join(
+        f"{field}={','.join(values)}"
+        for field, values in sorted(filters.items())
+    )
+
+
+def parse_attribute_remap(value) -> dict[str, dict[str, tuple[str, ...]]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("attribute_remap must be a mapping of FIELD -> LABEL -> source labels.")
+    remap: dict[str, dict[str, tuple[str, ...]]] = {}
+    for field, label_map in value.items():
+        if field not in semantic_key_field_choices():
+            raise ValueError(
+                f"Unknown attribute_remap field: {field!r}. "
+                f"Choose from: {', '.join(semantic_key_field_choices())}"
+            )
+        if not isinstance(label_map, dict):
+            raise ValueError(f"attribute_remap.{field} must map output labels to source labels.")
+        remap[str(field)] = {}
+        for mapped_value, source_values in label_map.items():
+            if isinstance(source_values, str):
+                values = (source_values,)
+            else:
+                values = tuple(str(source_value) for source_value in source_values)
+            if not values:
+                raise ValueError(f"attribute_remap.{field}.{mapped_value} must not be empty.")
+            remap[str(field)][str(mapped_value)] = values
+    return remap
+
+
+def _infer_attribute_remap(checkpoint: dict | None) -> dict[str, dict[str, tuple[str, ...]]]:
+    if checkpoint is None:
+        return {}
+    return parse_attribute_remap(checkpoint.get("args", {}).get("attribute_remap"))
+
+
+def format_attribute_remap(remap: dict[str, dict[str, tuple[str, ...]]]) -> str:
+    if not remap:
+        return "none"
+    return ";".join(
+        f"{field}="
+        + ",".join(f"{mapped}:{'|'.join(values)}" for mapped, values in mapping.items())
+        for field, mapping in sorted(remap.items())
+    )
+
+
 def _infer_attribute_fields(checkpoint: dict | None, override: tuple[str, ...] | None = None) -> tuple[str, ...]:
     if override is not None:
         return override
@@ -128,10 +254,32 @@ def _infer_attribute_fields(checkpoint: dict | None, override: tuple[str, ...] |
     return default_attribute_fields()
 
 
-def build_attribute_label_maps(samples, fields: tuple[str, ...]) -> dict[str, dict[str, int]]:
+def parse_attribute_binary_thresholds(values: list[str] | None) -> dict[str, float]:
+    thresholds = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValueError(
+                "--attribute-binary-threshold entries must use FIELD=THRESHOLD, "
+                f"got {value!r}."
+            )
+        field, threshold = value.split("=", 1)
+        thresholds[field.strip()] = float(threshold)
+    return thresholds
+
+
+def build_attribute_label_maps(
+    samples,
+    fields: tuple[str, ...],
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
+) -> dict[str, dict[str, int]]:
     label_maps = {}
     for field in fields:
-        values = sorted({str(getattr(sample.semantic_key, field)) for sample in samples})
+        values = sorted(
+            {
+                semantic_key_attribute_value(sample.semantic_key, field, attribute_remap)
+                for sample in samples
+            }
+        )
         label_maps[field] = {value: idx for idx, value in enumerate(values)}
     return label_maps
 
@@ -161,6 +309,65 @@ def filter_samples_by_min_class_size(samples, min_class_size: int):
     return filtered
 
 
+def filter_samples_by_attribute_values(samples, filters: dict[str, tuple[str, ...]]):
+    filtered = samples
+    for field, values in filters.items():
+        allowed_values = set(values)
+        next_filtered = [
+            sample
+            for sample in filtered
+            if semantic_key_attribute_raw_value(sample.semantic_key, field) in allowed_values
+        ]
+        if not next_filtered:
+            raise ValueError(
+                f"No samples remain after filtering {field} to values {','.join(values)}."
+            )
+        filtered = next_filtered
+    return filtered
+
+
+def limit_samples_for_debug(samples, limit_samples: int | None):
+    if limit_samples is None:
+        return samples
+    if limit_samples <= 0:
+        raise ValueError("--limit-samples must be a positive integer.")
+    limited = samples[:limit_samples]
+    if not limited:
+        raise ValueError(f"No samples remain after applying limit_samples={limit_samples}.")
+    return limited
+
+
+def limit_samples_by_attribute_value_for_debug(
+    samples,
+    attribute_field: str | None,
+    samples_per_value: int | None,
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
+):
+    if attribute_field is None and samples_per_value is None:
+        return samples
+    if attribute_field is None or samples_per_value is None:
+        raise ValueError(
+            "--limit-samples-by-attribute and --limit-samples-per-attribute-value must be used together."
+        )
+    if samples_per_value <= 0:
+        raise ValueError("--limit-samples-per-attribute-value must be a positive integer.")
+    grouped = {}
+    for sample in samples:
+        grouped.setdefault(
+            semantic_key_attribute_value(sample.semantic_key, attribute_field, attribute_remap),
+            [],
+        ).append(sample)
+    limited = []
+    for value in sorted(grouped):
+        limited.extend(grouped[value][:samples_per_value])
+    if not limited:
+        raise ValueError(
+            "No samples remain after applying "
+            f"limit_samples_by_attribute={attribute_field!r}."
+        )
+    return limited
+
+
 @torch.no_grad()
 def evaluate(
     data_path: str,
@@ -171,6 +378,11 @@ def evaluate(
     min_class_size_override: int | None = None,
     semantic_key_mode_override: str | None = None,
     attribute_fields_override: tuple[str, ...] | None = None,
+    filter_attribute_values_override: dict[str, tuple[str, ...]] | None = None,
+    limit_samples_override: int | None = None,
+    limit_samples_by_attribute_override: str | None = None,
+    limit_samples_per_attribute_value_override: int | None = None,
+    attribute_binary_thresholds: dict[str, float] | None = None,
 ) -> None:
     dataset = PreprocessedCSIDataset.from_pt(data_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False) if checkpoint_path else None
@@ -178,6 +390,24 @@ def evaluate(
     min_class_size = _infer_min_class_size(checkpoint, min_class_size_override)
     semantic_key_mode = _infer_semantic_key_mode(checkpoint, semantic_key_mode_override)
     attribute_fields = _infer_attribute_fields(checkpoint, attribute_fields_override)
+    attribute_remap = _infer_attribute_remap(checkpoint)
+    filter_attribute_values = _infer_filter_attribute_values(
+        checkpoint,
+        filter_attribute_values_override,
+    )
+    filter_attribute_values = {
+        **implied_attribute_value_filters(attribute_fields, attribute_remap),
+        **filter_attribute_values,
+    }
+    limit_samples = _infer_limit_samples(checkpoint, limit_samples_override)
+    limit_samples_by_attribute = _infer_limit_samples_by_attribute(
+        checkpoint,
+        limit_samples_by_attribute_override,
+    )
+    limit_samples_per_attribute_value = _infer_limit_samples_per_attribute_value(
+        checkpoint,
+        limit_samples_per_attribute_value_override,
+    )
     mode_samples = apply_semantic_key_mode(dataset.samples, semantic_key_mode)
     if semantic_key_mode != "full":
         before_counts = Counter(sample.semantic_key for sample in dataset.samples)
@@ -195,12 +425,79 @@ def evaluate(
             f"samples {len(mode_samples)} -> {len(samples)}, "
             f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
         )
+    value_filtered_samples = filter_samples_by_attribute_values(samples, filter_attribute_values)
+    if len(value_filtered_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in value_filtered_samples)
+        value_count_text = ";".join(
+            ",".join(
+                f"{value}:{count}"
+                for value, count in sorted(
+                    Counter(
+                        semantic_key_attribute_raw_value(sample.semantic_key, field)
+                        for sample in value_filtered_samples
+                    ).items()
+                )
+            )
+            for field in sorted(filter_attribute_values)
+        )
+        print(
+            f"filtered samples by attribute values: "
+            f"filters={format_attribute_value_filters(filter_attribute_values)} "
+            f"samples {len(samples)} -> {len(value_filtered_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}, "
+            f"value_counts={value_count_text}"
+        )
+    samples = value_filtered_samples
+    balanced_limited_samples = limit_samples_by_attribute_value_for_debug(
+        samples,
+        limit_samples_by_attribute,
+        limit_samples_per_attribute_value,
+        attribute_remap=attribute_remap,
+    )
+    if len(balanced_limited_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in balanced_limited_samples)
+        value_counts = Counter(
+            semantic_key_attribute_value(
+                sample.semantic_key,
+                limit_samples_by_attribute,
+                attribute_remap,
+            )
+            for sample in balanced_limited_samples
+        )
+        value_count_text = ",".join(
+            f"{value}:{count}"
+            for value, count in sorted(value_counts.items())
+        )
+        print(
+            f"limited samples by attribute for debug: "
+            f"attribute={limit_samples_by_attribute} "
+            f"samples {len(samples)} -> {len(balanced_limited_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}, "
+            f"value_counts={value_count_text}"
+        )
+    samples = balanced_limited_samples
+    limited_samples = limit_samples_for_debug(samples, limit_samples)
+    if len(limited_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in limited_samples)
+        print(
+            f"limited samples for debug: "
+            f"samples {len(samples)} -> {len(limited_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
+    samples = limited_samples
     tokenizer = build_tokenizer(samples, checkpoint)
     prototype_keys, prototype_token_ids, prototype_token_mask, prototype_label_map = build_prototype_bank(
         samples,
         tokenizer,
     )
-    attribute_label_maps = build_attribute_label_maps(samples, attribute_fields)
+    attribute_label_maps = build_attribute_label_maps(
+        samples,
+        attribute_fields,
+        attribute_remap=attribute_remap,
+    )
     loader = DataLoader(
         PreprocessedCSIDataset(samples),
         batch_size=batch_size,
@@ -235,25 +532,26 @@ def evaluate(
 
     for batch in loader:
         batch = move_batch(batch, device)
-        csi_features = model.encode_csi(
+        csi_features_raw = model.encode_csi(
             batch["tokens"],
             batch["beam_positions"],
             batch["token_mask"],
             batch["freq_bin"],
             batch["bw_bin"],
             batch["subcarrier_spacing"],
-            normalize=True,
+            normalize=False,
         )
+        csi_features = F.normalize(csi_features_raw, dim=-1)
         all_csi_features.append(csi_features.cpu())
         if attribute_label_maps:
-            attribute_logits = model.predict_attributes(csi_features)
+            attribute_logits = model.predict_attributes(csi_features_raw)
             for field, label_map in attribute_label_maps.items():
                 all_attribute_logits[field].append(attribute_logits[field].cpu())
                 all_attribute_labels[field].extend(
-                    label_map[str(getattr(key, field))]
+                    label_map[semantic_key_attribute_value(key, field, attribute_remap)]
                     for key in batch["semantic_keys"]
                 )
-        physics_predictions = model.predict_physics(csi_features)
+        physics_predictions = model.predict_physics(csi_features_raw)
         all_physics_predictions.append(physics_predictions.cpu())
         all_physics_targets.append(batch["physics_targets"].cpu())
         all_physics_raw_targets.append(batch["physics_raw_targets"].cpu())
@@ -331,15 +629,29 @@ def evaluate(
     print(f"text_mode={text_mode}")
     print(f"semantic_key_mode={semantic_key_mode}")
     print(f"min_class_size={min_class_size}")
+    print(f"attribute_remap={format_attribute_remap(attribute_remap)}")
+    print(f"filter_attribute_values={format_attribute_value_filters(filter_attribute_values)}")
+    print(f"limit_samples={limit_samples}")
+    print(f"limit_samples_by_attribute={limit_samples_by_attribute}")
+    print(f"limit_samples_per_attribute_value={limit_samples_per_attribute_value}")
     print(f"semantic_prototypes={len(prototype_keys)}")
     if checkpoint is not None and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0:
         print(f"attribute_classifier_fields={','.join(attribute_fields)}")
+        print(
+            "attribute_classifier_class_weight="
+            f"{checkpoint.get('args', {}).get('attribute_classifier_class_weight', 'none')}"
+        )
+        print(
+            "attribute_classifier_logit_adjustment="
+            f"{float(checkpoint.get('args', {}).get('attribute_classifier_logit_adjustment', 0.0)):.4f}"
+        )
     _print_retrieval_metrics(text_metric_prefix, logits, text_labels)
     if checkpoint is not None and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0:
         _print_attribute_classifier_metrics(
             attribute_logits,
             attribute_labels,
             attribute_label_maps,
+            attribute_binary_thresholds or {},
         )
     _print_physics_regression_metrics(
         physics_predictions=physics_predictions,
@@ -410,10 +722,64 @@ def _safe_pearson(x: torch.Tensor, y: torch.Tensor) -> float:
     return float((x * y).sum() / denom)
 
 
+def _binary_threshold_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    threshold_override: float | None = None,
+) -> dict[str, float]:
+    scores = logits[:, 1] - logits[:, 0]
+    if threshold_override is not None:
+        thresholds = torch.tensor([threshold_override], dtype=scores.dtype)
+    else:
+        sorted_scores = torch.sort(scores).values
+        if sorted_scores.numel() == 1:
+            thresholds = sorted_scores
+        else:
+            midpoints = (sorted_scores[:-1] + sorted_scores[1:]) * 0.5
+            thresholds = torch.cat(
+                [
+                    sorted_scores[:1] - 1.0,
+                    midpoints,
+                    sorted_scores[-1:] + 1.0,
+                ]
+            )
+
+    best = {
+        "macro_top1": -1.0,
+        "top1": 0.0,
+        "threshold": 0.0,
+        "class0_acc": 0.0,
+        "class1_acc": 0.0,
+    }
+    for threshold in thresholds:
+        predictions = (scores >= threshold).long()
+        class_accs = []
+        for class_idx in (0, 1):
+            mask = labels == class_idx
+            if bool(mask.any()):
+                class_accs.append((predictions[mask] == labels[mask]).float().mean())
+            else:
+                class_accs.append(torch.zeros(()))
+        macro_top1 = float(torch.stack(class_accs).mean())
+        top1 = float((predictions == labels).float().mean())
+        if threshold_override is not None or macro_top1 > best["macro_top1"]:
+            best = {
+                "macro_top1": macro_top1,
+                "top1": top1,
+                "threshold": float(threshold),
+                "class0_acc": float(class_accs[0]),
+                "class1_acc": float(class_accs[1]),
+            }
+    best["margin_mean"] = float(scores.mean())
+    best["margin_std"] = float(scores.std())
+    return best
+
+
 def _print_attribute_classifier_metrics(
     attribute_logits: dict[str, torch.Tensor],
     attribute_labels: dict[str, torch.Tensor],
     attribute_label_maps: dict[str, dict[str, int]],
+    attribute_binary_thresholds: dict[str, float],
 ) -> None:
     for field, logits in attribute_logits.items():
         labels = attribute_labels[field]
@@ -444,6 +810,70 @@ def _print_attribute_classifier_metrics(
             f"attribute_classifier_{field}_class_size_accuracy_pearson="
             f"{_safe_pearson(class_sizes[nonempty].float(), class_accuracy[nonempty]):.4f}"
         )
+        if num_classes == 2:
+            threshold_metrics = _binary_threshold_metrics(logits, labels)
+            print(
+                f"attribute_classifier_{field}_binary_margin_mean="
+                f"{threshold_metrics['margin_mean']:.4f}"
+            )
+            print(
+                f"attribute_classifier_{field}_binary_margin_std="
+                f"{threshold_metrics['margin_std']:.4f}"
+            )
+            print(
+                f"attribute_classifier_{field}_calibrated_threshold="
+                f"{threshold_metrics['threshold']:.4f}"
+            )
+            print(
+                f"attribute_classifier_{field}_calibrated_top1="
+                f"{threshold_metrics['top1']:.4f}"
+            )
+            print(
+                f"attribute_classifier_{field}_calibrated_macro_top1="
+                f"{threshold_metrics['macro_top1']:.4f}"
+            )
+            print(
+                f"attribute_classifier_{field}_calibrated_value_{id_to_value[0]}_acc="
+                f"{threshold_metrics['class0_acc']:.4f}"
+            )
+            print(
+                f"attribute_classifier_{field}_calibrated_value_{id_to_value[1]}_acc="
+                f"{threshold_metrics['class1_acc']:.4f}"
+            )
+            print(
+                f"attribute_classifier_{field}_binary_score_definition="
+                f"logit_{id_to_value[1]}-logit_{id_to_value[0]}"
+            )
+            if field in attribute_binary_thresholds:
+                fixed_threshold_metrics = _binary_threshold_metrics(
+                    logits,
+                    labels,
+                    threshold_override=attribute_binary_thresholds[field],
+                )
+                print(
+                    f"attribute_classifier_{field}_fixed_threshold="
+                    f"{fixed_threshold_metrics['threshold']:.4f}"
+                )
+                print(
+                    f"attribute_classifier_{field}_fixed_threshold_rule="
+                    f"score>=threshold predicts {id_to_value[1]}, else {id_to_value[0]}"
+                )
+                print(
+                    f"attribute_classifier_{field}_fixed_threshold_top1="
+                    f"{fixed_threshold_metrics['top1']:.4f}"
+                )
+                print(
+                    f"attribute_classifier_{field}_fixed_threshold_macro_top1="
+                    f"{fixed_threshold_metrics['macro_top1']:.4f}"
+                )
+                print(
+                    f"attribute_classifier_{field}_fixed_threshold_value_{id_to_value[0]}_acc="
+                    f"{fixed_threshold_metrics['class0_acc']:.4f}"
+                )
+                print(
+                    f"attribute_classifier_{field}_fixed_threshold_value_{id_to_value[1]}_acc="
+                    f"{fixed_threshold_metrics['class1_acc']:.4f}"
+                )
         for class_idx in range(num_classes):
             print(
                 f"attribute_classifier_{field}_value_{id_to_value[class_idx]}="
@@ -607,10 +1037,41 @@ def main() -> None:
         help="Drop semantic classes with fewer than this many samples before evaluation. Defaults to checkpoint args.",
     )
     parser.add_argument(
+        "--filter-attribute-values",
+        action="append",
+        help=(
+            "Keep only samples whose SemanticKey field matches listed values. "
+            "Use FIELD=VALUE[,VALUE...], e.g. k_factor_bin=weak,strong. Defaults to checkpoint args."
+        ),
+    )
+    parser.add_argument(
+        "--limit-samples",
+        type=int,
+        help="Keep only the first N samples after semantic remapping and class-size filtering. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
+        "--limit-samples-by-attribute",
+        choices=semantic_key_field_choices(),
+        help="Keep up to N samples per value of this SemanticKey field. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
+        "--limit-samples-per-attribute-value",
+        type=int,
+        help="Number of samples to keep per value when --limit-samples-by-attribute is set. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
         "--attribute-classifier-fields",
         nargs="+",
         choices=semantic_key_field_choices(),
         help="SemanticKey fields for attribute classifier evaluation. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
+        "--attribute-binary-threshold",
+        action="append",
+        help=(
+            "Apply a fixed binary threshold for an attribute as FIELD=THRESHOLD. "
+            "The score is logit[class_1]-logit[class_0], using the printed label order."
+        ),
     )
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -623,6 +1084,15 @@ def main() -> None:
         min_class_size_override=args.min_class_size,
         semantic_key_mode_override=args.semantic_key_mode,
         attribute_fields_override=tuple(args.attribute_classifier_fields) if args.attribute_classifier_fields else None,
+        filter_attribute_values_override=(
+            parse_attribute_value_filters(args.filter_attribute_values)
+            if args.filter_attribute_values is not None
+            else None
+        ),
+        limit_samples_override=args.limit_samples,
+        limit_samples_by_attribute_override=args.limit_samples_by_attribute,
+        limit_samples_per_attribute_value_override=args.limit_samples_per_attribute_value,
+        attribute_binary_thresholds=parse_attribute_binary_thresholds(args.attribute_binary_threshold),
     )
 
 

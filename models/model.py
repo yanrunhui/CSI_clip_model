@@ -22,10 +22,21 @@ class CSIClip(nn.Module):
         self.csi = csi_encoder
         self.text = text_encoder
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
-        self.physics_head = nn.Linear(embed_dim, num_physics_targets)
+        hidden_dim = embed_dim * 2
+        self.physics_head = nn.Sequential(
+            nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_physics_targets),
+        )
         self.attribute_classifiers = nn.ModuleDict(
             {
-                field: nn.Linear(embed_dim, num_classes)
+                field: nn.Sequential(
+                    nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
+                    nn.Linear(embed_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, num_classes),
+                )
                 for field, num_classes in (attribute_num_classes or {}).items()
             }
         )

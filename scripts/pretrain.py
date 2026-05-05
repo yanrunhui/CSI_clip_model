@@ -27,7 +27,14 @@ from data.dataset import (
     physics_aux_target_choices,
     semantic_key_mode_choices,
 )
-from data.semantic_key import SemanticKey, default_attribute_fields, semantic_key_field_choices
+from data.semantic_key import (
+    SemanticKey,
+    default_attribute_fields,
+    implied_attribute_value_filters,
+    semantic_key_attribute_raw_value,
+    semantic_key_attribute_value,
+    semantic_key_field_choices,
+)
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
 from models.model import CSIClip
@@ -95,6 +102,78 @@ def parse_attribute_fields(value) -> tuple[str, ...]:
     return fields
 
 
+def parse_attribute_value_filters(value) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return {}
+    entries = [value] if isinstance(value, str) else value
+    filters: dict[str, tuple[str, ...]] = {}
+    if isinstance(entries, dict):
+        entries = [f"{field}={','.join(values) if isinstance(values, (list, tuple)) else values}" for field, values in entries.items()]
+    for entry in entries:
+        if "=" not in str(entry):
+            raise ValueError(
+                "--filter-attribute-values entries must use FIELD=VALUE[,VALUE...], "
+                f"got {entry!r}."
+            )
+        field, raw_values = str(entry).split("=", 1)
+        field = field.strip()
+        if field not in semantic_key_field_choices():
+            raise ValueError(
+                f"Unknown filter attribute field: {field!r}. "
+                f"Choose from: {', '.join(semantic_key_field_choices())}"
+            )
+        values = tuple(part.strip() for part in raw_values.split(",") if part.strip())
+        if not values:
+            raise ValueError(f"No values provided for filter attribute field {field!r}.")
+        filters[field] = values
+    return filters
+
+
+def format_attribute_value_filters(filters: dict[str, tuple[str, ...]]) -> str:
+    if not filters:
+        return "none"
+    return ";".join(
+        f"{field}={','.join(values)}"
+        for field, values in sorted(filters.items())
+    )
+
+
+def parse_attribute_remap(value) -> dict[str, dict[str, tuple[str, ...]]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("attribute_remap must be a mapping of FIELD -> LABEL -> source labels.")
+    remap: dict[str, dict[str, tuple[str, ...]]] = {}
+    for field, label_map in value.items():
+        if field not in semantic_key_field_choices():
+            raise ValueError(
+                f"Unknown attribute_remap field: {field!r}. "
+                f"Choose from: {', '.join(semantic_key_field_choices())}"
+            )
+        if not isinstance(label_map, dict):
+            raise ValueError(f"attribute_remap.{field} must map output labels to source labels.")
+        remap[str(field)] = {}
+        for mapped_value, source_values in label_map.items():
+            if isinstance(source_values, str):
+                values = (source_values,)
+            else:
+                values = tuple(str(source_value) for source_value in source_values)
+            if not values:
+                raise ValueError(f"attribute_remap.{field}.{mapped_value} must not be empty.")
+            remap[str(field)][str(mapped_value)] = values
+    return remap
+
+
+def format_attribute_remap(remap: dict[str, dict[str, tuple[str, ...]]]) -> str:
+    if not remap:
+        return "none"
+    return ";".join(
+        f"{field}="
+        + ",".join(f"{mapped}:{'|'.join(values)}" for mapped, values in mapping.items())
+        for field, mapping in sorted(remap.items())
+    )
+
+
 def semantic_key_sort_key(key: SemanticKey) -> tuple[str, ...]:
     return (
         key.env_type,
@@ -146,13 +225,25 @@ def build_prototype_bank(
     )
 
 
-def build_attribute_banks(samples, fields: tuple[str, ...]):
+def build_attribute_banks(
+    samples,
+    fields: tuple[str, ...],
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
+):
     label_maps: dict[str, dict[str, int]] = {}
     class_counts: dict[str, torch.Tensor] = {}
     for field in fields:
-        values = sorted({str(getattr(sample.semantic_key, field)) for sample in samples})
+        values = sorted(
+            {
+                semantic_key_attribute_value(sample.semantic_key, field, attribute_remap)
+                for sample in samples
+            }
+        )
         label_map = {value: idx for idx, value in enumerate(values)}
-        counts = Counter(str(getattr(sample.semantic_key, field)) for sample in samples)
+        counts = Counter(
+            semantic_key_attribute_value(sample.semantic_key, field, attribute_remap)
+            for sample in samples
+        )
         label_maps[field] = label_map
         class_counts[field] = torch.tensor(
             [counts[value] for value in values],
@@ -167,9 +258,15 @@ def build_components_from_samples(
     batch_size: int = 128,
     temperature: float = 0.07,
     attribute_fields: tuple[str, ...] = (),
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
+    tokenizer_word2id: dict[str, int] | None = None,
 ):
     source_samples = samples if isinstance(samples, list) else samples.samples
     tokenizer = CaptionTokenizer()
+    if tokenizer_word2id is not None:
+        tokenizer.word2id = dict(tokenizer_word2id)
+        tokenizer.id2word = {idx: word for word, idx in tokenizer.word2id.items()}
+        tokenizer.next_id = max(tokenizer.id2word) + 1
     (
         prototype_keys,
         prototype_captions,
@@ -181,6 +278,7 @@ def build_components_from_samples(
     attribute_label_maps, attribute_class_counts = build_attribute_banks(
         source_samples,
         attribute_fields,
+        attribute_remap=attribute_remap,
     )
 
     dataset = SyntheticCSIDataset(source_samples) if isinstance(samples, list) else samples
@@ -218,6 +316,57 @@ def build_components_from_samples(
     return loader, model, tokenizer, prototype_bank
 
 
+def freeze_module(module: torch.nn.Module) -> None:
+    module.eval()
+    for parameter in module.parameters():
+        parameter.requires_grad = False
+
+
+def freeze_text_and_prototypes(model: CSIClip) -> None:
+    freeze_module(model.text)
+    if model.prototypes is not None:
+        model.prototypes.requires_grad = False
+
+
+def trainable_parameters(model: torch.nn.Module):
+    return [parameter for parameter in model.parameters() if parameter.requires_grad]
+
+
+def count_trainable_parameters(model: torch.nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def load_transfer_checkpoint(path: str | None, device: torch.device) -> dict | None:
+    if path is None:
+        return None
+    checkpoint_path = Path(path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    return torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+
+def load_model_state_compatible(model: torch.nn.Module, checkpoint: dict) -> None:
+    state_dict = checkpoint["model_state"]
+    model_state = model.state_dict()
+    compatible_state = {
+        name: value
+        for name, value in state_dict.items()
+        if name in model_state and model_state[name].shape == value.shape
+    }
+    skipped = sorted(set(state_dict) - set(compatible_state))
+    missing = sorted(set(model_state) - set(compatible_state))
+    model.load_state_dict(compatible_state, strict=False)
+    print(
+        f"loaded_checkpoint_keys={len(compatible_state)} "
+        f"skipped_checkpoint_keys={len(skipped)} "
+        f"new_model_keys={len(missing)}"
+    )
+    if skipped:
+        print(f"skipped_checkpoint_key_examples={','.join(skipped[:20])}")
+    if missing:
+        print(f"new_model_key_examples={','.join(missing[:20])}")
+
+
 def filter_samples_by_min_class_size(samples, min_class_size: int):
     if min_class_size <= 1:
         return samples
@@ -230,19 +379,84 @@ def filter_samples_by_min_class_size(samples, min_class_size: int):
     return filtered
 
 
+def filter_samples_by_attribute_values(samples, filters: dict[str, tuple[str, ...]]):
+    filtered = samples
+    for field, values in filters.items():
+        allowed_values = set(values)
+        next_filtered = [
+            sample
+            for sample in filtered
+            if semantic_key_attribute_raw_value(sample.semantic_key, field) in allowed_values
+        ]
+        if not next_filtered:
+            raise ValueError(
+                f"No samples remain after filtering {field} to values {','.join(values)}."
+            )
+        filtered = next_filtered
+    return filtered
+
+
+def limit_samples_for_debug(samples, limit_samples: int | None):
+    if limit_samples is None:
+        return samples
+    if limit_samples <= 0:
+        raise ValueError("--limit-samples must be a positive integer.")
+    limited = samples[:limit_samples]
+    if not limited:
+        raise ValueError(f"No samples remain after applying limit_samples={limit_samples}.")
+    return limited
+
+
+def limit_samples_by_attribute_value_for_debug(
+    samples,
+    attribute_field: str | None,
+    samples_per_value: int | None,
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
+):
+    if attribute_field is None and samples_per_value is None:
+        return samples
+    if attribute_field is None or samples_per_value is None:
+        raise ValueError(
+            "--limit-samples-by-attribute and --limit-samples-per-attribute-value must be used together."
+        )
+    if samples_per_value <= 0:
+        raise ValueError("--limit-samples-per-attribute-value must be a positive integer.")
+    grouped = {}
+    for sample in samples:
+        grouped.setdefault(
+            semantic_key_attribute_value(sample.semantic_key, attribute_field, attribute_remap),
+            [],
+        ).append(sample)
+    limited = []
+    for value in sorted(grouped):
+        limited.extend(grouped[value][:samples_per_value])
+    if not limited:
+        raise ValueError(
+            "No samples remain after applying "
+            f"limit_samples_by_attribute={attribute_field!r}."
+        )
+    return limited
+
+
 def build_demo_components(
     device: torch.device,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ):
     caption_generator = CaptionGenerator()
     samples = build_synthetic_samples(128, caption_generator=caption_generator)
     samples = apply_semantic_key_mode(samples, semantic_key_mode)
+    samples = filter_samples_by_attribute_values(
+        samples,
+        implied_attribute_value_filters(attribute_fields, attribute_remap),
+    )
     return build_components_from_samples(
         samples,
         device=device,
         batch_size=32,
         attribute_fields=attribute_fields,
+        attribute_remap=attribute_remap,
     )
 
 
@@ -254,6 +468,12 @@ def build_real_components(
     min_class_size: int = 1,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
+    filter_attribute_values: dict[str, tuple[str, ...]] | None = None,
+    limit_samples: int | None = None,
+    limit_samples_by_attribute: str | None = None,
+    limit_samples_per_attribute_value: int | None = None,
+    tokenizer_word2id: dict[str, int] | None = None,
 ):
     dataset = PreprocessedCSIDataset.from_pt(data_path)
     mode_samples = apply_semantic_key_mode(dataset.samples, semantic_key_mode)
@@ -273,12 +493,81 @@ def build_real_components(
             f"samples {len(mode_samples)} -> {len(samples)}, "
             f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
         )
+    filter_attribute_values = {
+        **implied_attribute_value_filters(attribute_fields, attribute_remap),
+        **(filter_attribute_values or {}),
+    }
+    value_filtered_samples = filter_samples_by_attribute_values(samples, filter_attribute_values)
+    if len(value_filtered_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in value_filtered_samples)
+        value_count_text = ";".join(
+            ",".join(
+                f"{value}:{count}"
+                for value, count in sorted(
+                    Counter(
+                        semantic_key_attribute_raw_value(sample.semantic_key, field)
+                        for sample in value_filtered_samples
+                    ).items()
+                )
+            )
+            for field in sorted(filter_attribute_values)
+        )
+        print(
+            f"filtered samples by attribute values: "
+            f"filters={format_attribute_value_filters(filter_attribute_values)} "
+            f"samples {len(samples)} -> {len(value_filtered_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}, "
+            f"value_counts={value_count_text}"
+        )
+    samples = value_filtered_samples
+    balanced_limited_samples = limit_samples_by_attribute_value_for_debug(
+        samples,
+        limit_samples_by_attribute,
+        limit_samples_per_attribute_value,
+        attribute_remap=attribute_remap,
+    )
+    if len(balanced_limited_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in balanced_limited_samples)
+        value_counts = Counter(
+            semantic_key_attribute_value(
+                sample.semantic_key,
+                limit_samples_by_attribute,
+                attribute_remap,
+            )
+            for sample in balanced_limited_samples
+        )
+        value_count_text = ",".join(
+            f"{value}:{count}"
+            for value, count in sorted(value_counts.items())
+        )
+        print(
+            f"limited samples by attribute for debug: "
+            f"attribute={limit_samples_by_attribute} "
+            f"samples {len(samples)} -> {len(balanced_limited_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}, "
+            f"value_counts={value_count_text}"
+        )
+    samples = balanced_limited_samples
+    limited_samples = limit_samples_for_debug(samples, limit_samples)
+    if len(limited_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in limited_samples)
+        print(
+            f"limited samples for debug: "
+            f"samples {len(samples)} -> {len(limited_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
+    samples = limited_samples
     return build_components_from_samples(
         samples,
         device=device,
         batch_size=batch_size,
         temperature=temperature,
         attribute_fields=attribute_fields,
+        attribute_remap=attribute_remap,
+        tokenizer_word2id=tokenizer_word2id,
     )
 
 
@@ -289,17 +578,20 @@ def run_smoke_test(
     attribute_classifier_weight: float = 0.0,
     attribute_classifier_fields: tuple[str, ...] = (),
     attribute_classifier_class_weight: str = "none",
+    attribute_classifier_logit_adjustment: float = 0.0,
     aux_regression_weight: float = 0.0,
     aux_regression_targets: tuple[str, ...] = ("all",),
     multipositive_distance_threshold: float = 0.25,
     multipositive_positive_mode: str = "semantic_and_physics",
     min_class_size_for_multipositive: int = 2,
     semantic_key_mode: str = "full",
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> None:
     loader, model, _, prototype_bank = build_demo_components(
         device,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
+        attribute_remap=attribute_remap,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
     scheduler = build_lr_scheduler(optimizer, total_epochs=2, warmup_epochs=1)
@@ -313,6 +605,7 @@ def run_smoke_test(
         prototype_class_counts=prototype_bank["class_counts"],
         attribute_label_maps=prototype_bank["attribute_label_maps"],
         attribute_class_counts=prototype_bank["attribute_class_counts"],
+        attribute_remap=attribute_remap,
     )
 
     for epoch in range(1, 3):
@@ -326,6 +619,7 @@ def run_smoke_test(
                     csi_to_text_weight=csi_to_text_weight,
                     attribute_classifier_weight=attribute_classifier_weight,
                     attribute_classifier_class_weight=attribute_classifier_class_weight,
+                    attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
                     aux_regression_weight=aux_regression_weight,
                     aux_regression_indices=aux_regression_indices(aux_regression_targets),
                     multipositive_distance_threshold=multipositive_distance_threshold,
@@ -343,6 +637,7 @@ def run_smoke_test(
 
 def run_real_pretrain(
     data_path: str,
+    checkpoint_path: str | None,
     device: torch.device,
     epochs: int,
     max_steps_per_epoch: int | None,
@@ -359,6 +654,7 @@ def run_real_pretrain(
     attribute_classifier_weight: float,
     attribute_classifier_fields: tuple[str, ...],
     attribute_classifier_class_weight: str,
+    attribute_classifier_logit_adjustment: float,
     aux_regression_weight: float,
     aux_regression_targets: tuple[str, ...],
     multipositive_distance_threshold: float,
@@ -366,9 +662,21 @@ def run_real_pretrain(
     min_class_size_for_multipositive: int,
     min_class_size: int,
     semantic_key_mode: str,
+    attribute_remap: dict[str, dict[str, tuple[str, ...]]],
+    filter_attribute_values: dict[str, tuple[str, ...]],
+    limit_samples: int | None,
+    limit_samples_by_attribute: str | None,
+    limit_samples_per_attribute_value: int | None,
+    freeze_csi: bool,
+    freeze_text_prototypes: bool,
     output_dir: str,
     save_every: int,
 ) -> None:
+    transfer_checkpoint = load_transfer_checkpoint(checkpoint_path, device)
+    effective_filter_attribute_values = {
+        **implied_attribute_value_filters(attribute_classifier_fields, attribute_remap),
+        **filter_attribute_values,
+    }
     loader, model, tokenizer, prototype_bank = build_real_components(
         data_path=data_path,
         device=device,
@@ -377,8 +685,27 @@ def run_real_pretrain(
         min_class_size=min_class_size,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
+        attribute_remap=attribute_remap,
+        filter_attribute_values=effective_filter_attribute_values,
+        limit_samples=limit_samples,
+        limit_samples_by_attribute=limit_samples_by_attribute,
+        limit_samples_per_attribute_value=limit_samples_per_attribute_value,
+        tokenizer_word2id=(
+            transfer_checkpoint.get("tokenizer_word2id")
+            if transfer_checkpoint is not None
+            else None
+        ),
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if transfer_checkpoint is not None:
+        load_model_state_compatible(model, transfer_checkpoint)
+    if freeze_csi:
+        freeze_module(model.csi)
+    if freeze_text_prototypes:
+        freeze_text_and_prototypes(model)
+    optimizer_parameters = trainable_parameters(model)
+    if not optimizer_parameters:
+        raise ValueError("No trainable parameters remain after applying freeze options.")
+    optimizer = torch.optim.AdamW(optimizer_parameters, lr=lr, weight_decay=weight_decay)
     scheduler = build_lr_scheduler(
         optimizer,
         total_epochs=epochs,
@@ -395,8 +722,11 @@ def run_real_pretrain(
         text_mode=text_mode,
         attribute_classifier_weight=attribute_classifier_weight,
         attribute_classifier_class_weight=attribute_classifier_class_weight,
+        attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
         aux_regression_weight=aux_regression_weight,
         aux_regression_indices=aux_regression_indices(aux_regression_targets),
+        freeze_csi=freeze_csi,
+        freeze_text_prototypes=freeze_text_prototypes,
         multipositive_distance_threshold=multipositive_distance_threshold,
         multipositive_positive_mode=multipositive_positive_mode,
         min_class_size_for_multipositive=min_class_size_for_multipositive,
@@ -411,9 +741,11 @@ def run_real_pretrain(
         prototype_class_counts=prototype_bank["class_counts"],
         attribute_label_maps=prototype_bank["attribute_label_maps"],
         attribute_class_counts=prototype_bank["attribute_class_counts"],
+        attribute_remap=attribute_remap,
     )
 
     print(f"training on {data_path}")
+    print(f"checkpoint={checkpoint_path}")
     print(
         f"device={device} epochs={epochs} batch_size={batch_size} "
         f"temperature={temperature} warmup_epochs={warmup_epochs} min_lr={min_lr}"
@@ -426,12 +758,20 @@ def run_real_pretrain(
         f"attribute_classifier_weight={attribute_classifier_weight} "
         f"attribute_classifier_fields={','.join(attribute_classifier_fields)} "
         f"attribute_classifier_class_weight={attribute_classifier_class_weight} "
+        f"attribute_classifier_logit_adjustment={attribute_classifier_logit_adjustment} "
+        f"attribute_remap={format_attribute_remap(attribute_remap)} "
         f"aux_regression_weight={aux_regression_weight} "
         f"aux_regression_targets={','.join(aux_regression_targets)} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
         f"min_class_size_for_multipositive={min_class_size_for_multipositive} "
-        f"min_class_size={min_class_size} semantic_key_mode={semantic_key_mode}"
+        f"min_class_size={min_class_size} semantic_key_mode={semantic_key_mode} "
+        f"filter_attribute_values={format_attribute_value_filters(effective_filter_attribute_values)} "
+        f"limit_samples={limit_samples} "
+        f"limit_samples_by_attribute={limit_samples_by_attribute} "
+        f"limit_samples_per_attribute_value={limit_samples_per_attribute_value} "
+        f"freeze_csi={freeze_csi} freeze_text_prototypes={freeze_text_prototypes} "
+        f"trainable_parameters={count_trainable_parameters(model)}"
     )
 
     output_path = Path(output_dir)
@@ -455,15 +795,31 @@ def run_real_pretrain(
         mean_csi_to_prototype = sum(m["loss_csi_to_prototype"] for m in epoch_metrics) / len(epoch_metrics)
         mean_text_to_prototype = sum(m["loss_text_to_prototype"] for m in epoch_metrics) / len(epoch_metrics)
         mean_attribute_classifier = sum(m.get("loss_attribute_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_attribute_accuracy = sum(m.get("accuracy_attribute_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_attribute_logit_std = sum(m.get("logit_std_attribute_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_grad_csi_encoder = sum(m.get("grad_norm_csi_encoder", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_grad_attribute_classifiers = sum(m.get("grad_norm_attribute_classifiers", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_csi_feature_raw_std = sum(m.get("csi_feature_raw_std", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_csi_feature_normalized_std = sum(m.get("csi_feature_normalized_std", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_positive_count = sum(m.get("multipositive_positive_count_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_logit_scale = sum(m["logit_scale"] for m in epoch_metrics) / len(epoch_metrics)
+        attribute_debug = (
+            f" attr_logit_std={mean_attribute_logit_std:.4f} "
+            f"raw_std={mean_csi_feature_raw_std:.4f} "
+            f"norm_std={mean_csi_feature_normalized_std:.4f} "
+            f"grad_csi={mean_grad_csi_encoder:.4e} "
+            f"grad_attr={mean_grad_attribute_classifiers:.4e}"
+            if attribute_classifier_weight > 0
+            else ""
+        )
         print(
             f"epoch={epoch} steps={len(epoch_metrics)} "
             f"loss={mean_total:.4f} contrastive={mean_contrastive:.4f} "
             f"csi_to_text={mean_csi_to_text:.4f} csi_to_proto={mean_csi_to_prototype:.4f} "
             f"text_to_proto={mean_text_to_prototype:.4f} "
-            f"attr_cls={mean_attribute_classifier:.4f} "
+            f"attr_cls={mean_attribute_classifier:.4f} attr_acc={mean_attribute_accuracy:.4f} "
+            f"{attribute_debug} "
             f"aux_reg={mean_aux_regression:.4f} "
             f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
         )
@@ -475,17 +831,32 @@ def run_real_pretrain(
                         "steps": len(epoch_metrics),
                         "loss_total": mean_total,
                         "contrastive_loss": mean_contrastive,
+                        "checkpoint": checkpoint_path,
                         "csi_to_text_weight": csi_to_text_weight,
                         "loss_csi_to_text": mean_csi_to_text,
                         "loss_csi_to_prototype": mean_csi_to_prototype,
                         "loss_text_to_prototype": mean_text_to_prototype,
                         "loss_attribute_classifier": mean_attribute_classifier,
+                        "accuracy_attribute_classifier": mean_attribute_accuracy,
+                        "logit_std_attribute_classifier": mean_attribute_logit_std,
+                        "csi_feature_raw_std": mean_csi_feature_raw_std,
+                        "csi_feature_normalized_std": mean_csi_feature_normalized_std,
+                        "grad_norm_csi_encoder": mean_grad_csi_encoder,
+                        "grad_norm_attribute_classifiers": mean_grad_attribute_classifiers,
                         "loss_aux_regression": mean_aux_regression,
                         "logit_scale": mean_logit_scale,
                         "text_mode": text_mode,
                         "attribute_classifier_weight": attribute_classifier_weight,
                         "attribute_classifier_fields": list(attribute_classifier_fields),
                         "attribute_classifier_class_weight": attribute_classifier_class_weight,
+                        "attribute_classifier_logit_adjustment": attribute_classifier_logit_adjustment,
+                        "attribute_remap": {
+                            field: {
+                                mapped: list(values)
+                                for mapped, values in mapping.items()
+                            }
+                            for field, mapping in attribute_remap.items()
+                        },
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
                         "multipositive_distance_threshold": multipositive_distance_threshold,
@@ -493,6 +864,15 @@ def run_real_pretrain(
                         "min_class_size_for_multipositive": min_class_size_for_multipositive,
                         "min_class_size": min_class_size,
                         "semantic_key_mode": semantic_key_mode,
+                        "filter_attribute_values": {
+                            field: list(values)
+                            for field, values in effective_filter_attribute_values.items()
+                        },
+                        "limit_samples": limit_samples,
+                        "limit_samples_by_attribute": limit_samples_by_attribute,
+                        "limit_samples_per_attribute_value": limit_samples_per_attribute_value,
+                        "freeze_csi": freeze_csi,
+                        "freeze_text_prototypes": freeze_text_prototypes,
                         "multipositive_positive_count_mean": mean_positive_count,
                         "lr": scheduler.get_last_lr()[0],
                     }
@@ -509,6 +889,7 @@ def run_real_pretrain(
                 "prototype_captions": prototype_bank["captions"],
                 "args": {
                     "data_path": data_path,
+                    "checkpoint": checkpoint_path,
                     "epochs": epochs,
                     "lr": lr,
                     "weight_decay": weight_decay,
@@ -523,6 +904,14 @@ def run_real_pretrain(
                     "attribute_classifier_weight": attribute_classifier_weight,
                     "attribute_classifier_fields": list(attribute_classifier_fields),
                     "attribute_classifier_class_weight": attribute_classifier_class_weight,
+                    "attribute_classifier_logit_adjustment": attribute_classifier_logit_adjustment,
+                    "attribute_remap": {
+                        field: {
+                            mapped: list(values)
+                            for mapped, values in mapping.items()
+                        }
+                        for field, mapping in attribute_remap.items()
+                    },
                     "aux_regression_weight": aux_regression_weight,
                     "aux_regression_targets": list(aux_regression_targets),
                     "multipositive_distance_threshold": multipositive_distance_threshold,
@@ -530,6 +919,15 @@ def run_real_pretrain(
                     "min_class_size_for_multipositive": min_class_size_for_multipositive,
                     "min_class_size": min_class_size,
                     "semantic_key_mode": semantic_key_mode,
+                    "filter_attribute_values": {
+                        field: list(values)
+                        for field, values in effective_filter_attribute_values.items()
+                    },
+                    "limit_samples": limit_samples,
+                    "limit_samples_by_attribute": limit_samples_by_attribute,
+                    "limit_samples_per_attribute_value": limit_samples_per_attribute_value,
+                    "freeze_csi": freeze_csi,
+                    "freeze_text_prototypes": freeze_text_prototypes,
                     "phase": f"csi_clip_{text_mode}_text",
                 },
             }
@@ -543,6 +941,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true", help="Run a synthetic end-to-end training step.")
     parser.add_argument("--data-path", type=str, help="Path to preprocessed .pt samples.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        help="Load compatible model/tokenizer weights from a previous checkpoint before training.",
+    )
     parser.add_argument("--config", type=str, default=str(ROOT / "configs" / "train.yaml"))
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--max-steps-per-epoch", type=int)
@@ -566,8 +969,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--attribute-classifier-class-weight",
-        choices=["none", "balanced"],
-        help="Optional per-attribute class weighting. balanced uses clipped inverse-sqrt frequency weights.",
+        choices=["none", "mild", "balanced"],
+        help=(
+            "Optional per-attribute class weighting. mild uses clipped inverse-fourth-root "
+            "frequency weights; balanced uses clipped inverse-sqrt weights."
+        ),
+    )
+    parser.add_argument(
+        "--attribute-classifier-logit-adjustment",
+        type=float,
+        help=(
+            "Optional training-time logit adjustment strength for long-tail attribute heads. "
+            "Try small values such as 0.1 or 0.25; defaults to config or 0.0."
+        ),
     )
     parser.add_argument("--aux-regression-weight", type=float)
     parser.add_argument(
@@ -585,6 +999,39 @@ def main() -> None:
         "--min-class-size",
         type=int,
         help="Drop semantic classes with fewer than this many samples before training.",
+    )
+    parser.add_argument(
+        "--filter-attribute-values",
+        action="append",
+        help=(
+            "Keep only samples whose SemanticKey field matches listed values. "
+            "Use FIELD=VALUE[,VALUE...], e.g. k_factor_bin=weak,strong."
+        ),
+    )
+    parser.add_argument(
+        "--limit-samples",
+        type=int,
+        help="Keep only the first N samples after semantic remapping and class-size filtering. For overfit debugging.",
+    )
+    parser.add_argument(
+        "--limit-samples-by-attribute",
+        choices=semantic_key_field_choices(),
+        help="For overfit debugging, keep up to N samples per value of this SemanticKey field.",
+    )
+    parser.add_argument(
+        "--limit-samples-per-attribute-value",
+        type=int,
+        help="Number of samples to keep per value when --limit-samples-by-attribute is set.",
+    )
+    parser.add_argument(
+        "--freeze-csi",
+        action="store_true",
+        help="Freeze the CSI encoder. Useful for attribute-head-only overfit diagnostics.",
+    )
+    parser.add_argument(
+        "--freeze-text-prototypes",
+        action="store_true",
+        help="Freeze the text encoder and learnable prototypes.",
     )
     parser.add_argument("--min-class-size-for-multipositive", type=int)
     parser.add_argument("--output-dir", type=str)
@@ -644,13 +1091,21 @@ def main() -> None:
         if args.attribute_classifier_fields is not None
         else cfg_get(train_cfg, "attribute_classifier_fields", default_attribute_fields())
     )
+    attribute_remap = parse_attribute_remap(cfg_get(train_cfg, "attribute_remap", None))
     attribute_classifier_class_weight = (
         args.attribute_classifier_class_weight
         if args.attribute_classifier_class_weight is not None
         else str(cfg_get(train_cfg, "attribute_classifier_class_weight", "none"))
     )
-    if attribute_classifier_class_weight not in ("none", "balanced"):
-        raise ValueError("--attribute-classifier-class-weight must be one of: none, balanced")
+    if attribute_classifier_class_weight not in ("none", "mild", "balanced"):
+        raise ValueError("--attribute-classifier-class-weight must be one of: none, mild, balanced")
+    attribute_classifier_logit_adjustment = (
+        args.attribute_classifier_logit_adjustment
+        if args.attribute_classifier_logit_adjustment is not None
+        else float(cfg_get(train_cfg, "attribute_classifier_logit_adjustment", 0.0))
+    )
+    if attribute_classifier_logit_adjustment < 0.0:
+        raise ValueError("--attribute-classifier-logit-adjustment must be non-negative.")
     aux_regression_weight = (
         args.aux_regression_weight
         if args.aux_regression_weight is not None
@@ -681,8 +1136,38 @@ def main() -> None:
         if args.min_class_size is not None
         else int(cfg_get(train_cfg, "min_class_size", 1))
     )
+    filter_attribute_values = parse_attribute_value_filters(
+        args.filter_attribute_values
+        if args.filter_attribute_values is not None
+        else cfg_get(train_cfg, "filter_attribute_values", None)
+    )
+    limit_samples = (
+        args.limit_samples
+        if args.limit_samples is not None
+        else cfg_get(train_cfg, "limit_samples", None)
+    )
+    if limit_samples is not None:
+        limit_samples = int(limit_samples)
+    limit_samples_by_attribute = (
+        args.limit_samples_by_attribute
+        if args.limit_samples_by_attribute is not None
+        else cfg_get(train_cfg, "limit_samples_by_attribute", None)
+    )
+    limit_samples_per_attribute_value = (
+        args.limit_samples_per_attribute_value
+        if args.limit_samples_per_attribute_value is not None
+        else cfg_get(train_cfg, "limit_samples_per_attribute_value", None)
+    )
+    if limit_samples_per_attribute_value is not None:
+        limit_samples_per_attribute_value = int(limit_samples_per_attribute_value)
+    freeze_csi = bool(args.freeze_csi or cfg_get(train_cfg, "freeze_csi", False))
+    freeze_text_prototypes = bool(
+        args.freeze_text_prototypes
+        or cfg_get(train_cfg, "freeze_text_prototypes", False)
+    )
     output_dir = args.output_dir if args.output_dir is not None else str(cfg_get(train_cfg, "output_dir", "artifacts/pretrain_csi_clip"))
     save_every = args.save_every if args.save_every is not None else int(cfg_get(train_cfg, "save_every", 1))
+    checkpoint_path = args.checkpoint if args.checkpoint is not None else cfg_get(train_cfg, "checkpoint", None)
 
     if args.smoke_test:
         run_smoke_test(
@@ -691,7 +1176,9 @@ def main() -> None:
             csi_to_text_weight=csi_to_text_weight,
             attribute_classifier_weight=attribute_classifier_weight,
             attribute_classifier_fields=attribute_classifier_fields,
+            attribute_remap=attribute_remap,
             attribute_classifier_class_weight=attribute_classifier_class_weight,
+            attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
             multipositive_distance_threshold=multipositive_distance_threshold,
@@ -705,6 +1192,7 @@ def main() -> None:
     if data_path:
         run_real_pretrain(
             data_path=data_path,
+            checkpoint_path=checkpoint_path,
             device=device,
             epochs=epochs,
             max_steps_per_epoch=args.max_steps_per_epoch,
@@ -721,6 +1209,7 @@ def main() -> None:
             attribute_classifier_weight=attribute_classifier_weight,
             attribute_classifier_fields=attribute_classifier_fields,
             attribute_classifier_class_weight=attribute_classifier_class_weight,
+            attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
             multipositive_distance_threshold=multipositive_distance_threshold,
@@ -728,6 +1217,13 @@ def main() -> None:
             min_class_size_for_multipositive=min_class_size_for_multipositive,
             min_class_size=min_class_size,
             semantic_key_mode=semantic_key_mode,
+            attribute_remap=attribute_remap,
+            filter_attribute_values=filter_attribute_values,
+            limit_samples=limit_samples,
+            limit_samples_by_attribute=limit_samples_by_attribute,
+            limit_samples_per_attribute_value=limit_samples_per_attribute_value,
+            freeze_csi=freeze_csi,
+            freeze_text_prototypes=freeze_text_prototypes,
             output_dir=output_dir,
             save_every=save_every,
         )

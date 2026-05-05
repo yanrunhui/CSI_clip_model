@@ -176,7 +176,7 @@ def semantic_key_for_mode(key: SemanticKey, mode: str) -> SemanticKey:
             k_factor_bin=key.k_factor_bin if mode in {"coarse_k", "coarse_k_angle"} else "any",
             first_delay_bin=key.first_delay_bin,
             first_power_bin=key.first_power_bin,
-            first_angle_bin=key.first_angle_bin,
+            first_angle_bin=key.first_angle_bin if mode != "coarse_k" else "any",
             reflection_bin=key.reflection_bin if mode == "coarse_interaction" else "any",
             diffraction_bin=key.diffraction_bin if mode == "coarse_interaction" else "any",
         )
