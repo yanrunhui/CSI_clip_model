@@ -144,14 +144,8 @@ SLOT_VOCAB = {
         "nlos": ["non-line-of-sight", "NLoS", "obstructed"],
     },
     "richness": {
-        "zero": ["zero", "no"],
-        "one": ["one", "single"],
-        "two": ["two"],
-        "three": ["three"],
-        "four": ["four"],
-        "five": ["five"],
-        "six": ["six"],
-        "seven_plus": ["seven or more", "many"],
+        "low": ["low", "sparse", "few"],
+        "high": ["high", "rich", "many"],
     },
     "ds": {
         "any": ["any"],
@@ -168,10 +162,10 @@ SLOT_VOCAB = {
     "kf": {
         "any": ["any"],
         "strong": ["strong", "dominant"],
-        "moderate": ["moderate"],
         "weak": ["weak", "absent"],
     },
     "first_delay": {
+        "any": ["any"],
         "unknown": ["unknown"],
         "short": ["short"],
         "medium": ["medium"],

@@ -11,6 +11,7 @@ class CSIClip(nn.Module):
         csi_encoder: nn.Module,
         text_encoder: nn.Module,
         num_prototypes: int | None = None,
+        semantic_num_classes: int | None = None,
         embed_dim: int = 256,
         temperature: float = 0.07,
         num_physics_targets: int = 10,
@@ -29,6 +30,14 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, num_physics_targets),
         )
+        self.semantic_classifier = None
+        if semantic_num_classes is not None:
+            self.semantic_classifier = nn.Sequential(
+                nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, semantic_num_classes),
+            )
         self.attribute_classifiers = nn.ModuleDict(
             {
                 field: nn.Sequential(
@@ -43,6 +52,24 @@ class CSIClip(nn.Module):
         self.prototypes = None
         if num_prototypes is not None:
             self.prototypes = nn.Parameter(torch.randn(num_prototypes, embed_dim) * 0.02)
+
+    @torch.no_grad()
+    def initialize_prototypes(
+        self,
+        prototype_features: torch.Tensor,
+        normalize: bool = True,
+    ) -> None:
+        if self.prototypes is None:
+            raise RuntimeError("This CSIClip instance was created without learnable prototypes.")
+        if prototype_features.shape != self.prototypes.shape:
+            raise ValueError(
+                f"Prototype init shape mismatch: expected {tuple(self.prototypes.shape)}, "
+                f"got {tuple(prototype_features.shape)}."
+            )
+        features = prototype_features.to(device=self.prototypes.device, dtype=self.prototypes.dtype)
+        if normalize:
+            features = F.normalize(features, dim=-1)
+        self.prototypes.copy_(features)
 
     def encode_csi(
         self,
@@ -80,6 +107,11 @@ class CSIClip(nn.Module):
 
     def predict_physics(self, csi_features: torch.Tensor) -> torch.Tensor:
         return self.physics_head(csi_features)
+
+    def predict_semantic(self, csi_features: torch.Tensor) -> torch.Tensor:
+        if self.semantic_classifier is None:
+            raise RuntimeError("This CSIClip instance was created without a semantic classifier.")
+        return self.semantic_classifier(csi_features)
 
     def predict_attributes(self, csi_features: torch.Tensor) -> dict[str, torch.Tensor]:
         if not self.attribute_classifiers:

@@ -36,6 +36,7 @@ from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
 from models.model import CSIClip
 from models.text_encoder import PhysicsTextEncoder
+from scripts.pretrain import assert_checkpoint_prototype_compatibility
 from training.losses import cosine_alignment_loss, paired_contrastive_loss
 
 
@@ -249,7 +250,7 @@ def _infer_attribute_fields(checkpoint: dict | None, override: tuple[str, ...] |
         return override
     if checkpoint is not None:
         fields = checkpoint.get("args", {}).get("attribute_classifier_fields")
-        if fields:
+        if fields is not None:
             return tuple(str(field) for field in fields)
     return default_attribute_fields()
 
@@ -508,6 +509,7 @@ def evaluate(
         CSIEncoder(d_token=8, d_model=384, d_clip=256),
         PhysicsTextEncoder(vocab_size=max(tokenizer.next_id + 8, 300)),
         num_prototypes=len(prototype_keys),
+        semantic_num_classes=len(prototype_keys),
         embed_dim=256,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
         attribute_num_classes={
@@ -516,10 +518,17 @@ def evaluate(
         },
     ).to(device)
     if checkpoint is not None:
+        assert_checkpoint_prototype_compatibility(
+            checkpoint,
+            prototype_keys,
+            expected_shape=tuple(model.prototypes.shape) if model.prototypes is not None else None,
+            context="evaluation checkpoint",
+        )
         _load_model_state_compatible(model, checkpoint["model_state"])
     model.eval()
 
     all_csi_features = []
+    all_semantic_logits = []
     all_attribute_logits = {field: [] for field in attribute_label_maps}
     all_attribute_labels = {field: [] for field in attribute_label_maps}
     all_instance_text_features = []
@@ -529,6 +538,10 @@ def evaluate(
     all_physics_masks = []
     all_labels = []
     all_text_labels = []
+    semantic_classifier_enabled = (
+        checkpoint is not None
+        and float(checkpoint.get("args", {}).get("semantic_classifier_weight", 0.0)) > 0
+    )
 
     for batch in loader:
         batch = move_batch(batch, device)
@@ -543,6 +556,8 @@ def evaluate(
         )
         csi_features = F.normalize(csi_features_raw, dim=-1)
         all_csi_features.append(csi_features.cpu())
+        if semantic_classifier_enabled:
+            all_semantic_logits.append(model.predict_semantic(csi_features_raw).cpu())
         if attribute_label_maps:
             attribute_logits = model.predict_attributes(csi_features_raw)
             for field, label_map in attribute_label_maps.items():
@@ -573,6 +588,7 @@ def evaluate(
     ).cpu()
     prototype_features = model.encode_prototypes(normalize=True).cpu()
     csi_features = torch.cat(all_csi_features, dim=0)
+    semantic_logits = torch.cat(all_semantic_logits, dim=0) if all_semantic_logits else None
     attribute_logits = {
         field: torch.cat(chunks, dim=0)
         for field, chunks in all_attribute_logits.items()
@@ -635,6 +651,8 @@ def evaluate(
     print(f"limit_samples_by_attribute={limit_samples_by_attribute}")
     print(f"limit_samples_per_attribute_value={limit_samples_per_attribute_value}")
     print(f"semantic_prototypes={len(prototype_keys)}")
+    if semantic_classifier_enabled and semantic_logits is not None:
+        _print_semantic_classifier_metrics(semantic_logits, labels, prototype_keys)
     if checkpoint is not None and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0:
         print(f"attribute_classifier_fields={','.join(attribute_fields)}")
         print(
@@ -897,6 +915,71 @@ def _print_attribute_classifier_metrics(
                 f"attribute_classifier_{field}_confusion_pair_rank_{printed}="
                 f"true:{id_to_value[true_label]} pred:{id_to_value[pred_label]} count:{count}"
             )
+
+
+def _print_semantic_classifier_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    prototype_keys: list[SemanticKey],
+) -> None:
+    predictions = logits.argmax(dim=1)
+    num_classes = len(prototype_keys)
+    confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
+    for true_label, pred_label in zip(labels.tolist(), predictions.tolist()):
+        confusion[int(true_label), int(pred_label)] += 1
+
+    class_sizes = confusion.sum(dim=1)
+    class_correct = confusion.diag()
+    nonempty = class_sizes > 0
+    class_accuracy = torch.zeros(num_classes, dtype=torch.float32)
+    class_accuracy[nonempty] = class_correct[nonempty].float() / class_sizes[nonempty].float()
+    top1 = (predictions == labels).float().mean()
+    macro_acc = class_accuracy[nonempty].mean() if bool(nonempty.any()) else torch.zeros(())
+    majority_label = int(class_sizes.argmax().item())
+    majority_acc = float(class_sizes[majority_label]) / max(int(class_sizes.sum().item()), 1)
+    prediction_sizes = torch.bincount(predictions, minlength=num_classes)
+
+    print(f"semantic_classifier_loss={float(F.cross_entropy(logits, labels)):.4f}")
+    print(f"semantic_classifier_top1={float(top1):.4f}")
+    print(f"semantic_classifier_macro_top1={float(macro_acc):.4f}")
+    print(f"semantic_classifier_majority_baseline_R@1={majority_acc:.4f}")
+    print(f"semantic_classifier_majority_key={prototype_keys[majority_label]}")
+    print(
+        f"semantic_classifier_class_size_accuracy_pearson="
+        f"{_safe_pearson(class_sizes[nonempty].float(), class_accuracy[nonempty]):.4f}"
+    )
+    print(
+        "semantic_classifier_prediction_distribution="
+        + ";".join(
+            f"{prototype_keys[class_idx]}:{int(prediction_sizes[class_idx])}"
+            for class_idx in range(num_classes)
+        )
+    )
+    for class_idx in range(num_classes):
+        print(
+            f"semantic_classifier_class_{class_idx}="
+            f"key:{prototype_keys[class_idx]} "
+            f"size:{int(class_sizes[class_idx])} "
+            f"pred:{int(prediction_sizes[class_idx])} "
+            f"acc:{float(class_accuracy[class_idx]):.4f}"
+        )
+
+    offdiag = confusion.clone()
+    offdiag.fill_diagonal_(0)
+    flat_counts = offdiag.flatten()
+    top_confusions = torch.argsort(flat_counts, descending=True)
+    printed = 0
+    for flat_idx_tensor in top_confusions:
+        count = int(flat_counts[int(flat_idx_tensor)].item())
+        if count <= 0 or printed >= min(10, num_classes * num_classes):
+            break
+        true_label = int(flat_idx_tensor.item() // num_classes)
+        pred_label = int(flat_idx_tensor.item() % num_classes)
+        printed += 1
+        print(
+            f"semantic_classifier_confusion_pair_rank_{printed}="
+            f"true:{prototype_keys[true_label]} pred:{prototype_keys[pred_label]} count:{count}"
+        )
 
 
 def _print_semantic_retrieval_metrics(

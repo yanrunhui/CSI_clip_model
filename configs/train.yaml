@@ -13,31 +13,12 @@ train:
   prototype_weight: 1.0
   text_prototype_weight: 1.0
   text_mode: prototype
+  prototype_warmup_epochs: 5
+  semantic_classifier_weight: 1.0
+  semantic_classifier_class_weight: mild
+  semantic_classifier_logit_adjustment: 0.0
   attribute_classifier_weight: 0.0
-  attribute_classifier_fields:
-    - los_status
-    - path_richness
-    - k_factor_bin
-    - first_delay_bin
-    - first_power_bin
-  attribute_remap:
-    path_richness:
-      low:
-        - zero
-        - one
-        - two
-      mid:
-        - three
-        - four
-      high:
-        - five
-        - six
-        - seven_plus
-    k_factor_bin:
-      weak:
-        - weak
-      strong:
-        - strong
+  attribute_classifier_fields: []
   attribute_classifier_class_weight: mild
   attribute_classifier_logit_adjustment: 0.0
   semantic_key_mode: coarse_k

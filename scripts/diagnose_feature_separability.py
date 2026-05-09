@@ -33,6 +33,7 @@ from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
 from models.model import CSIClip
 from models.text_encoder import PhysicsTextEncoder
+from scripts.pretrain import assert_checkpoint_prototype_compatibility
 
 
 def semantic_key_sort_key(key: SemanticKey) -> tuple[str, ...]:
@@ -110,11 +111,18 @@ def load_model(
         CSIEncoder(d_token=8, d_model=384, d_clip=256),
         PhysicsTextEncoder(vocab_size=max(tokenizer.next_id + 8, 300)),
         num_prototypes=len(unique_keys),
+        semantic_num_classes=len(unique_keys),
         embed_dim=256,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
         attribute_num_classes={attribute_field: len(label_map)},
     ).to(device)
     if checkpoint is not None:
+        assert_checkpoint_prototype_compatibility(
+            checkpoint,
+            unique_keys,
+            expected_shape=tuple(model.prototypes.shape) if model.prototypes is not None else None,
+            context="feature separability checkpoint",
+        )
         model_state = model.state_dict()
         compatible_state = {
             name: value

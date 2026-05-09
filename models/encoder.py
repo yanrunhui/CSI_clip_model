@@ -60,9 +60,18 @@ class CSIEncoder(nn.Module):
         d_token: int = 8,
         n_freq_bins: int = 3,
         n_bw_bins: int = 3,
+        token_norm_mode: str = "std",
+        token_norm_eps: float = 1e-6,
     ):
         super().__init__()
+        if token_norm_mode not in {"none", "rms", "std"}:
+            raise ValueError(
+                "token_norm_mode must be one of: none, rms, std, "
+                f"got {token_norm_mode!r}."
+            )
         self.input_proj = InputProjection(d_token=d_token, d_model=d_model)
+        self.token_norm_mode = token_norm_mode
+        self.token_norm_eps = token_norm_eps
         self.beam_pe = BeamPositionEncoding(d_model)
         self.freq_enc = FrequencyBandEncoding(d_model, n_freq_bins=n_freq_bins, n_bw_bins=n_bw_bins)
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
@@ -82,6 +91,33 @@ class CSIEncoder(nn.Module):
             nn.Linear(d_model, d_clip),
         )
 
+    def _normalize_tokens(
+        self,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.token_norm_mode == "none":
+            return tokens
+
+        weights = token_mask.to(dtype=tokens.dtype).unsqueeze(-1).unsqueeze(-1)
+        element_count = token_mask.sum(dim=1, keepdim=True).to(dtype=tokens.dtype)
+        element_count = (element_count * (tokens.shape[2] * tokens.shape[3])).clamp(min=1.0)
+
+        if self.token_norm_mode == "rms":
+            rms = torch.sqrt(
+                ((tokens.square() * weights).sum(dim=(1, 2, 3), keepdim=True) / element_count[:, :, None, None])
+                .clamp(min=self.token_norm_eps ** 2)
+            )
+            return tokens * weights / rms
+
+        mean = (tokens * weights).sum(dim=(1, 2, 3), keepdim=True) / element_count[:, :, None, None]
+        centered = (tokens - mean) * weights
+        std = torch.sqrt(
+            (centered.square().sum(dim=(1, 2, 3), keepdim=True) / element_count[:, :, None, None])
+            .clamp(min=self.token_norm_eps ** 2)
+        )
+        return centered / std
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -91,6 +127,7 @@ class CSIEncoder(nn.Module):
         bw_bin: torch.Tensor,
         subcarrier_spacing: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens = self._normalize_tokens(tokens, token_mask)
         x = self.input_proj(tokens, subcarrier_spacing)
         x = x + self.beam_pe(beam_positions) + self.freq_enc(freq_bin, bw_bin)
 

@@ -190,6 +190,74 @@ def semantic_key_sort_key(key: SemanticKey) -> tuple[str, ...]:
     )
 
 
+def serialize_prototype_keys(keys: list[SemanticKey]) -> list[dict[str, str]]:
+    fields = tuple(SemanticKey.__dataclass_fields__)
+    return [{field: str(getattr(key, field)) for field in fields} for key in keys]
+
+
+def deserialize_prototype_keys(value) -> list[SemanticKey] | None:
+    if value is None:
+        return None
+    fields = tuple(SemanticKey.__dataclass_fields__)
+    keys: list[SemanticKey] = []
+    for item in value:
+        if isinstance(item, SemanticKey):
+            keys.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise ValueError(
+                "checkpoint prototype_keys entries must be SemanticKey objects or field mappings."
+            )
+        missing = [field for field in fields if field not in item]
+        if missing:
+            raise ValueError(
+                f"checkpoint prototype_keys entry is missing fields: {', '.join(missing)}"
+            )
+        keys.append(SemanticKey(**{field: str(item[field]) for field in fields}))
+    return keys
+
+
+def _format_prototype_key(key: SemanticKey) -> str:
+    fields = tuple(SemanticKey.__dataclass_fields__)
+    return ",".join(f"{field}={getattr(key, field)}" for field in fields)
+
+
+def assert_checkpoint_prototype_compatibility(
+    checkpoint: dict | None,
+    current_keys: list[SemanticKey],
+    expected_shape: tuple[int, ...] | None = None,
+    context: str = "checkpoint",
+) -> None:
+    if checkpoint is None:
+        return
+    prototype_tensor = checkpoint.get("model_state", {}).get("prototypes")
+    if prototype_tensor is None:
+        return
+    if expected_shape is not None and tuple(prototype_tensor.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"{context} prototype tensor shape mismatch: "
+            f"checkpoint={tuple(prototype_tensor.shape)} current={tuple(expected_shape)}."
+        )
+    checkpoint_keys = deserialize_prototype_keys(checkpoint.get("prototype_keys"))
+    if checkpoint_keys is None:
+        raise ValueError(
+            f"{context} contains learnable prototypes but is missing prototype_keys metadata; "
+            "cannot verify prototype ordering."
+        )
+    if len(checkpoint_keys) != len(current_keys):
+        raise ValueError(
+            f"{context} prototype key count mismatch: "
+            f"checkpoint={len(checkpoint_keys)} current={len(current_keys)}."
+        )
+    for idx, (checkpoint_key, current_key) in enumerate(zip(checkpoint_keys, current_keys)):
+        if checkpoint_key != current_key:
+            raise ValueError(
+                f"{context} prototype key mismatch at index {idx}: "
+                f"checkpoint[{idx}]={_format_prototype_key(checkpoint_key)} "
+                f"current[{idx}]={_format_prototype_key(current_key)}."
+            )
+
+
 def build_prototype_bank(
     samples,
     tokenizer: CaptionTokenizer,
@@ -295,6 +363,7 @@ def build_components_from_samples(
         csi_encoder,
         text_encoder,
         num_prototypes=len(prototype_keys),
+        semantic_num_classes=len(prototype_keys),
         embed_dim=256,
         temperature=temperature,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
@@ -326,6 +395,50 @@ def freeze_text_and_prototypes(model: CSIClip) -> None:
     freeze_module(model.text)
     if model.prototypes is not None:
         model.prototypes.requires_grad = False
+
+
+def checkpoint_has_compatible_prototypes(
+    model: CSIClip,
+    checkpoint: dict | None,
+    prototype_keys: list[SemanticKey] | None = None,
+) -> bool:
+    if checkpoint is None or model.prototypes is None:
+        return False
+    tensor = checkpoint.get("model_state", {}).get("prototypes")
+    if tensor is None or tuple(tensor.shape) != tuple(model.prototypes.shape):
+        return False
+    if prototype_keys is None:
+        return True
+    try:
+        assert_checkpoint_prototype_compatibility(
+            checkpoint,
+            prototype_keys,
+            expected_shape=tuple(model.prototypes.shape),
+            context="checkpoint",
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def initialize_prototypes_from_canonical_text(
+    model: CSIClip,
+    prototype_token_ids: torch.Tensor,
+    prototype_token_mask: torch.Tensor,
+) -> None:
+    if model.prototypes is None:
+        return
+    was_training = model.text.training
+    model.text.eval()
+    with torch.no_grad():
+        text_features = model.encode_text(
+            prototype_token_ids.to(next(model.parameters()).device),
+            prototype_token_mask.to(next(model.parameters()).device),
+            normalize=True,
+        )
+        model.initialize_prototypes(text_features, normalize=False)
+    if was_training:
+        model.text.train()
 
 
 def trainable_parameters(model: torch.nn.Module):
@@ -575,6 +688,9 @@ def run_smoke_test(
     device: torch.device,
     text_mode: str = "prototype",
     csi_to_text_weight: float = 1.0,
+    semantic_classifier_weight: float = 0.0,
+    semantic_classifier_class_weight: str = "none",
+    semantic_classifier_logit_adjustment: float = 0.0,
     attribute_classifier_weight: float = 0.0,
     attribute_classifier_fields: tuple[str, ...] = (),
     attribute_classifier_class_weight: str = "none",
@@ -592,6 +708,11 @@ def run_smoke_test(
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
         attribute_remap=attribute_remap,
+    )
+    initialize_prototypes_from_canonical_text(
+        model,
+        prototype_bank["token_ids"],
+        prototype_bank["token_mask"],
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
     scheduler = build_lr_scheduler(optimizer, total_epochs=2, warmup_epochs=1)
@@ -617,11 +738,15 @@ def run_smoke_test(
                     epochs=2,
                     text_mode=text_mode,
                     csi_to_text_weight=csi_to_text_weight,
+                    semantic_classifier_weight=semantic_classifier_weight,
+                    semantic_classifier_class_weight=semantic_classifier_class_weight,
+                    semantic_classifier_logit_adjustment=semantic_classifier_logit_adjustment,
                     attribute_classifier_weight=attribute_classifier_weight,
                     attribute_classifier_class_weight=attribute_classifier_class_weight,
                     attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
                     aux_regression_weight=aux_regression_weight,
                     aux_regression_indices=aux_regression_indices(aux_regression_targets),
+                    prototype_warmup_epochs=1,
                     multipositive_distance_threshold=multipositive_distance_threshold,
                     multipositive_positive_mode=multipositive_positive_mode,
                     min_class_size_for_multipositive=min_class_size_for_multipositive,
@@ -651,6 +776,10 @@ def run_real_pretrain(
     csi_to_text_weight: float,
     text_prototype_weight: float,
     text_mode: str,
+    prototype_warmup_epochs: int,
+    semantic_classifier_weight: float,
+    semantic_classifier_class_weight: str,
+    semantic_classifier_logit_adjustment: float,
     attribute_classifier_weight: float,
     attribute_classifier_fields: tuple[str, ...],
     attribute_classifier_class_weight: str,
@@ -697,7 +826,20 @@ def run_real_pretrain(
         ),
     )
     if transfer_checkpoint is not None:
+        assert_checkpoint_prototype_compatibility(
+            transfer_checkpoint,
+            prototype_bank["keys"],
+            expected_shape=tuple(model.prototypes.shape) if model.prototypes is not None else None,
+            context="transfer checkpoint",
+        )
+    if transfer_checkpoint is not None:
         load_model_state_compatible(model, transfer_checkpoint)
+    if not checkpoint_has_compatible_prototypes(model, transfer_checkpoint, prototype_bank["keys"]):
+        initialize_prototypes_from_canonical_text(
+            model,
+            prototype_bank["token_ids"],
+            prototype_bank["token_mask"],
+        )
     if freeze_csi:
         freeze_module(model.csi)
     if freeze_text_prototypes:
@@ -720,6 +862,10 @@ def run_real_pretrain(
         prototype_weight=prototype_weight,
         text_prototype_weight=text_prototype_weight,
         text_mode=text_mode,
+        prototype_warmup_epochs=prototype_warmup_epochs,
+        semantic_classifier_weight=semantic_classifier_weight,
+        semantic_classifier_class_weight=semantic_classifier_class_weight,
+        semantic_classifier_logit_adjustment=semantic_classifier_logit_adjustment,
         attribute_classifier_weight=attribute_classifier_weight,
         attribute_classifier_class_weight=attribute_classifier_class_weight,
         attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
@@ -755,6 +901,10 @@ def run_real_pretrain(
         f"csi_to_text_weight={csi_to_text_weight} "
         f"prototype_weight={prototype_weight} text_prototype_weight={text_prototype_weight} "
         f"text_mode={text_mode} "
+        f"prototype_warmup_epochs={prototype_warmup_epochs} "
+        f"semantic_classifier_weight={semantic_classifier_weight} "
+        f"semantic_classifier_class_weight={semantic_classifier_class_weight} "
+        f"semantic_classifier_logit_adjustment={semantic_classifier_logit_adjustment} "
         f"attribute_classifier_weight={attribute_classifier_weight} "
         f"attribute_classifier_fields={','.join(attribute_classifier_fields)} "
         f"attribute_classifier_class_weight={attribute_classifier_class_weight} "
@@ -794,23 +944,70 @@ def run_real_pretrain(
         mean_csi_to_text = sum(m["loss_csi_to_text"] for m in epoch_metrics) / len(epoch_metrics)
         mean_csi_to_prototype = sum(m["loss_csi_to_prototype"] for m in epoch_metrics) / len(epoch_metrics)
         mean_text_to_prototype = sum(m["loss_text_to_prototype"] for m in epoch_metrics) / len(epoch_metrics)
+        mean_semantic_classifier = sum(m.get("loss_semantic_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_semantic_accuracy = sum(m.get("accuracy_semantic_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_semantic_logit_std = sum(m.get("logit_std_semantic_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_semantic_logit_mean = sum(m.get("semantic_logit_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_semantic_logit_max_mean = sum(m.get("semantic_logit_max_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_semantic_pred_majority_fraction = sum(
+            m.get("batch_semantic_prediction_majority_fraction", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_semantic_pred_unique_classes = sum(
+            m.get("batch_semantic_prediction_unique_classes", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_semantic_head_bias_mean = sum(
+            m.get("semantic_head_bias_mean", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_semantic_head_bias_std = sum(
+            m.get("semantic_head_bias_std", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_semantic_head_bias_argmax = sum(
+            m.get("semantic_head_bias_argmax", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
         mean_attribute_classifier = sum(m.get("loss_attribute_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_attribute_accuracy = sum(m.get("accuracy_attribute_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_attribute_logit_std = sum(m.get("logit_std_attribute_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_grad_csi_encoder = sum(m.get("grad_norm_csi_encoder", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_grad_semantic_classifier = sum(m.get("grad_norm_semantic_classifier", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_grad_attribute_classifiers = sum(m.get("grad_norm_attribute_classifiers", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_csi_feature_raw_std = sum(m.get("csi_feature_raw_std", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_csi_feature_normalized_std = sum(m.get("csi_feature_normalized_std", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_batch_label_majority_fraction = sum(
+            m.get("batch_label_majority_fraction", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_batch_label_unique_classes = sum(
+            m.get("batch_label_unique_classes", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_positive_count = sum(m.get("multipositive_positive_count_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_logit_scale = sum(m["logit_scale"] for m in epoch_metrics) / len(epoch_metrics)
+        mean_prototype_warmup_active = sum(m.get("prototype_warmup_active", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        last_batch_label_histogram = epoch_metrics[-1].get("batch_label_histogram", "")
+        last_batch_semantic_argmax_histogram = epoch_metrics[-1].get("batch_semantic_argmax_histogram", "")
+        last_batch_semantic_head_bias_values = epoch_metrics[-1].get("semantic_head_bias_values", "")
         attribute_debug = (
+            f" sem_logit_std={mean_semantic_logit_std:.4f} "
+            f"sem_logit_mean={mean_semantic_logit_mean:.4f} "
+            f"sem_logit_max={mean_semantic_logit_max_mean:.4f} "
+            f"sem_grad={mean_grad_semantic_classifier:.4e} "
+            f"sem_pred_maj={mean_semantic_pred_majority_fraction:.4f} "
+            f"sem_pred_u={mean_semantic_pred_unique_classes:.2f} "
+            f"sem_bias_mean={mean_semantic_head_bias_mean:.4f} "
+            f"sem_bias_std={mean_semantic_head_bias_std:.4f} "
+            f"sem_bias_argmax={mean_semantic_head_bias_argmax:.2f} "
             f" attr_logit_std={mean_attribute_logit_std:.4f} "
             f"raw_std={mean_csi_feature_raw_std:.4f} "
             f"norm_std={mean_csi_feature_normalized_std:.4f} "
+            f"label_maj={mean_batch_label_majority_fraction:.4f} "
+            f"label_u={mean_batch_label_unique_classes:.2f} "
             f"grad_csi={mean_grad_csi_encoder:.4e} "
             f"grad_attr={mean_grad_attribute_classifiers:.4e}"
-            if attribute_classifier_weight > 0
+            if semantic_classifier_weight > 0 or attribute_classifier_weight > 0
             else ""
         )
         print(
@@ -818,7 +1015,9 @@ def run_real_pretrain(
             f"loss={mean_total:.4f} contrastive={mean_contrastive:.4f} "
             f"csi_to_text={mean_csi_to_text:.4f} csi_to_proto={mean_csi_to_prototype:.4f} "
             f"text_to_proto={mean_text_to_prototype:.4f} "
+            f"sem_cls={mean_semantic_classifier:.4f} sem_acc={mean_semantic_accuracy:.4f} "
             f"attr_cls={mean_attribute_classifier:.4f} attr_acc={mean_attribute_accuracy:.4f} "
+            f"proto_warmup_active={mean_prototype_warmup_active:.2f} "
             f"{attribute_debug} "
             f"aux_reg={mean_aux_regression:.4f} "
             f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
@@ -836,16 +1035,37 @@ def run_real_pretrain(
                         "loss_csi_to_text": mean_csi_to_text,
                         "loss_csi_to_prototype": mean_csi_to_prototype,
                         "loss_text_to_prototype": mean_text_to_prototype,
+                        "loss_semantic_classifier": mean_semantic_classifier,
+                        "accuracy_semantic_classifier": mean_semantic_accuracy,
+                        "logit_std_semantic_classifier": mean_semantic_logit_std,
+                        "semantic_logit_mean": mean_semantic_logit_mean,
+                        "semantic_logit_max_mean": mean_semantic_logit_max_mean,
+                        "batch_semantic_prediction_majority_fraction": mean_semantic_pred_majority_fraction,
+                        "batch_semantic_prediction_unique_classes": mean_semantic_pred_unique_classes,
+                        "semantic_head_bias_mean": mean_semantic_head_bias_mean,
+                        "semantic_head_bias_std": mean_semantic_head_bias_std,
+                        "semantic_head_bias_argmax": mean_semantic_head_bias_argmax,
                         "loss_attribute_classifier": mean_attribute_classifier,
                         "accuracy_attribute_classifier": mean_attribute_accuracy,
                         "logit_std_attribute_classifier": mean_attribute_logit_std,
                         "csi_feature_raw_std": mean_csi_feature_raw_std,
                         "csi_feature_normalized_std": mean_csi_feature_normalized_std,
+                        "batch_label_majority_fraction": mean_batch_label_majority_fraction,
+                        "batch_label_unique_classes": mean_batch_label_unique_classes,
+                        "last_batch_label_histogram": last_batch_label_histogram,
+                        "last_batch_semantic_argmax_histogram": last_batch_semantic_argmax_histogram,
+                        "last_batch_semantic_head_bias_values": last_batch_semantic_head_bias_values,
                         "grad_norm_csi_encoder": mean_grad_csi_encoder,
+                        "grad_norm_semantic_classifier": mean_grad_semantic_classifier,
                         "grad_norm_attribute_classifiers": mean_grad_attribute_classifiers,
                         "loss_aux_regression": mean_aux_regression,
                         "logit_scale": mean_logit_scale,
                         "text_mode": text_mode,
+                        "prototype_warmup_epochs": prototype_warmup_epochs,
+                        "prototype_warmup_active": mean_prototype_warmup_active,
+                        "semantic_classifier_weight": semantic_classifier_weight,
+                        "semantic_classifier_class_weight": semantic_classifier_class_weight,
+                        "semantic_classifier_logit_adjustment": semantic_classifier_logit_adjustment,
                         "attribute_classifier_weight": attribute_classifier_weight,
                         "attribute_classifier_fields": list(attribute_classifier_fields),
                         "attribute_classifier_class_weight": attribute_classifier_class_weight,
@@ -886,6 +1106,7 @@ def run_real_pretrain(
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "tokenizer_word2id": tokenizer.word2id,
+                "prototype_keys": serialize_prototype_keys(prototype_bank["keys"]),
                 "prototype_captions": prototype_bank["captions"],
                 "args": {
                     "data_path": data_path,
@@ -901,6 +1122,10 @@ def run_real_pretrain(
                     "prototype_weight": prototype_weight,
                     "text_prototype_weight": text_prototype_weight,
                     "text_mode": text_mode,
+                    "prototype_warmup_epochs": prototype_warmup_epochs,
+                    "semantic_classifier_weight": semantic_classifier_weight,
+                    "semantic_classifier_class_weight": semantic_classifier_class_weight,
+                    "semantic_classifier_logit_adjustment": semantic_classifier_logit_adjustment,
                     "attribute_classifier_weight": attribute_classifier_weight,
                     "attribute_classifier_fields": list(attribute_classifier_fields),
                     "attribute_classifier_class_weight": attribute_classifier_class_weight,
@@ -959,6 +1184,28 @@ def main() -> None:
     parser.add_argument("--prototype-weight", type=float)
     parser.add_argument("--text-prototype-weight", type=float)
     parser.add_argument("--text-mode", choices=["prototype", "instance", "multipositive"])
+    parser.add_argument(
+        "--prototype-warmup-epochs",
+        type=int,
+        help="Train only text-to-prototype alignment for the first N epochs before enabling CSI losses.",
+    )
+    parser.add_argument("--semantic-classifier-weight", type=float)
+    parser.add_argument(
+        "--semantic-classifier-class-weight",
+        choices=["none", "mild", "balanced"],
+        help=(
+            "Optional class weighting for the direct semantic classifier. "
+            "mild uses clipped inverse-fourth-root frequency weights; balanced uses clipped inverse-sqrt weights."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-classifier-logit-adjustment",
+        type=float,
+        help=(
+            "Optional training-time logit adjustment strength for the direct semantic classifier. "
+            "Try small values such as 0.1 or 0.25; defaults to config or 0.0."
+        ),
+    )
     parser.add_argument("--semantic-key-mode", choices=semantic_key_mode_choices())
     parser.add_argument("--attribute-classifier-weight", type=float)
     parser.add_argument(
@@ -1076,11 +1323,35 @@ def main() -> None:
         else float(cfg_get(train_cfg, "text_prototype_weight", 1.0))
     )
     text_mode = args.text_mode if args.text_mode is not None else str(cfg_get(train_cfg, "text_mode", "prototype"))
+    prototype_warmup_epochs = (
+        args.prototype_warmup_epochs
+        if args.prototype_warmup_epochs is not None
+        else int(cfg_get(train_cfg, "prototype_warmup_epochs", 0))
+    )
     semantic_key_mode = (
         args.semantic_key_mode
         if args.semantic_key_mode is not None
         else str(cfg_get(train_cfg, "semantic_key_mode", "full"))
     )
+    semantic_classifier_weight = (
+        args.semantic_classifier_weight
+        if args.semantic_classifier_weight is not None
+        else float(cfg_get(train_cfg, "semantic_classifier_weight", 0.0))
+    )
+    semantic_classifier_class_weight = (
+        args.semantic_classifier_class_weight
+        if args.semantic_classifier_class_weight is not None
+        else str(cfg_get(train_cfg, "semantic_classifier_class_weight", "none"))
+    )
+    if semantic_classifier_class_weight not in ("none", "mild", "balanced"):
+        raise ValueError("--semantic-classifier-class-weight must be one of: none, mild, balanced")
+    semantic_classifier_logit_adjustment = (
+        args.semantic_classifier_logit_adjustment
+        if args.semantic_classifier_logit_adjustment is not None
+        else float(cfg_get(train_cfg, "semantic_classifier_logit_adjustment", 0.0))
+    )
+    if semantic_classifier_logit_adjustment < 0.0:
+        raise ValueError("--semantic-classifier-logit-adjustment must be non-negative.")
     attribute_classifier_weight = (
         args.attribute_classifier_weight
         if args.attribute_classifier_weight is not None
@@ -1174,6 +1445,9 @@ def main() -> None:
             device,
             text_mode=text_mode,
             csi_to_text_weight=csi_to_text_weight,
+            semantic_classifier_weight=semantic_classifier_weight,
+            semantic_classifier_class_weight=semantic_classifier_class_weight,
+            semantic_classifier_logit_adjustment=semantic_classifier_logit_adjustment,
             attribute_classifier_weight=attribute_classifier_weight,
             attribute_classifier_fields=attribute_classifier_fields,
             attribute_remap=attribute_remap,
@@ -1206,6 +1480,10 @@ def main() -> None:
             prototype_weight=prototype_weight,
             text_prototype_weight=text_prototype_weight,
             text_mode=text_mode,
+            prototype_warmup_epochs=prototype_warmup_epochs,
+            semantic_classifier_weight=semantic_classifier_weight,
+            semantic_classifier_class_weight=semantic_classifier_class_weight,
+            semantic_classifier_logit_adjustment=semantic_classifier_logit_adjustment,
             attribute_classifier_weight=attribute_classifier_weight,
             attribute_classifier_fields=attribute_classifier_fields,
             attribute_classifier_class_weight=attribute_classifier_class_weight,

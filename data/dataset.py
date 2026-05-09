@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .caption import CaptionGenerator
-from .semantic_key import SemanticKey
+from .semantic_key import SemanticKey, normalize_k_factor_bin, normalize_path_richness
 from .tokenizer import CaptionTokenizer
 
 SEMANTIC_KEY_MODES = (
@@ -170,11 +170,11 @@ def semantic_key_for_mode(key: SemanticKey, mode: str) -> SemanticKey:
         return SemanticKey(
             env_type=key.env_type,
             los_status=key.los_status,
-            path_richness=key.path_richness,
+            path_richness=normalize_path_richness(key.path_richness),
             ds_bin=key.ds_bin if mode == "coarse_delay" else "any",
             as_az_bin=key.as_az_bin if mode in {"coarse_angle", "coarse_k_angle"} else "any",
-            k_factor_bin=key.k_factor_bin if mode in {"coarse_k", "coarse_k_angle"} else "any",
-            first_delay_bin=key.first_delay_bin,
+            k_factor_bin=normalize_k_factor_bin(key.k_factor_bin) if mode in {"coarse_k", "coarse_k_angle"} else "any",
+            first_delay_bin=key.first_delay_bin if mode not in {"coarse_k", "coarse_k_angle"} else "any",
             first_power_bin=key.first_power_bin,
             first_angle_bin=key.first_angle_bin if mode != "coarse_k" else "any",
             reflection_bin=key.reflection_bin if mode == "coarse_interaction" else "any",
@@ -304,9 +304,9 @@ def build_synthetic_samples(
 ) -> list[PreprocessedSample]:
     samples: list[PreprocessedSample] = []
     keys = [
-        SemanticKey("indoor", "los", "four", "low", "narrow", "strong", "short", "strong", "front", "none", "none"),
-        SemanticKey("outdoor", "nlos", "seven_plus", "high", "wide", "weak", "long", "weak", "left", "heavy", "light"),
-        SemanticKey("O2I", "nlos", "two", "moderate", "moderate", "moderate", "medium", "moderate", "right", "light", "none"),
+        SemanticKey("indoor", "los", "high", "low", "narrow", "strong", "short", "strong", "front", "none", "none"),
+        SemanticKey("outdoor", "nlos", "high", "high", "wide", "weak", "long", "weak", "left", "heavy", "light"),
+        SemanticKey("O2I", "nlos", "low", "moderate", "moderate", "weak", "medium", "moderate", "right", "light", "none"),
     ]
     configs = [
         ("ULA-16", 4, 0, 1, 1),

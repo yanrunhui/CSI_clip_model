@@ -6,14 +6,8 @@ from typing import Mapping
 import numpy as np
 
 PATH_RICHNESS_LABELS = (
-    "zero",
-    "one",
-    "two",
-    "three",
-    "four",
-    "five",
-    "six",
-    "seven_plus",
+    "low",
+    "high",
 )
 
 PROP_DISC = {
@@ -50,8 +44,7 @@ PROP_DISC = {
         "wide": (40, float("inf")),
     },
     "k_factor_db": {
-        "strong": (10, float("inf")),
-        "moderate": (3, 10),
+        "strong": (3, float("inf")),
         "weak": (float("-inf"), 3),
     },
     "interaction_count": {
@@ -123,9 +116,21 @@ def semantic_key_field_choices() -> tuple[str, ...]:
 AttributeRemap = Mapping[str, Mapping[str, tuple[str, ...] | list[str]]]
 
 
+def normalize_path_richness(value: str) -> str:
+    return "low" if str(value) in {"zero", "one", "two", "low"} else "high"
+
+
+def normalize_k_factor_bin(value: str) -> str:
+    return "weak" if str(value) == "weak" else "strong"
+
+
 def semantic_key_attribute_raw_value(key: SemanticKey, field: str) -> str:
+    if field == "path_richness":
+        return normalize_path_richness(key.path_richness)
+    if field == "k_factor_bin":
+        return normalize_k_factor_bin(key.k_factor_bin)
     if field == "k_factor_binary":
-        return key.k_factor_bin if key.k_factor_bin in {"weak", "strong"} else "moderate"
+        return normalize_k_factor_bin(key.k_factor_bin)
     if field == "first_power_binary":
         return key.first_power_bin if key.first_power_bin in {"weak", "strong"} else "moderate"
     return str(getattr(key, field))
@@ -218,7 +223,9 @@ def build_semantic_key(sample: Mapping[str, float] | object) -> SemanticKey:
     return SemanticKey(
         env_type=_get(sample, "environment_type"),
         los_status="los" if bool(_get(sample, "los_status")) else "nlos",
-        path_richness=discretize(float(_get(sample, "n_paths")), PROP_DISC["n_paths"]),
+        path_richness=normalize_path_richness(
+            discretize(float(_get(sample, "n_paths")), PROP_DISC["n_paths"])
+        ),
         ds_bin=discretize(
             float(_get(sample, "delay_spread")) * 1e9,
             PROP_DISC["delay_spread_ns"],
@@ -227,9 +234,11 @@ def build_semantic_key(sample: Mapping[str, float] | object) -> SemanticKey:
             float(np.degrees(_get(sample, "azimuth_spread_aoa"))),
             PROP_DISC["azimuth_spread_deg"],
         ),
-        k_factor_bin=discretize(
-            float(_get(sample, "k_factor_db")),
-            PROP_DISC["k_factor_db"],
+        k_factor_bin=normalize_k_factor_bin(
+            discretize(
+                float(_get(sample, "k_factor_db")),
+                PROP_DISC["k_factor_db"],
+            )
         ),
         first_delay_bin=discretize(
             float(_get(sample, "first_path_delay", float("nan"))) * 1e9,
