@@ -7,6 +7,7 @@ import numpy as np
 
 PATH_RICHNESS_LABELS = (
     "low",
+    "moderate",
     "high",
 )
 
@@ -117,7 +118,12 @@ AttributeRemap = Mapping[str, Mapping[str, tuple[str, ...] | list[str]]]
 
 
 def normalize_path_richness(value: str) -> str:
-    return "low" if str(value) in {"zero", "one", "two", "low"} else "high"
+    value = str(value)
+    if value in {"zero", "one", "low"}:
+        return "low"
+    if value in {"two", "three", "four", "moderate"}:
+        return "moderate"
+    return "high"
 
 
 def normalize_k_factor_bin(value: str) -> str:

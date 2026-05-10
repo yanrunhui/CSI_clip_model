@@ -7,7 +7,13 @@ import torch
 from torch.utils.data import Dataset
 
 from .caption import CaptionGenerator
-from .semantic_key import SemanticKey, normalize_k_factor_bin, normalize_path_richness
+from .semantic_key import (
+    PROP_DISC,
+    SemanticKey,
+    discretize,
+    normalize_k_factor_bin,
+    normalize_path_richness,
+)
 from .tokenizer import CaptionTokenizer
 
 SEMANTIC_KEY_MODES = (
@@ -156,9 +162,18 @@ def expand_physics_aux_targets(targets: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(expanded))
 
 
-def semantic_key_for_mode(key: SemanticKey, mode: str) -> SemanticKey:
+def semantic_key_for_mode(
+    key: SemanticKey,
+    mode: str,
+    n_paths: int | None = None,
+) -> SemanticKey:
     if mode == "full":
         return key
+    path_richness = (
+        normalize_path_richness(discretize(float(n_paths), PROP_DISC["n_paths"]))
+        if n_paths is not None
+        else normalize_path_richness(key.path_richness)
+    )
     if mode in {
         "coarse",
         "coarse_delay",
@@ -170,7 +185,7 @@ def semantic_key_for_mode(key: SemanticKey, mode: str) -> SemanticKey:
         return SemanticKey(
             env_type=key.env_type,
             los_status=key.los_status,
-            path_richness=normalize_path_richness(key.path_richness),
+            path_richness=path_richness,
             ds_bin=key.ds_bin if mode == "coarse_delay" else "any",
             as_az_bin=key.as_az_bin if mode in {"coarse_angle", "coarse_k_angle"} else "any",
             k_factor_bin=normalize_k_factor_bin(key.k_factor_bin) if mode in {"coarse_k", "coarse_k_angle"} else "any",
@@ -192,7 +207,7 @@ def apply_semantic_key_mode(samples: list[PreprocessedSample], mode: str) -> lis
     generator = CaptionGenerator()
     remapped = []
     for sample in samples:
-        key = semantic_key_for_mode(sample.semantic_key, mode)
+        key = semantic_key_for_mode(sample.semantic_key, mode, n_paths=sample.n_paths)
         remapped_sample = replace(
             sample,
             semantic_key=key,

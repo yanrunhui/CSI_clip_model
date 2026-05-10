@@ -145,6 +145,7 @@ SLOT_VOCAB = {
     },
     "richness": {
         "low": ["low", "sparse", "few"],
+        "moderate": ["moderate", "medium", "several"],
         "high": ["high", "rich", "many"],
     },
     "ds": {
