@@ -39,6 +39,20 @@ from models.text_encoder import PhysicsTextEncoder
 from scripts.pretrain import assert_checkpoint_prototype_compatibility
 from training.losses import cosine_alignment_loss, paired_contrastive_loss
 
+PHYSICAL_DESCRIPTION_FIELDS = (
+    "delay_spread_ns",
+    "k_factor_db",
+    "azimuth_spread_deg",
+    "first_path_power_dbw",
+)
+
+PHYSICAL_DESCRIPTION_TOLERANCES = {
+    "delay_spread_ns": 20.0,
+    "k_factor_db": 3.0,
+    "azimuth_spread_deg": 10.0,
+    "first_path_power_dbw": 3.0,
+}
+
 
 def build_tokenizer(samples, checkpoint: dict | None) -> CaptionTokenizer:
     tokenizer = CaptionTokenizer()
@@ -90,6 +104,43 @@ def build_prototype_bank(
     return unique_keys, token_ids, token_mask, label_map
 
 
+def _physics_target_index(name: str) -> int:
+    return PHYSICS_TARGET_NAMES.index(name)
+
+
+def _physics_raw_predictions(physics_predictions: torch.Tensor) -> torch.Tensor:
+    return physics_predictions * PHYSICS_TARGET_SCALES + PHYSICS_TARGET_OFFSETS
+
+
+def _format_scalar(value: float, decimals: int = 1) -> str:
+    text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def _structured_physical_record(
+    los_status: str,
+    raw_values: torch.Tensor,
+) -> dict[str, float | str]:
+    return {
+        "los_status": str(los_status),
+        "delay_spread_ns": float(raw_values[_physics_target_index("delay_spread_ns")]),
+        "k_factor_db": float(raw_values[_physics_target_index("k_factor_db")]),
+        "azimuth_spread_deg": float(raw_values[_physics_target_index("azimuth_spread_deg")]),
+        "first_path_power_dbw": float(raw_values[_physics_target_index("first_path_power_dbw")]),
+    }
+
+
+def _render_physical_description(record: dict[str, float | str]) -> str:
+    los_text = "LoS" if str(record["los_status"]) == "los" else "NLoS"
+    return (
+        f"This channel is likely {los_text}, with a delay spread of about "
+        f"{_format_scalar(float(record['delay_spread_ns']))} ns, a K-factor of about "
+        f"{_format_scalar(float(record['k_factor_db']))} dB, an azimuth spread of about "
+        f"{_format_scalar(float(record['azimuth_spread_deg']))} deg, and a first-path power "
+        f"of about {_format_scalar(float(record['first_path_power_dbw']))} dBW."
+    )
+
+
 def move_batch(batch: dict, device: torch.device) -> dict:
     moved = {}
     for key, value in batch.items():
@@ -124,6 +175,29 @@ def _infer_semantic_key_mode(checkpoint: dict | None, override: str | None) -> s
     if checkpoint is not None:
         return str(checkpoint.get("args", {}).get("semantic_key_mode", "full"))
     return "full"
+
+
+def _infer_token_norm_mode(checkpoint: dict | None, override: str | None) -> str:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        return str(checkpoint.get("args", {}).get("token_norm_mode", "std"))
+    return "std"
+
+
+def _infer_use_power_branch(checkpoint: dict | None, override: bool | None) -> bool:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        return bool(checkpoint.get("args", {}).get("use_power_branch", False))
+    return False
+
+
+def _first_path_power_residual_scale(model: torch.nn.Module) -> float | None:
+    scale = getattr(model, "first_path_power_residual_scale", None)
+    if scale is None:
+        return None
+    return float(scale.detach().cpu().item())
 
 
 def _infer_limit_samples(checkpoint: dict | None, override: int | None) -> int | None:
@@ -378,18 +452,23 @@ def evaluate(
     text_mode_override: str | None = None,
     min_class_size_override: int | None = None,
     semantic_key_mode_override: str | None = None,
+    token_norm_mode_override: str | None = None,
+    use_power_branch_override: bool | None = None,
     attribute_fields_override: tuple[str, ...] | None = None,
     filter_attribute_values_override: dict[str, tuple[str, ...]] | None = None,
     limit_samples_override: int | None = None,
     limit_samples_by_attribute_override: str | None = None,
     limit_samples_per_attribute_value_override: int | None = None,
     attribute_binary_thresholds: dict[str, float] | None = None,
+    physical_caption_examples: int = 3,
 ) -> None:
     dataset = PreprocessedCSIDataset.from_pt(data_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False) if checkpoint_path else None
     text_mode = _infer_text_mode(checkpoint, text_mode_override)
     min_class_size = _infer_min_class_size(checkpoint, min_class_size_override)
     semantic_key_mode = _infer_semantic_key_mode(checkpoint, semantic_key_mode_override)
+    token_norm_mode = _infer_token_norm_mode(checkpoint, token_norm_mode_override)
+    use_power_branch = _infer_use_power_branch(checkpoint, use_power_branch_override)
     attribute_fields = _infer_attribute_fields(checkpoint, attribute_fields_override)
     attribute_remap = _infer_attribute_remap(checkpoint)
     filter_attribute_values = _infer_filter_attribute_values(
@@ -506,12 +585,18 @@ def evaluate(
         collate_fn=partial(collate_fn, tokenizer=tokenizer, max_caption_len=48),
     )
     model = CSIClip(
-        CSIEncoder(d_token=8, d_model=384, d_clip=256),
+        CSIEncoder(
+            d_token=8,
+            d_model=384,
+            d_clip=256,
+            token_norm_mode=token_norm_mode,
+        ),
         PhysicsTextEncoder(vocab_size=max(tokenizer.next_id + 8, 300)),
         num_prototypes=len(prototype_keys),
         semantic_num_classes=len(prototype_keys),
         embed_dim=256,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
+        use_power_branch=use_power_branch,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -526,6 +611,7 @@ def evaluate(
         )
         _load_model_state_compatible(model, checkpoint["model_state"])
     model.eval()
+    residual_scale = _first_path_power_residual_scale(model)
 
     all_csi_features = []
     all_semantic_logits = []
@@ -533,11 +619,15 @@ def evaluate(
     all_attribute_labels = {field: [] for field in attribute_label_maps}
     all_instance_text_features = []
     all_physics_predictions = []
+    all_base_physics_predictions = []
+    all_direct_first_path_power_predictions = []
     all_physics_targets = []
     all_physics_raw_targets = []
     all_physics_masks = []
+    all_first_path_power_residual_scaled = []
     all_labels = []
     all_text_labels = []
+    all_semantic_keys = []
     semantic_classifier_enabled = (
         checkpoint is not None
         and float(checkpoint.get("args", {}).get("semantic_classifier_weight", 0.0)) > 0
@@ -566,11 +656,27 @@ def evaluate(
                     label_map[semantic_key_attribute_value(key, field, attribute_remap)]
                     for key in batch["semantic_keys"]
                 )
-        physics_predictions = model.predict_physics(csi_features_raw)
+        power_context = None
+        if use_power_branch:
+            power_context = model.encode_power_context(
+                batch["tokens"],
+                batch["token_mask"],
+            )
+        physics_outputs = model.predict_physics_components(
+            csi_features_raw,
+            power_context=power_context,
+        )
+        physics_predictions = physics_outputs["final"]
+        all_base_physics_predictions.append(physics_outputs["base"].cpu())
+        all_direct_first_path_power_predictions.append(
+            physics_outputs["direct_first_path_power"].cpu()
+        )
+        all_first_path_power_residual_scaled.append(physics_outputs["residual_scaled"].cpu())
         all_physics_predictions.append(physics_predictions.cpu())
         all_physics_targets.append(batch["physics_targets"].cpu())
         all_physics_raw_targets.append(batch["physics_raw_targets"].cpu())
         all_physics_masks.append(batch["physics_target_mask"].cpu())
+        all_semantic_keys.extend(batch["semantic_keys"])
         if text_mode in ("instance", "multipositive"):
             instance_text_features = model.encode_text(
                 batch["t_instance_ids"],
@@ -600,9 +706,12 @@ def evaluate(
         if values
     }
     physics_predictions = torch.cat(all_physics_predictions, dim=0)
+    base_physics_predictions = torch.cat(all_base_physics_predictions, dim=0)
+    direct_first_path_power_predictions = torch.cat(all_direct_first_path_power_predictions, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
     physics_masks = torch.cat(all_physics_masks, dim=0)
+    first_path_power_residual_scaled = torch.cat(all_first_path_power_residual_scaled, dim=0)
     labels = torch.tensor(all_labels, dtype=torch.long)
     logit_scale = float(model.logit_scale.exp().detach().cpu().item())
     prototype_logits = logit_scale * csi_features @ prototype_features.T
@@ -642,8 +751,12 @@ def evaluate(
     print(f"eval_csi_to_prototype_loss={float(csi_prototype_loss):.4f}")
     print(f"eval_text_to_prototype_loss={float(text_prototype_loss):.4f}")
     print(f"logit_scale={logit_scale:.4f}")
+    if residual_scale is not None:
+        print(f"first_path_power_residual_scale={residual_scale:.6f}")
     print(f"text_mode={text_mode}")
     print(f"semantic_key_mode={semantic_key_mode}")
+    print(f"token_norm_mode={token_norm_mode}")
+    print(f"use_power_branch={use_power_branch}")
     print(f"min_class_size={min_class_size}")
     print(f"attribute_remap={format_attribute_remap(attribute_remap)}")
     print(f"filter_attribute_values={format_attribute_value_filters(filter_attribute_values)}")
@@ -675,6 +788,44 @@ def evaluate(
         physics_predictions=physics_predictions,
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
+    )
+    first_path_power_idx = _physics_target_index("first_path_power_dbw")
+    first_path_power_mask = physics_masks[:, first_path_power_idx]
+    if bool(first_path_power_mask.any()):
+        base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
+        final_physics_raw_predictions = _physics_raw_predictions(physics_predictions)
+        base_first_path_power_errors = (
+            base_physics_raw_predictions[:, first_path_power_idx] - physics_raw_targets[:, first_path_power_idx]
+        ).abs()
+        final_first_path_power_errors = (
+            final_physics_raw_predictions[:, first_path_power_idx] - physics_raw_targets[:, first_path_power_idx]
+        ).abs()
+        direct_first_path_power_errors = (
+            (
+                direct_first_path_power_predictions * PHYSICS_TARGET_SCALES[first_path_power_idx]
+                + PHYSICS_TARGET_OFFSETS[first_path_power_idx]
+            )
+            - physics_raw_targets[:, first_path_power_idx]
+        ).abs()
+        print(f"base_first_power_MAE={float(base_first_path_power_errors[first_path_power_mask].mean()):.4f}")
+        print(f"direct_power_head_MAE={float(direct_first_path_power_errors[first_path_power_mask].mean()):.4f}")
+        print(f"residual_final_MAE={float(final_first_path_power_errors[first_path_power_mask].mean()):.4f}")
+    else:
+        print("base_first_power_MAE=nan")
+        print("direct_power_head_MAE=nan")
+        print("residual_final_MAE=nan")
+    print(f"residual_scaled_mean={float(first_path_power_residual_scaled.mean()):.6f}")
+    print(f"residual_scaled_std={float(first_path_power_residual_scaled.std()):.6f}")
+    if residual_scale is not None:
+        print(f"residual_scale={residual_scale:.6f}")
+    _print_structured_physical_description_metrics(
+        physics_predictions=physics_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
+        prototype_logits=prototype_logits,
+        prototype_keys=prototype_keys,
+        example_count=physical_caption_examples,
     )
     if text_mode in ("instance", "multipositive"):
         _print_semantic_retrieval_metrics(
@@ -1067,7 +1218,7 @@ def _print_physics_regression_metrics(
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
 ) -> None:
-    raw_predictions = physics_predictions * PHYSICS_TARGET_SCALES + PHYSICS_TARGET_OFFSETS
+    raw_predictions = _physics_raw_predictions(physics_predictions)
     errors = (raw_predictions - physics_raw_targets).abs()
     mae_values = []
     angle_sin_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_sin")
@@ -1103,6 +1254,95 @@ def _print_physics_regression_metrics(
     print(f"physics_regression_MAE_mean={float(total_mae):.4f}")
 
 
+def _print_structured_physical_description_metrics(
+    physics_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+    prototype_logits: torch.Tensor,
+    prototype_keys: list[SemanticKey],
+    example_count: int,
+) -> None:
+    raw_predictions = _physics_raw_predictions(physics_predictions)
+    predicted_labels = prototype_logits.argmax(dim=1)
+    los_true = torch.tensor(
+        [1 if key.los_status == "los" else 0 for key in semantic_keys],
+        dtype=torch.long,
+    )
+    los_pred = torch.tensor(
+        [
+            1 if prototype_keys[int(label)].los_status == "los" else 0
+            for label in predicted_labels.tolist()
+        ],
+        dtype=torch.long,
+    )
+    los_accuracy = (los_true == los_pred).float().mean()
+    print(f"physical_description_los_status_accuracy={float(los_accuracy):.4f}")
+
+    tolerance_hits = []
+    tolerance_masks = []
+    for field in PHYSICAL_DESCRIPTION_FIELDS:
+        idx = _physics_target_index(field)
+        mask = physics_masks[:, idx]
+        if not bool(mask.any()):
+            print(f"physical_description_{field}_MAE=nan")
+            print(
+                f"physical_description_{field}_accuracy@{_format_scalar(PHYSICAL_DESCRIPTION_TOLERANCES[field])}=nan"
+            )
+            continue
+        errors = (raw_predictions[:, idx] - physics_raw_targets[:, idx]).abs()
+        mae = errors[mask].mean()
+        tolerance = PHYSICAL_DESCRIPTION_TOLERANCES[field]
+        hits = errors <= tolerance
+        accuracy = hits[mask].float().mean()
+        print(f"physical_description_{field}_MAE={float(mae):.4f}")
+        print(
+            f"physical_description_{field}_accuracy@{_format_scalar(tolerance)}={float(accuracy):.4f}"
+        )
+        tolerance_hits.append(hits)
+        tolerance_masks.append(mask)
+
+    if tolerance_hits:
+        valid_sentence_mask = torch.ones_like(tolerance_masks[0], dtype=torch.bool)
+        within_tolerance = torch.ones_like(tolerance_hits[0], dtype=torch.bool)
+        for mask in tolerance_masks:
+            valid_sentence_mask &= mask
+        for hits in tolerance_hits:
+            within_tolerance &= hits
+        sentence_correct = (los_true == los_pred) & within_tolerance
+        if bool(valid_sentence_mask.any()):
+            sentence_accuracy = sentence_correct[valid_sentence_mask].float().mean()
+            print(
+                f"physical_description_sentence_level_accuracy={float(sentence_accuracy):.4f}"
+            )
+            print(
+                f"physical_description_sentence_level_valid_samples={int(valid_sentence_mask.sum().item())}"
+            )
+        else:
+            print("physical_description_sentence_level_accuracy=nan")
+            print("physical_description_sentence_level_valid_samples=0")
+
+    for idx in range(min(example_count, raw_predictions.shape[0])):
+        predicted_record = _structured_physical_record(
+            los_status=prototype_keys[int(predicted_labels[idx])].los_status,
+            raw_values=raw_predictions[idx],
+        )
+        target_record = _structured_physical_record(
+            los_status=semantic_keys[idx].los_status,
+            raw_values=physics_raw_targets[idx],
+        )
+        print(f"physical_description_example_{idx + 1}_pred_struct={predicted_record}")
+        print(f"physical_description_example_{idx + 1}_true_struct={target_record}")
+        print(
+            f"physical_description_example_{idx + 1}_pred_text="
+            f"{_render_physical_description(predicted_record)}"
+        )
+        print(
+            f"physical_description_example_{idx + 1}_true_text="
+            f"{_render_physical_description(target_record)}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", required=True)
@@ -1113,6 +1353,16 @@ def main() -> None:
         "--semantic-key-mode",
         choices=semantic_key_mode_choices(),
         help="Semantic key granularity for evaluation. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
+        "--token-norm-mode",
+        choices=["std", "rms", "none"],
+        help="CSI token normalization mode. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
+        "--enable-power-branch",
+        action="store_true",
+        help="Enable the power branch regardless of checkpoint args.",
     )
     parser.add_argument(
         "--min-class-size",
@@ -1156,6 +1406,12 @@ def main() -> None:
             "The score is logit[class_1]-logit[class_0], using the printed label order."
         ),
     )
+    parser.add_argument(
+        "--physical-caption-examples",
+        type=int,
+        default=3,
+        help="How many structured physical caption prediction examples to print.",
+    )
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     evaluate(
@@ -1166,6 +1422,8 @@ def main() -> None:
         text_mode_override=args.text_mode,
         min_class_size_override=args.min_class_size,
         semantic_key_mode_override=args.semantic_key_mode,
+        token_norm_mode_override=args.token_norm_mode,
+        use_power_branch_override=True if args.enable_power_branch else None,
         attribute_fields_override=tuple(args.attribute_classifier_fields) if args.attribute_classifier_fields else None,
         filter_attribute_values_override=(
             parse_attribute_value_filters(args.filter_attribute_values)
@@ -1176,6 +1434,7 @@ def main() -> None:
         limit_samples_by_attribute_override=args.limit_samples_by_attribute,
         limit_samples_per_attribute_value_override=args.limit_samples_per_attribute_value,
         attribute_binary_thresholds=parse_attribute_binary_thresholds(args.attribute_binary_threshold),
+        physical_caption_examples=args.physical_caption_examples,
     )
 
 

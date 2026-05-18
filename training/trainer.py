@@ -35,6 +35,7 @@ class TrainConfig:
     attribute_classifier_logit_adjustment: float = 0.0
     aux_regression_weight: float = 0.0
     aux_regression_indices: tuple[int, ...] | None = None
+    direct_power_weight: float = 0.0
     freeze_csi: bool = False
     freeze_text_prototypes: bool = False
     prototype_warmup_epochs: int = 0
@@ -294,8 +295,19 @@ class Trainer:
         semantic_predictions = None
         semantic_prediction_histogram = None
         semantic_head_bias = None
-        if effective_aux_regression_weight > 0:
-            physics_predictions = self.model.predict_physics(csi_features_raw)
+        physics_outputs = None
+        if effective_aux_regression_weight > 0 or cfg.direct_power_weight > 0.0:
+            power_context = None
+            if bool(getattr(self.model, "use_power_branch", False)):
+                power_context = self.model.encode_power_context(
+                    batch["tokens"],
+                    batch["token_mask"],
+                )
+            physics_outputs = self.model.predict_physics_components(
+                csi_features_raw,
+                power_context=power_context,
+            )
+            physics_predictions = physics_outputs["final"]
 
         if cfg.text_mode == "prototype":
             losses = self.loss(
@@ -440,13 +452,35 @@ class Trainer:
                 regression_targets,
                 regression_mask,
             )
+            if (
+                physics_outputs is not None
+                and bool(getattr(self.model, "use_power_branch", False))
+                and cfg.direct_power_weight > 0.0
+            ):
+                first_path_power_idx = 5
+                direct_first_path_power = physics_outputs["direct_first_path_power"]
+                direct_power_target = batch["physics_targets"][:, first_path_power_idx]
+                direct_power_mask = batch["physics_target_mask"][:, first_path_power_idx]
+                direct_power_errors = torch.nn.functional.smooth_l1_loss(
+                    direct_first_path_power,
+                    direct_power_target,
+                    reduction="none",
+                )
+                direct_power_errors = direct_power_errors * direct_power_mask.to(
+                    dtype=direct_power_errors.dtype
+                )
+                losses["loss_direct_power"] = (
+                    direct_power_errors.sum()
+                    / direct_power_mask.sum().clamp(min=1).to(dtype=direct_power_errors.dtype)
+                )
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
             effective_prototype_weight * losses["loss_csi_to_prototype"] +
             cfg.text_prototype_weight * losses["loss_text_to_prototype"] +
             effective_semantic_classifier_weight * losses.get("loss_semantic_classifier", torch.zeros((), device=self.device)) +
             effective_attribute_classifier_weight * losses.get("loss_attribute_classifier", torch.zeros((), device=self.device)) +
-            effective_aux_regression_weight * losses.get("loss_aux_regression", torch.zeros((), device=self.device))
+            effective_aux_regression_weight * losses.get("loss_aux_regression", torch.zeros((), device=self.device)) +
+            cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device))
         )
         total_loss.backward()
         grad_metrics = {
@@ -483,6 +517,7 @@ class Trainer:
             cfg.attribute_classifier_logit_adjustment
         )
         metrics["aux_regression_weight"] = float(effective_aux_regression_weight)
+        metrics["direct_power_weight"] = float(cfg.direct_power_weight)
         metrics["prototype_warmup_active"] = float(warmup_active)
         metrics["prototype_warmup_epochs"] = float(cfg.prototype_warmup_epochs)
         metrics["min_class_size_for_multipositive"] = float(cfg.min_class_size_for_multipositive)

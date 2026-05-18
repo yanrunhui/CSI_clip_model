@@ -325,6 +325,8 @@ def build_components_from_samples(
     device: torch.device,
     batch_size: int = 128,
     temperature: float = 0.07,
+    token_norm_mode: str = "std",
+    use_power_branch: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
@@ -357,7 +359,12 @@ def build_components_from_samples(
         collate_fn=partial(collate_fn, tokenizer=tokenizer, max_caption_len=48),
     )
 
-    csi_encoder = CSIEncoder(d_token=8, d_model=384, d_clip=256)
+    csi_encoder = CSIEncoder(
+        d_token=8,
+        d_model=384,
+        d_clip=256,
+        token_norm_mode=token_norm_mode,
+    )
     text_encoder = PhysicsTextEncoder(vocab_size=max(tokenizer.next_id + 8, 300))
     model = CSIClip(
         csi_encoder,
@@ -367,6 +374,7 @@ def build_components_from_samples(
         embed_dim=256,
         temperature=temperature,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
+        use_power_branch=use_power_branch,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -447,6 +455,13 @@ def trainable_parameters(model: torch.nn.Module):
 
 def count_trainable_parameters(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def get_first_path_power_residual_scale(model: torch.nn.Module) -> float | None:
+    scale = getattr(model, "first_path_power_residual_scale", None)
+    if scale is None:
+        return None
+    return float(scale.detach().cpu().item())
 
 
 def load_transfer_checkpoint(path: str | None, device: torch.device) -> dict | None:
@@ -554,6 +569,8 @@ def limit_samples_by_attribute_value_for_debug(
 def build_demo_components(
     device: torch.device,
     semantic_key_mode: str = "full",
+    token_norm_mode: str = "std",
+    use_power_branch: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ):
@@ -568,6 +585,8 @@ def build_demo_components(
         samples,
         device=device,
         batch_size=32,
+        token_norm_mode=token_norm_mode,
+        use_power_branch=use_power_branch,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
     )
@@ -578,6 +597,8 @@ def build_real_components(
     device: torch.device,
     batch_size: int = 128,
     temperature: float = 0.07,
+    token_norm_mode: str = "std",
+    use_power_branch: bool = False,
     min_class_size: int = 1,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
@@ -678,6 +699,8 @@ def build_real_components(
         device=device,
         batch_size=batch_size,
         temperature=temperature,
+        token_norm_mode=token_norm_mode,
+        use_power_branch=use_power_branch,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
         tokenizer_word2id=tokenizer_word2id,
@@ -697,15 +720,20 @@ def run_smoke_test(
     attribute_classifier_logit_adjustment: float = 0.0,
     aux_regression_weight: float = 0.0,
     aux_regression_targets: tuple[str, ...] = ("all",),
+    direct_power_weight: float = 0.0,
     multipositive_distance_threshold: float = 0.25,
     multipositive_positive_mode: str = "semantic_and_physics",
     min_class_size_for_multipositive: int = 2,
     semantic_key_mode: str = "full",
+    token_norm_mode: str = "std",
+    use_power_branch: bool = False,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> None:
     loader, model, _, prototype_bank = build_demo_components(
         device,
         semantic_key_mode=semantic_key_mode,
+        token_norm_mode=token_norm_mode,
+        use_power_branch=use_power_branch,
         attribute_fields=attribute_classifier_fields,
         attribute_remap=attribute_remap,
     )
@@ -746,6 +774,7 @@ def run_smoke_test(
                     attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
                     aux_regression_weight=aux_regression_weight,
                     aux_regression_indices=aux_regression_indices(aux_regression_targets),
+                    direct_power_weight=direct_power_weight,
                     prototype_warmup_epochs=1,
                     multipositive_distance_threshold=multipositive_distance_threshold,
                     multipositive_positive_mode=multipositive_positive_mode,
@@ -770,6 +799,8 @@ def run_real_pretrain(
     weight_decay: float,
     batch_size: int,
     temperature: float,
+    token_norm_mode: str,
+    use_power_branch: bool,
     warmup_epochs: int,
     min_lr: float,
     prototype_weight: float,
@@ -786,6 +817,7 @@ def run_real_pretrain(
     attribute_classifier_logit_adjustment: float,
     aux_regression_weight: float,
     aux_regression_targets: tuple[str, ...],
+    direct_power_weight: float,
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
     min_class_size_for_multipositive: int,
@@ -811,6 +843,8 @@ def run_real_pretrain(
         device=device,
         batch_size=batch_size,
         temperature=temperature,
+        token_norm_mode=token_norm_mode,
+        use_power_branch=use_power_branch,
         min_class_size=min_class_size,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
@@ -871,6 +905,7 @@ def run_real_pretrain(
         attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
         aux_regression_weight=aux_regression_weight,
         aux_regression_indices=aux_regression_indices(aux_regression_targets),
+        direct_power_weight=direct_power_weight,
         freeze_csi=freeze_csi,
         freeze_text_prototypes=freeze_text_prototypes,
         multipositive_distance_threshold=multipositive_distance_threshold,
@@ -889,12 +924,15 @@ def run_real_pretrain(
         attribute_class_counts=prototype_bank["attribute_class_counts"],
         attribute_remap=attribute_remap,
     )
+    residual_scale = get_first_path_power_residual_scale(model)
 
     print(f"training on {data_path}")
     print(f"checkpoint={checkpoint_path}")
     print(
         f"device={device} epochs={epochs} batch_size={batch_size} "
-        f"temperature={temperature} warmup_epochs={warmup_epochs} min_lr={min_lr}"
+        f"temperature={temperature} token_norm_mode={token_norm_mode} "
+        f"use_power_branch={use_power_branch} "
+        f"warmup_epochs={warmup_epochs} min_lr={min_lr}"
     )
     print(
         f"semantic_prototypes={len(prototype_bank['keys'])} "
@@ -912,6 +950,7 @@ def run_real_pretrain(
         f"attribute_remap={format_attribute_remap(attribute_remap)} "
         f"aux_regression_weight={aux_regression_weight} "
         f"aux_regression_targets={','.join(aux_regression_targets)} "
+        f"direct_power_weight={direct_power_weight} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
         f"min_class_size_for_multipositive={min_class_size_for_multipositive} "
@@ -923,6 +962,8 @@ def run_real_pretrain(
         f"freeze_csi={freeze_csi} freeze_text_prototypes={freeze_text_prototypes} "
         f"trainable_parameters={count_trainable_parameters(model)}"
     )
+    if residual_scale is not None:
+        print(f"first_path_power_residual_scale={residual_scale:.6f}")
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -984,6 +1025,7 @@ def run_real_pretrain(
             m.get("batch_label_unique_classes", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_direct_power = sum(m.get("loss_direct_power", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_positive_count = sum(m.get("multipositive_positive_count_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_logit_scale = sum(m["logit_scale"] for m in epoch_metrics) / len(epoch_metrics)
         mean_prototype_warmup_active = sum(m.get("prototype_warmup_active", 0.0) for m in epoch_metrics) / len(epoch_metrics)
@@ -1020,6 +1062,7 @@ def run_real_pretrain(
             f"proto_warmup_active={mean_prototype_warmup_active:.2f} "
             f"{attribute_debug} "
             f"aux_reg={mean_aux_regression:.4f} "
+            f"direct_power={mean_direct_power:.4f} "
             f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
         )
         with log_path.open("a", encoding="utf-8") as f:
@@ -1059,6 +1102,7 @@ def run_real_pretrain(
                         "grad_norm_semantic_classifier": mean_grad_semantic_classifier,
                         "grad_norm_attribute_classifiers": mean_grad_attribute_classifiers,
                         "loss_aux_regression": mean_aux_regression,
+                        "loss_direct_power": mean_direct_power,
                         "logit_scale": mean_logit_scale,
                         "text_mode": text_mode,
                         "prototype_warmup_epochs": prototype_warmup_epochs,
@@ -1077,8 +1121,11 @@ def run_real_pretrain(
                             }
                             for field, mapping in attribute_remap.items()
                         },
+                        "token_norm_mode": token_norm_mode,
+                        "use_power_branch": use_power_branch,
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
+                        "direct_power_weight": direct_power_weight,
                         "multipositive_distance_threshold": multipositive_distance_threshold,
                         "multipositive_positive_mode": multipositive_positive_mode,
                         "min_class_size_for_multipositive": min_class_size_for_multipositive,
@@ -1116,6 +1163,8 @@ def run_real_pretrain(
                     "weight_decay": weight_decay,
                     "batch_size": batch_size,
                     "temperature": temperature,
+                    "token_norm_mode": token_norm_mode,
+                    "use_power_branch": use_power_branch,
                     "warmup_epochs": warmup_epochs,
                     "min_lr": min_lr,
                     "csi_to_text_weight": csi_to_text_weight,
@@ -1137,8 +1186,10 @@ def run_real_pretrain(
                         }
                         for field, mapping in attribute_remap.items()
                     },
+                    "token_norm_mode": token_norm_mode,
                     "aux_regression_weight": aux_regression_weight,
                     "aux_regression_targets": list(aux_regression_targets),
+                    "direct_power_weight": direct_power_weight,
                     "multipositive_distance_threshold": multipositive_distance_threshold,
                     "multipositive_positive_mode": multipositive_positive_mode,
                     "min_class_size_for_multipositive": min_class_size_for_multipositive,
@@ -1178,6 +1229,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--temperature", type=float)
+    parser.add_argument("--token-norm-mode", choices=["std", "rms", "none"])
+    parser.add_argument("--enable-power-branch", action="store_true")
     parser.add_argument("--warmup-epochs", type=int)
     parser.add_argument("--min-lr", type=float)
     parser.add_argument("--csi-to-text-weight", type=float)
@@ -1236,6 +1289,11 @@ def main() -> None:
         nargs="+",
         choices=physics_aux_target_choices(),
         help="Physics targets used by aux regression. Defaults to train config, or all.",
+    )
+    parser.add_argument(
+        "--direct-power-weight",
+        type=float,
+        help="Small explicit supervision weight for the direct first-path-power head.",
     )
     parser.add_argument("--multipositive-distance-threshold", type=float)
     parser.add_argument(
@@ -1300,6 +1358,15 @@ def main() -> None:
         args.temperature
         if args.temperature is not None
         else float(cfg_get(train_cfg, "temperature", 0.07))
+    )
+    token_norm_mode = (
+        args.token_norm_mode
+        if args.token_norm_mode is not None
+        else str(cfg_get(train_cfg, "token_norm_mode", "std"))
+    )
+    use_power_branch = bool(
+        args.enable_power_branch
+        or cfg_get(train_cfg, "use_power_branch", False)
     )
     warmup_epochs = (
         args.warmup_epochs
@@ -1382,6 +1449,11 @@ def main() -> None:
         if args.aux_regression_weight is not None
         else float(cfg_get(train_cfg, "aux_regression_weight", 0.0))
     )
+    direct_power_weight = (
+        args.direct_power_weight
+        if args.direct_power_weight is not None
+        else float(cfg_get(train_cfg, "direct_power_weight", 0.0))
+    )
     aux_regression_targets = parse_aux_regression_targets(
         args.aux_regression_targets
         if args.aux_regression_targets is not None
@@ -1455,10 +1527,13 @@ def main() -> None:
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
+            direct_power_weight=direct_power_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
             semantic_key_mode=semantic_key_mode,
+            token_norm_mode=token_norm_mode,
+            use_power_branch=use_power_branch,
         )
         return
 
@@ -1474,6 +1549,8 @@ def main() -> None:
             weight_decay=weight_decay,
             batch_size=batch_size,
             temperature=temperature,
+            token_norm_mode=token_norm_mode,
+            use_power_branch=use_power_branch,
             warmup_epochs=warmup_epochs,
             min_lr=min_lr,
             csi_to_text_weight=csi_to_text_weight,
@@ -1490,6 +1567,7 @@ def main() -> None:
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
+            direct_power_weight=direct_power_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
