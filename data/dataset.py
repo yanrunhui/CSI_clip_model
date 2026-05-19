@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 
 import torch
@@ -55,6 +55,17 @@ PHYSICS_TARGET_OFFSETS = torch.tensor(
     dtype=torch.float32,
 )
 
+DELAY_POWER_MAP_SHAPE = (32, 32)
+DELAY_POWER_PROFILE_BINS = 64
+
+
+def empty_delay_power_map() -> torch.Tensor:
+    return torch.zeros(DELAY_POWER_MAP_SHAPE, dtype=torch.float32)
+
+
+def empty_delay_power_profile() -> torch.Tensor:
+    return torch.zeros(DELAY_POWER_PROFILE_BINS, dtype=torch.float32)
+
 
 @dataclass
 class PreprocessedSample:
@@ -83,6 +94,8 @@ class PreprocessedSample:
     first_path_aoa_az_deg: float = math.nan
     reflection_count: int = 0
     diffraction_count: int = 0
+    delay_power_map: torch.Tensor = field(default_factory=empty_delay_power_map)
+    delay_power_profile: torch.Tensor = field(default_factory=empty_delay_power_profile)
 
 
 def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
@@ -102,6 +115,12 @@ def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
             setattr(sample, field_name, default_value)
     if not getattr(sample, "instance_caption", ""):
         setattr(sample, "instance_caption", CaptionGenerator().generate_instance_from_sample(sample))
+    delay_power_map = getattr(sample, "delay_power_map", None)
+    if not isinstance(delay_power_map, torch.Tensor) or delay_power_map.shape != DELAY_POWER_MAP_SHAPE:
+        setattr(sample, "delay_power_map", empty_delay_power_map())
+    delay_power_profile = getattr(sample, "delay_power_profile", None)
+    if not isinstance(delay_power_profile, torch.Tensor) or delay_power_profile.shape != (DELAY_POWER_PROFILE_BINS,):
+        setattr(sample, "delay_power_profile", empty_delay_power_profile())
     return sample
 
 
@@ -271,6 +290,17 @@ def collate_fn(
     physics_raw_targets = torch.zeros(batch_size, len(PHYSICS_TARGET_NAMES), dtype=torch.float32)
     physics_targets = torch.zeros_like(physics_raw_targets)
     physics_target_mask = torch.zeros_like(physics_raw_targets, dtype=torch.bool)
+    delay_power_map = torch.zeros(
+        batch_size,
+        DELAY_POWER_MAP_SHAPE[0],
+        DELAY_POWER_MAP_SHAPE[1],
+        dtype=torch.float32,
+    )
+    delay_power_profile = torch.zeros(
+        batch_size,
+        DELAY_POWER_PROFILE_BINS,
+        dtype=torch.float32,
+    )
 
     for i, sample in enumerate(batch):
         n_tokens = sample.n_tokens
@@ -288,6 +318,8 @@ def collate_fn(
         physics_raw_targets[i] = raw_targets
         physics_targets[i] = normalized_targets
         physics_target_mask[i] = target_mask
+        delay_power_map[i] = sample.delay_power_map.to(dtype=torch.float32)
+        delay_power_profile[i] = sample.delay_power_profile.to(dtype=torch.float32)
 
     return {
         "tokens": tokens,
@@ -306,6 +338,8 @@ def collate_fn(
         "physics_targets": physics_targets,
         "physics_target_mask": physics_target_mask,
         "physics_raw_targets": physics_raw_targets,
+        "delay_power_map": delay_power_map,
+        "delay_power_profile": delay_power_profile,
         "instance_captions": [sample.instance_caption for sample in batch],
         "semantic_keys": [sample.semantic_key for sample in batch],
         "group_ids": [sample.group_id for sample in batch],

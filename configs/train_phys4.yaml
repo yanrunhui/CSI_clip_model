@@ -31,7 +31,7 @@ train:
   semantic_key_mode: coarse_k
 
   aux_regression_weight: 0.005
-  direct_power_weight: 0.001
+  direct_power_weight: 0.2
   aux_regression_targets:
     - first_path_power_dbw
     - k_factor_db

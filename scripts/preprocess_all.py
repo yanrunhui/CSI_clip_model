@@ -19,7 +19,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data.caption import CaptionGenerator
-from data.dataset import PreprocessedSample
+from data.dataset import (
+    DELAY_POWER_MAP_SHAPE,
+    DELAY_POWER_PROFILE_BINS,
+    PreprocessedSample,
+)
 from data.preprocess import preprocess_sample
 from data.semantic_key import SemanticKey
 
@@ -27,6 +31,8 @@ PROP_MAGIC = {b"PORP", b"PROP"}
 PROP_HEADER_BYTES = 32
 PROP_RX_RECORD_BYTES = 32
 PROP_PATH_RECORD_BYTES = 24
+DELAY_POWER_MAP_DELAY_NS_RANGE = (0.0, 3000.0)
+DELAY_POWER_MAP_POWER_DBW_RANGE = (-140.0, -40.0)
 
 PROP_RX_DTYPE = np.dtype(
     [
@@ -951,6 +957,72 @@ def estimate_k_factor_db(power_dbw: np.ndarray, los_flag: int) -> float:
     return float(10.0 * np.log10(los_power / nlos_power))
 
 
+def build_delay_power_map(
+    delay_s: np.ndarray,
+    power_dbw: np.ndarray,
+    valid_mask: np.ndarray,
+    delay_ns_range: tuple[float, float] = DELAY_POWER_MAP_DELAY_NS_RANGE,
+    power_dbw_range: tuple[float, float] = DELAY_POWER_MAP_POWER_DBW_RANGE,
+    map_shape: tuple[int, int] = DELAY_POWER_MAP_SHAPE,
+) -> torch.Tensor:
+    delay_bins, power_bins = map_shape
+    delay_power_map = np.zeros((delay_bins, power_bins), dtype=np.float32)
+    if not bool(valid_mask.any()):
+        return torch.from_numpy(delay_power_map)
+
+    valid_delay_ns = np.asarray(delay_s[valid_mask], dtype=np.float32) * 1e9
+    valid_power_dbw = np.asarray(power_dbw[valid_mask], dtype=np.float32)
+    power_linear = np.power(10.0, valid_power_dbw / 10.0).astype(np.float32)
+    power_sum = float(power_linear.sum())
+    if power_sum <= 0.0:
+        return torch.from_numpy(delay_power_map)
+    normalized_power = power_linear / power_sum
+
+    delay_min, delay_max = delay_ns_range
+    power_min, power_max = power_dbw_range
+    clipped_delay = np.clip(valid_delay_ns, delay_min, np.nextafter(delay_max, delay_min))
+    clipped_power = np.clip(valid_power_dbw, power_min, np.nextafter(power_max, power_min))
+    delay_idx = np.floor(
+        (clipped_delay - delay_min) / max(delay_max - delay_min, 1e-6) * delay_bins
+    ).astype(np.int64)
+    power_idx = np.floor(
+        (clipped_power - power_min) / max(power_max - power_min, 1e-6) * power_bins
+    ).astype(np.int64)
+    delay_idx = np.clip(delay_idx, 0, delay_bins - 1)
+    power_idx = np.clip(power_idx, 0, power_bins - 1)
+    np.add.at(delay_power_map, (delay_idx, power_idx), normalized_power)
+    return torch.from_numpy(delay_power_map)
+
+
+def build_delay_power_profile(
+    delay_s: np.ndarray,
+    power_dbw: np.ndarray,
+    valid_mask: np.ndarray,
+    delay_ns_range: tuple[float, float] = DELAY_POWER_MAP_DELAY_NS_RANGE,
+    num_bins: int = DELAY_POWER_PROFILE_BINS,
+) -> torch.Tensor:
+    profile = np.zeros((num_bins,), dtype=np.float32)
+    if not bool(valid_mask.any()):
+        return torch.from_numpy(profile)
+
+    valid_delay_ns = np.asarray(delay_s[valid_mask], dtype=np.float32) * 1e9
+    valid_power_dbw = np.asarray(power_dbw[valid_mask], dtype=np.float32)
+    power_linear = np.power(10.0, valid_power_dbw / 10.0).astype(np.float32)
+    power_sum = float(power_linear.sum())
+    if power_sum <= 0.0:
+        return torch.from_numpy(profile)
+    normalized_power = power_linear / power_sum
+
+    delay_min, delay_max = delay_ns_range
+    clipped_delay = np.clip(valid_delay_ns, delay_min, np.nextafter(delay_max, delay_min))
+    delay_idx = np.floor(
+        (clipped_delay - delay_min) / max(delay_max - delay_min, 1e-6) * num_bins
+    ).astype(np.int64)
+    delay_idx = np.clip(delay_idx, 0, num_bins - 1)
+    np.add.at(profile, delay_idx, normalized_power)
+    return torch.from_numpy(profile)
+
+
 def extract_semantic_observables_from_deepmimo(
     scenario: str,
     env_type: str,
@@ -1130,6 +1202,16 @@ def preprocess_deepmimo_dataset(
         from data.semantic_key import build_semantic_key
 
         semantic_key = build_semantic_key(observables)
+        delay_power_map = build_delay_power_map(
+            delay_s=delay_s,
+            power_dbw=power_dbw,
+            valid_mask=valid_paths,
+        )
+        delay_power_profile = build_delay_power_profile(
+            delay_s=delay_s,
+            power_dbw=power_dbw,
+            valid_mask=valid_paths,
+        )
         instance_caption = caption_generator.generate_instance(
             semantic_key,
             n_paths=int(observables["n_paths"]),
@@ -1175,6 +1257,8 @@ def preprocess_deepmimo_dataset(
                 first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
                 reflection_count=int(observables["reflection_count"]),
                 diffraction_count=int(observables["diffraction_count"]),
+                delay_power_map=delay_power_map,
+                delay_power_profile=delay_power_profile,
             )
         )
     return samples

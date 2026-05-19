@@ -302,6 +302,8 @@ class Trainer:
                 power_context = self.model.encode_power_context(
                     batch["tokens"],
                     batch["token_mask"],
+                    delay_power_map=batch.get("delay_power_map"),
+                    delay_power_profile=batch.get("delay_power_profile"),
                 )
             physics_outputs = self.model.predict_physics_components(
                 csi_features_raw,

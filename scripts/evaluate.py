@@ -661,6 +661,8 @@ def evaluate(
             power_context = model.encode_power_context(
                 batch["tokens"],
                 batch["token_mask"],
+                delay_power_map=batch.get("delay_power_map"),
+                delay_power_profile=batch.get("delay_power_profile"),
             )
         physics_outputs = model.predict_physics_components(
             csi_features_raw,
@@ -789,31 +791,14 @@ def evaluate(
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
     )
-    first_path_power_idx = _physics_target_index("first_path_power_dbw")
-    first_path_power_mask = physics_masks[:, first_path_power_idx]
-    if bool(first_path_power_mask.any()):
-        base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
-        final_physics_raw_predictions = _physics_raw_predictions(physics_predictions)
-        base_first_path_power_errors = (
-            base_physics_raw_predictions[:, first_path_power_idx] - physics_raw_targets[:, first_path_power_idx]
-        ).abs()
-        final_first_path_power_errors = (
-            final_physics_raw_predictions[:, first_path_power_idx] - physics_raw_targets[:, first_path_power_idx]
-        ).abs()
-        direct_first_path_power_errors = (
-            (
-                direct_first_path_power_predictions * PHYSICS_TARGET_SCALES[first_path_power_idx]
-                + PHYSICS_TARGET_OFFSETS[first_path_power_idx]
-            )
-            - physics_raw_targets[:, first_path_power_idx]
-        ).abs()
-        print(f"base_first_power_MAE={float(base_first_path_power_errors[first_path_power_mask].mean()):.4f}")
-        print(f"direct_power_head_MAE={float(direct_first_path_power_errors[first_path_power_mask].mean()):.4f}")
-        print(f"residual_final_MAE={float(final_first_path_power_errors[first_path_power_mask].mean()):.4f}")
-    else:
-        print("base_first_power_MAE=nan")
-        print("direct_power_head_MAE=nan")
-        print("residual_final_MAE=nan")
+    _print_first_path_power_diagnostics(
+        base_physics_predictions=base_physics_predictions,
+        physics_predictions=physics_predictions,
+        direct_first_path_power_predictions=direct_first_path_power_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_targets=physics_targets,
+        physics_masks=physics_masks,
+    )
     print(f"residual_scaled_mean={float(first_path_power_residual_scaled.mean()):.6f}")
     print(f"residual_scaled_std={float(first_path_power_residual_scaled.std()):.6f}")
     if residual_scale is not None:
@@ -1341,6 +1326,63 @@ def _print_structured_physical_description_metrics(
             f"physical_description_example_{idx + 1}_true_text="
             f"{_render_physical_description(target_record)}"
         )
+
+
+def _print_first_path_power_diagnostics(
+    base_physics_predictions: torch.Tensor,
+    physics_predictions: torch.Tensor,
+    direct_first_path_power_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+) -> None:
+    first_path_power_idx = _physics_target_index("first_path_power_dbw")
+    first_path_power_mask = physics_masks[:, first_path_power_idx]
+    if not bool(first_path_power_mask.any()):
+        print("base_first_power_MAE=nan")
+        print("direct_power_head_MAE=nan")
+        print("residual_final_MAE=nan")
+        print("direct_power_head_norm_MAE=nan")
+        print("direct_power_head_norm_range=nan,nan")
+        print("direct_power_head_dbw_range=nan,nan")
+        print("target_first_power_norm_range=nan,nan")
+        print("target_first_power_dbw_range=nan,nan")
+        return
+
+    base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
+    final_physics_raw_predictions = _physics_raw_predictions(physics_predictions)
+    direct_raw_predictions = (
+        direct_first_path_power_predictions * PHYSICS_TARGET_SCALES[first_path_power_idx]
+        + PHYSICS_TARGET_OFFSETS[first_path_power_idx]
+    )
+
+    masked_base_raw = base_physics_raw_predictions[first_path_power_mask, first_path_power_idx]
+    masked_final_raw = final_physics_raw_predictions[first_path_power_mask, first_path_power_idx]
+    masked_direct_norm = direct_first_path_power_predictions[first_path_power_mask]
+    masked_direct_raw = direct_raw_predictions[first_path_power_mask]
+    masked_target_norm = physics_targets[first_path_power_mask, first_path_power_idx]
+    masked_target_raw = physics_raw_targets[first_path_power_mask, first_path_power_idx]
+
+    print(f"base_first_power_MAE={float((masked_base_raw - masked_target_raw).abs().mean()):.4f}")
+    print(f"direct_power_head_MAE={float((masked_direct_raw - masked_target_raw).abs().mean()):.4f}")
+    print(f"residual_final_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
+    print(f"direct_power_head_norm_MAE={float((masked_direct_norm - masked_target_norm).abs().mean()):.4f}")
+    print(
+        "direct_power_head_norm_range="
+        f"{float(masked_direct_norm.min()):.4f},{float(masked_direct_norm.max()):.4f}"
+    )
+    print(
+        "direct_power_head_dbw_range="
+        f"{float(masked_direct_raw.min()):.4f},{float(masked_direct_raw.max()):.4f}"
+    )
+    print(
+        "target_first_power_norm_range="
+        f"{float(masked_target_norm.min()):.4f},{float(masked_target_norm.max()):.4f}"
+    )
+    print(
+        "target_first_power_dbw_range="
+        f"{float(masked_target_raw.min()):.4f},{float(masked_target_raw.max()):.4f}"
+    )
 
 
 def main() -> None:

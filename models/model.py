@@ -14,8 +14,22 @@ class PowerFeatureEncoder(nn.Module):
     ):
         super().__init__()
         self.eps = eps
+        self.map_encoder = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+        )
+        self.profile_encoder = nn.Sequential(
+            nn.Conv1d(1, 8, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(8, 16, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(8),
+        )
         self.proj = nn.Sequential(
-            nn.Linear(12, hidden_dim),
+            nn.Linear(16 + 16 * 4 * 4 + 16 * 8, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, out_dim),
         )
@@ -24,6 +38,8 @@ class PowerFeatureEncoder(nn.Module):
         self,
         tokens: torch.Tensor,
         token_mask: torch.Tensor,
+        delay_power_map: torch.Tensor | None = None,
+        delay_power_profile: torch.Tensor | None = None,
     ) -> torch.Tensor:
         weights = token_mask.to(dtype=tokens.dtype).unsqueeze(-1).unsqueeze(-1)
         valid_beam_count = token_mask.sum(dim=1).to(dtype=tokens.dtype).clamp(min=1.0)
@@ -60,6 +76,27 @@ class PowerFeatureEncoder(nn.Module):
         beam_peak_over_top3 = beam_peak_power / top3_beam_power_mean.clamp(min=self.eps)
         beam_peak_over_top5 = beam_peak_power / top5_beam_power_mean.clamp(min=self.eps)
 
+        delay_power_mean = torch.zeros_like(raw_power_mean)
+        delay_power_max = torch.zeros_like(raw_power_mean)
+        delay_top3_power_mean = torch.zeros_like(raw_power_mean)
+        delay_power_std = torch.zeros_like(raw_power_mean)
+        if tokens.shape[2] % 2 == 0 and tokens.shape[2] > 0:
+            half = tokens.shape[2] // 2
+            complex_tokens = torch.complex(
+                raw[:, :, :half, :],
+                raw[:, :, half:half * 2, :],
+            )
+            delay_tokens = torch.fft.ifft(complex_tokens, dim=-1)
+            delay_power = delay_tokens.abs().square().mean(dim=2) * token_weights.unsqueeze(-1)
+            delay_element_count = (valid_beam_count[:, None] * delay_power.shape[-1]).clamp(min=1.0)
+            delay_power_mean = delay_power.sum(dim=(1, 2)) / delay_element_count[:, 0]
+            delay_power_max = delay_power.amax(dim=(1, 2))
+            flattened_delay_power = delay_power.reshape(delay_power.shape[0], -1)
+            top3_delay_count = min(max(int(flattened_delay_power.shape[1]), 1), 3)
+            top3_delay_power, _ = torch.topk(flattened_delay_power, k=top3_delay_count, dim=1)
+            delay_top3_power_mean = top3_delay_power.mean(dim=1)
+            delay_power_std = flattened_delay_power.std(dim=1, correction=0)
+
         stats = torch.stack(
             [
                 raw_abs_mean,
@@ -74,10 +111,41 @@ class PowerFeatureEncoder(nn.Module):
                 frequency_rms_std,
                 beam_peak_over_top3,
                 beam_peak_over_top5,
+                delay_power_mean,
+                delay_power_max,
+                delay_top3_power_mean,
+                delay_power_std,
             ],
             dim=1,
         )
-        return self.proj(stats)
+        if delay_power_map is None:
+            delay_power_map = torch.zeros(
+                tokens.shape[0],
+                32,
+                32,
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+        if delay_power_profile is None:
+            delay_power_profile = torch.zeros(
+                tokens.shape[0],
+                64,
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+        map_features = self.map_encoder(delay_power_map.unsqueeze(1).to(dtype=tokens.dtype))
+        profile_features = self.profile_encoder(
+            delay_power_profile.unsqueeze(1).to(dtype=tokens.dtype)
+        )
+        fused = torch.cat(
+            [
+                stats,
+                map_features.flatten(start_dim=1),
+                profile_features.flatten(start_dim=1),
+            ],
+            dim=1,
+        )
+        return self.proj(fused)
 
 
 class CSIClip(nn.Module):
@@ -104,6 +172,8 @@ class CSIClip(nn.Module):
         self.power_feature_encoder = PowerFeatureEncoder()
         self.first_path_power_index = 5
         self.first_path_power_residual_scale = nn.Parameter(torch.tensor(0.0))
+        self.first_path_power_norm_center = 0.0
+        self.first_path_power_norm_half_range = 4.5
         self.physics_head = nn.Sequential(
             nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
             nn.Linear(embed_dim, hidden_dim),
@@ -195,8 +265,15 @@ class CSIClip(nn.Module):
         self,
         tokens: torch.Tensor,
         token_mask: torch.Tensor,
+        delay_power_map: torch.Tensor | None = None,
+        delay_power_profile: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.power_feature_encoder(tokens, token_mask)
+        return self.power_feature_encoder(
+            tokens,
+            token_mask,
+            delay_power_map=delay_power_map,
+            delay_power_profile=delay_power_profile,
+        )
 
     def predict_physics(
         self,
@@ -228,20 +305,19 @@ class CSIClip(nn.Module):
             }
         power_input = torch.cat([csi_features.detach(), power_context], dim=-1)
         direct_first_path_power = self.first_path_power_head(power_input).squeeze(-1)
-        base_first_path_power = base[:, self.first_path_power_index]
-        residual_scaled = self.first_path_power_residual_scale * (
-            direct_first_path_power - base_first_path_power
+        direct_first_path_power = self.first_path_power_norm_center + self.first_path_power_norm_half_range * torch.tanh(
+            direct_first_path_power / max(self.first_path_power_norm_half_range, 1e-6)
         )
-        final = base.clone()
-        final[:, self.first_path_power_index] = (
-            base_first_path_power
-            + residual_scaled
+        zeros = torch.zeros(
+            base.shape[0],
+            device=base.device,
+            dtype=base.dtype,
         )
         return {
             "base": base,
             "direct_first_path_power": direct_first_path_power,
-            "residual_scaled": residual_scaled,
-            "final": final,
+            "residual_scaled": zeros,
+            "final": base,
         }
 
     def predict_semantic(self, csi_features: torch.Tensor) -> torch.Tensor:
