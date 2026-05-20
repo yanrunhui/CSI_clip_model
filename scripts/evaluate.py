@@ -193,13 +193,6 @@ def _infer_use_power_branch(checkpoint: dict | None, override: bool | None) -> b
     return False
 
 
-def _first_path_power_residual_scale(model: torch.nn.Module) -> float | None:
-    scale = getattr(model, "first_path_power_residual_scale", None)
-    if scale is None:
-        return None
-    return float(scale.detach().cpu().item())
-
-
 def _infer_limit_samples(checkpoint: dict | None, override: int | None) -> int | None:
     if override is not None:
         return override
@@ -611,8 +604,6 @@ def evaluate(
         )
         _load_model_state_compatible(model, checkpoint["model_state"])
     model.eval()
-    residual_scale = _first_path_power_residual_scale(model)
-
     all_csi_features = []
     all_semantic_logits = []
     all_attribute_logits = {field: [] for field in attribute_label_maps}
@@ -620,11 +611,11 @@ def evaluate(
     all_instance_text_features = []
     all_physics_predictions = []
     all_base_physics_predictions = []
-    all_direct_first_path_power_predictions = []
+    all_enhanced_first_path_power_predictions = []
     all_physics_targets = []
     all_physics_raw_targets = []
     all_physics_masks = []
-    all_first_path_power_residual_scaled = []
+    all_enhanced_delta = []
     all_labels = []
     all_text_labels = []
     all_semantic_keys = []
@@ -670,10 +661,10 @@ def evaluate(
         )
         physics_predictions = physics_outputs["final"]
         all_base_physics_predictions.append(physics_outputs["base"].cpu())
-        all_direct_first_path_power_predictions.append(
-            physics_outputs["direct_first_path_power"].cpu()
+        all_enhanced_first_path_power_predictions.append(
+            physics_outputs["enhanced_first_path_power"].cpu()
         )
-        all_first_path_power_residual_scaled.append(physics_outputs["residual_scaled"].cpu())
+        all_enhanced_delta.append(physics_outputs["enhanced_delta"].cpu())
         all_physics_predictions.append(physics_predictions.cpu())
         all_physics_targets.append(batch["physics_targets"].cpu())
         all_physics_raw_targets.append(batch["physics_raw_targets"].cpu())
@@ -709,11 +700,11 @@ def evaluate(
     }
     physics_predictions = torch.cat(all_physics_predictions, dim=0)
     base_physics_predictions = torch.cat(all_base_physics_predictions, dim=0)
-    direct_first_path_power_predictions = torch.cat(all_direct_first_path_power_predictions, dim=0)
+    enhanced_first_path_power_predictions = torch.cat(all_enhanced_first_path_power_predictions, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
     physics_masks = torch.cat(all_physics_masks, dim=0)
-    first_path_power_residual_scaled = torch.cat(all_first_path_power_residual_scaled, dim=0)
+    enhanced_delta = torch.cat(all_enhanced_delta, dim=0)
     labels = torch.tensor(all_labels, dtype=torch.long)
     logit_scale = float(model.logit_scale.exp().detach().cpu().item())
     prototype_logits = logit_scale * csi_features @ prototype_features.T
@@ -753,8 +744,6 @@ def evaluate(
     print(f"eval_csi_to_prototype_loss={float(csi_prototype_loss):.4f}")
     print(f"eval_text_to_prototype_loss={float(text_prototype_loss):.4f}")
     print(f"logit_scale={logit_scale:.4f}")
-    if residual_scale is not None:
-        print(f"first_path_power_residual_scale={residual_scale:.6f}")
     print(f"text_mode={text_mode}")
     print(f"semantic_key_mode={semantic_key_mode}")
     print(f"token_norm_mode={token_norm_mode}")
@@ -794,15 +783,13 @@ def evaluate(
     _print_first_path_power_diagnostics(
         base_physics_predictions=base_physics_predictions,
         physics_predictions=physics_predictions,
-        direct_first_path_power_predictions=direct_first_path_power_predictions,
+        enhanced_first_path_power_predictions=enhanced_first_path_power_predictions,
         physics_raw_targets=physics_raw_targets,
         physics_targets=physics_targets,
         physics_masks=physics_masks,
     )
-    print(f"residual_scaled_mean={float(first_path_power_residual_scaled.mean()):.6f}")
-    print(f"residual_scaled_std={float(first_path_power_residual_scaled.std()):.6f}")
-    if residual_scale is not None:
-        print(f"residual_scale={residual_scale:.6f}")
+    print(f"enhanced_delta_mean={float(enhanced_delta.mean()):.6f}")
+    print(f"enhanced_delta_std={float(enhanced_delta.std()):.6f}")
     _print_structured_physical_description_metrics(
         physics_predictions=physics_predictions,
         physics_raw_targets=physics_raw_targets,
@@ -1331,7 +1318,7 @@ def _print_structured_physical_description_metrics(
 def _print_first_path_power_diagnostics(
     base_physics_predictions: torch.Tensor,
     physics_predictions: torch.Tensor,
-    direct_first_path_power_predictions: torch.Tensor,
+    enhanced_first_path_power_predictions: torch.Tensor,
     physics_raw_targets: torch.Tensor,
     physics_targets: torch.Tensor,
     physics_masks: torch.Tensor,
@@ -1340,40 +1327,40 @@ def _print_first_path_power_diagnostics(
     first_path_power_mask = physics_masks[:, first_path_power_idx]
     if not bool(first_path_power_mask.any()):
         print("base_first_power_MAE=nan")
-        print("direct_power_head_MAE=nan")
-        print("residual_final_MAE=nan")
-        print("direct_power_head_norm_MAE=nan")
-        print("direct_power_head_norm_range=nan,nan")
-        print("direct_power_head_dbw_range=nan,nan")
+        print("enhanced_first_power_MAE=nan")
+        print("final_first_power_MAE=nan")
+        print("enhanced_first_power_norm_MAE=nan")
+        print("enhanced_first_power_norm_range=nan,nan")
+        print("enhanced_first_power_dbw_range=nan,nan")
         print("target_first_power_norm_range=nan,nan")
         print("target_first_power_dbw_range=nan,nan")
         return
 
     base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
     final_physics_raw_predictions = _physics_raw_predictions(physics_predictions)
-    direct_raw_predictions = (
-        direct_first_path_power_predictions * PHYSICS_TARGET_SCALES[first_path_power_idx]
+    enhanced_raw_predictions = (
+        enhanced_first_path_power_predictions * PHYSICS_TARGET_SCALES[first_path_power_idx]
         + PHYSICS_TARGET_OFFSETS[first_path_power_idx]
     )
 
     masked_base_raw = base_physics_raw_predictions[first_path_power_mask, first_path_power_idx]
     masked_final_raw = final_physics_raw_predictions[first_path_power_mask, first_path_power_idx]
-    masked_direct_norm = direct_first_path_power_predictions[first_path_power_mask]
-    masked_direct_raw = direct_raw_predictions[first_path_power_mask]
+    masked_enhanced_norm = enhanced_first_path_power_predictions[first_path_power_mask]
+    masked_enhanced_raw = enhanced_raw_predictions[first_path_power_mask]
     masked_target_norm = physics_targets[first_path_power_mask, first_path_power_idx]
     masked_target_raw = physics_raw_targets[first_path_power_mask, first_path_power_idx]
 
     print(f"base_first_power_MAE={float((masked_base_raw - masked_target_raw).abs().mean()):.4f}")
-    print(f"direct_power_head_MAE={float((masked_direct_raw - masked_target_raw).abs().mean()):.4f}")
-    print(f"residual_final_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
-    print(f"direct_power_head_norm_MAE={float((masked_direct_norm - masked_target_norm).abs().mean()):.4f}")
+    print(f"enhanced_first_power_MAE={float((masked_enhanced_raw - masked_target_raw).abs().mean()):.4f}")
+    print(f"final_first_power_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
+    print(f"enhanced_first_power_norm_MAE={float((masked_enhanced_norm - masked_target_norm).abs().mean()):.4f}")
     print(
-        "direct_power_head_norm_range="
-        f"{float(masked_direct_norm.min()):.4f},{float(masked_direct_norm.max()):.4f}"
+        "enhanced_first_power_norm_range="
+        f"{float(masked_enhanced_norm.min()):.4f},{float(masked_enhanced_norm.max()):.4f}"
     )
     print(
-        "direct_power_head_dbw_range="
-        f"{float(masked_direct_raw.min()):.4f},{float(masked_direct_raw.max()):.4f}"
+        "enhanced_first_power_dbw_range="
+        f"{float(masked_enhanced_raw.min()):.4f},{float(masked_enhanced_raw.max()):.4f}"
     )
     print(
         "target_first_power_norm_range="
@@ -1401,10 +1388,16 @@ def main() -> None:
         choices=["std", "rms", "none"],
         help="CSI token normalization mode. Defaults to checkpoint args.",
     )
-    parser.add_argument(
+    power_branch_group = parser.add_mutually_exclusive_group()
+    power_branch_group.add_argument(
         "--enable-power-branch",
         action="store_true",
         help="Enable the power branch regardless of checkpoint args.",
+    )
+    power_branch_group.add_argument(
+        "--disable-power-branch",
+        action="store_true",
+        help="Disable the power branch regardless of checkpoint args.",
     )
     parser.add_argument(
         "--min-class-size",
@@ -1465,7 +1458,9 @@ def main() -> None:
         min_class_size_override=args.min_class_size,
         semantic_key_mode_override=args.semantic_key_mode,
         token_norm_mode_override=args.token_norm_mode,
-        use_power_branch_override=True if args.enable_power_branch else None,
+        use_power_branch_override=(
+            True if args.enable_power_branch else False if args.disable_power_branch else None
+        ),
         attribute_fields_override=tuple(args.attribute_classifier_fields) if args.attribute_classifier_fields else None,
         filter_attribute_values_override=(
             parse_attribute_value_filters(args.filter_attribute_values)

@@ -460,11 +460,11 @@ class Trainer:
                 and cfg.direct_power_weight > 0.0
             ):
                 first_path_power_idx = 5
-                direct_first_path_power = physics_outputs["direct_first_path_power"]
+                enhanced_first_path_power = physics_outputs["enhanced_first_path_power"]
                 direct_power_target = batch["physics_targets"][:, first_path_power_idx]
                 direct_power_mask = batch["physics_target_mask"][:, first_path_power_idx]
                 direct_power_errors = torch.nn.functional.smooth_l1_loss(
-                    direct_first_path_power,
+                    enhanced_first_path_power,
                     direct_power_target,
                     reduction="none",
                 )

@@ -356,6 +356,7 @@ def build_components_from_samples(
         dataset,
         batch_size=batch_size,
         shuffle=True,
+        drop_last=True,
         collate_fn=partial(collate_fn, tokenizer=tokenizer, max_caption_len=48),
     )
 
@@ -455,13 +456,6 @@ def trainable_parameters(model: torch.nn.Module):
 
 def count_trainable_parameters(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-
-
-def get_first_path_power_residual_scale(model: torch.nn.Module) -> float | None:
-    scale = getattr(model, "first_path_power_residual_scale", None)
-    if scale is None:
-        return None
-    return float(scale.detach().cpu().item())
 
 
 def load_transfer_checkpoint(path: str | None, device: torch.device) -> dict | None:
@@ -924,8 +918,6 @@ def run_real_pretrain(
         attribute_class_counts=prototype_bank["attribute_class_counts"],
         attribute_remap=attribute_remap,
     )
-    residual_scale = get_first_path_power_residual_scale(model)
-
     print(f"training on {data_path}")
     print(f"checkpoint={checkpoint_path}")
     print(
@@ -962,9 +954,6 @@ def run_real_pretrain(
         f"freeze_csi={freeze_csi} freeze_text_prototypes={freeze_text_prototypes} "
         f"trainable_parameters={count_trainable_parameters(model)}"
     )
-    if residual_scale is not None:
-        print(f"first_path_power_residual_scale={residual_scale:.6f}")
-
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     log_path = output_path / "train_log.jsonl"
