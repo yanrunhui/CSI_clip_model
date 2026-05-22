@@ -148,6 +148,46 @@ class DelayProfileEncoder(nn.Module):
         return self.proj(features.flatten(start_dim=1))
 
 
+class DelayPowerMapEncoder(nn.Module):
+    def __init__(
+        self,
+        out_dim: int = 32,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(16 * 4 * 4, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(
+        self,
+        delay_power_map: torch.Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if delay_power_map is None:
+            delay_power_map = torch.zeros(
+                batch_size,
+                32,
+                32,
+                device=device,
+                dtype=dtype,
+            )
+        features = self.encoder(delay_power_map.unsqueeze(1).to(dtype=dtype))
+        return self.proj(features.flatten(start_dim=1))
+
+
 class CSIClip(nn.Module):
     def __init__(
         self,
@@ -170,9 +210,10 @@ class CSIClip(nn.Module):
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
         hidden_dim = embed_dim * 2
         self.power_feature_encoder = PowerFeatureEncoder()
-        self.delay_profile_encoder = DelayProfileEncoder()
+        self.delay_power_map_encoder = DelayPowerMapEncoder()
         self.first_path_power_index = 5
         self.first_path_power_delta_limit = 0.5
+        self.first_path_power_fusion_scale = 0.1
         self.physics_head = nn.Sequential(
             nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
             nn.Linear(embed_dim, hidden_dim),
@@ -180,6 +221,12 @@ class CSIClip(nn.Module):
             nn.Linear(hidden_dim, num_physics_targets),
         )
         self.first_path_power_head = nn.Sequential(
+            nn.BatchNorm1d(embed_dim + 32 + 32, eps=1e-12, momentum=None),
+            nn.Linear(embed_dim + 32 + 32, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.first_path_power_gate = nn.Sequential(
             nn.BatchNorm1d(embed_dim + 32 + 32, eps=1e-12, momentum=None),
             nn.Linear(embed_dim + 32 + 32, hidden_dim),
             nn.GELU(),
@@ -273,15 +320,15 @@ class CSIClip(nn.Module):
             delay_power_map=delay_power_map,
             delay_power_profile=delay_power_profile,
         )
-        delay_context = self.delay_profile_encoder(
-            delay_power_profile,
+        delay_map_context = self.delay_power_map_encoder(
+            delay_power_map,
             batch_size=tokens.shape[0],
             device=tokens.device,
             dtype=tokens.dtype,
         )
         return {
             "raw_power_context": raw_power_context,
-            "delay_context": delay_context,
+            "delay_map_context": delay_map_context,
         }
 
     def predict_physics(
@@ -309,13 +356,14 @@ class CSIClip(nn.Module):
             return {
                 "base": base,
                 "enhanced_first_path_power": base[:, self.first_path_power_index],
+                "enhanced_gate": zeros,
                 "enhanced_delta": zeros,
                 "final": base,
             }
         enhanced_input = torch.cat(
             [
                 csi_features,
-                power_context["delay_context"],
+                power_context["delay_map_context"],
                 power_context["raw_power_context"],
             ],
             dim=-1,
@@ -324,13 +372,22 @@ class CSIClip(nn.Module):
         enhanced_delta = self.first_path_power_delta_limit * torch.tanh(
             enhanced_delta / max(self.first_path_power_delta_limit, 1e-6)
         )
+        enhanced_gate = torch.sigmoid(
+            self.first_path_power_gate(enhanced_input).squeeze(-1)
+        )
         base_first_path_power = base[:, self.first_path_power_index]
-        enhanced_first_path_power = base_first_path_power + enhanced_delta
+        gated_delta = enhanced_gate * enhanced_delta
+        enhanced_first_path_power = base_first_path_power + gated_delta
+        final = base.clone()
+        final[:, self.first_path_power_index] = (
+            base_first_path_power + self.first_path_power_fusion_scale * gated_delta
+        )
         return {
             "base": base,
             "enhanced_first_path_power": enhanced_first_path_power,
+            "enhanced_gate": enhanced_gate,
             "enhanced_delta": enhanced_delta,
-            "final": base,
+            "final": final,
         }
 
     def predict_semantic(self, csi_features: torch.Tensor) -> torch.Tensor:

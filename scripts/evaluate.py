@@ -612,6 +612,7 @@ def evaluate(
     all_physics_predictions = []
     all_base_physics_predictions = []
     all_enhanced_first_path_power_predictions = []
+    all_enhanced_gates = []
     all_physics_targets = []
     all_physics_raw_targets = []
     all_physics_masks = []
@@ -664,6 +665,7 @@ def evaluate(
         all_enhanced_first_path_power_predictions.append(
             physics_outputs["enhanced_first_path_power"].cpu()
         )
+        all_enhanced_gates.append(physics_outputs["enhanced_gate"].cpu())
         all_enhanced_delta.append(physics_outputs["enhanced_delta"].cpu())
         all_physics_predictions.append(physics_predictions.cpu())
         all_physics_targets.append(batch["physics_targets"].cpu())
@@ -701,6 +703,7 @@ def evaluate(
     physics_predictions = torch.cat(all_physics_predictions, dim=0)
     base_physics_predictions = torch.cat(all_base_physics_predictions, dim=0)
     enhanced_first_path_power_predictions = torch.cat(all_enhanced_first_path_power_predictions, dim=0)
+    enhanced_gate = torch.cat(all_enhanced_gates, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
     physics_masks = torch.cat(all_physics_masks, dim=0)
@@ -790,6 +793,8 @@ def evaluate(
     )
     print(f"enhanced_delta_mean={float(enhanced_delta.mean()):.6f}")
     print(f"enhanced_delta_std={float(enhanced_delta.std()):.6f}")
+    print(f"enhanced_gate_mean={float(enhanced_gate.mean()):.6f}")
+    print(f"enhanced_gate_std={float(enhanced_gate.std()):.6f}")
     _print_structured_physical_description_metrics(
         physics_predictions=physics_predictions,
         physics_raw_targets=physics_raw_targets,
@@ -1315,6 +1320,86 @@ def _print_structured_physical_description_metrics(
         )
 
 
+def _print_scalar_error_distribution(
+    prefix: str,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+) -> None:
+    errors = predictions - targets
+    abs_errors = errors.abs()
+    quantiles = torch.tensor(
+        [0.05, 0.25, 0.50, 0.75, 0.95],
+        dtype=errors.dtype,
+        device=errors.device,
+    )
+    error_quantiles = torch.quantile(errors, quantiles)
+    abs_error_quantiles = torch.quantile(abs_errors, quantiles)
+    print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
+    print(f"{prefix}_signed_std={float(errors.std(correction=0)): .4f}".replace(" ", ""))
+    print(
+        f"{prefix}_signed_quantiles="
+        f"p05:{float(error_quantiles[0]):.4f},"
+        f"p25:{float(error_quantiles[1]):.4f},"
+        f"p50:{float(error_quantiles[2]):.4f},"
+        f"p75:{float(error_quantiles[3]):.4f},"
+        f"p95:{float(error_quantiles[4]):.4f}"
+    )
+    print(
+        f"{prefix}_abs_quantiles="
+        f"p05:{float(abs_error_quantiles[0]):.4f},"
+        f"p25:{float(abs_error_quantiles[1]):.4f},"
+        f"p50:{float(abs_error_quantiles[2]):.4f},"
+        f"p75:{float(abs_error_quantiles[3]):.4f},"
+        f"p95:{float(abs_error_quantiles[4]):.4f}"
+    )
+    print(f"{prefix}_overpredict_fraction={float((errors > 0).float().mean()):.4f}")
+    print(f"{prefix}_underpredict_fraction={float((errors < 0).float().mean()):.4f}")
+    print(f"{prefix}_abs_error_le_1db={float((abs_errors <= 1.0).float().mean()):.4f}")
+    print(f"{prefix}_abs_error_le_3db={float((abs_errors <= 3.0).float().mean()):.4f}")
+    print(f"{prefix}_abs_error_gt_6db={float((abs_errors > 6.0).float().mean()):.4f}")
+
+
+def _print_binned_scalar_error_distribution(
+    prefix: str,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+) -> None:
+    bins = (
+        ("very_weak", -220.0, -180.0),
+        ("weak", -180.0, -140.0),
+        ("moderate", -140.0, -100.0),
+        ("strong", -100.0, -60.0),
+    )
+    quantiles = torch.tensor(
+        [0.50, 0.75, 0.95],
+        dtype=targets.dtype,
+        device=targets.device,
+    )
+    for label, lower, upper in bins:
+        mask = (targets >= lower) & (targets < upper)
+        count = int(mask.sum().item())
+        print(f"{prefix}_{label}_count={count}")
+        if count == 0:
+            print(f"{prefix}_{label}_MAE=nan")
+            print(f"{prefix}_{label}_signed_mean=nan")
+            print(f"{prefix}_{label}_abs_p50=nan")
+            print(f"{prefix}_{label}_abs_p75=nan")
+            print(f"{prefix}_{label}_abs_p95=nan")
+            print(f"{prefix}_{label}_abs_error_le_3db=nan")
+            print(f"{prefix}_{label}_abs_error_gt_6db=nan")
+            continue
+        errors = predictions[mask] - targets[mask]
+        abs_errors = errors.abs()
+        abs_error_quantiles = torch.quantile(abs_errors, quantiles)
+        print(f"{prefix}_{label}_MAE={float(abs_errors.mean()):.4f}")
+        print(f"{prefix}_{label}_signed_mean={float(errors.mean()):.4f}")
+        print(f"{prefix}_{label}_abs_p50={float(abs_error_quantiles[0]):.4f}")
+        print(f"{prefix}_{label}_abs_p75={float(abs_error_quantiles[1]):.4f}")
+        print(f"{prefix}_{label}_abs_p95={float(abs_error_quantiles[2]):.4f}")
+        print(f"{prefix}_{label}_abs_error_le_3db={float((abs_errors <= 3.0).float().mean()):.4f}")
+        print(f"{prefix}_{label}_abs_error_gt_6db={float((abs_errors > 6.0).float().mean()):.4f}")
+
+
 def _print_first_path_power_diagnostics(
     base_physics_predictions: torch.Tensor,
     physics_predictions: torch.Tensor,
@@ -1369,6 +1454,36 @@ def _print_first_path_power_diagnostics(
     print(
         "target_first_power_dbw_range="
         f"{float(masked_target_raw.min()):.4f},{float(masked_target_raw.max()):.4f}"
+    )
+    _print_scalar_error_distribution(
+        "base_first_power_error_dbw",
+        masked_base_raw,
+        masked_target_raw,
+    )
+    _print_scalar_error_distribution(
+        "enhanced_first_power_error_dbw",
+        masked_enhanced_raw,
+        masked_target_raw,
+    )
+    _print_scalar_error_distribution(
+        "final_first_power_error_dbw",
+        masked_final_raw,
+        masked_target_raw,
+    )
+    _print_binned_scalar_error_distribution(
+        "base_first_power_error_dbw",
+        masked_base_raw,
+        masked_target_raw,
+    )
+    _print_binned_scalar_error_distribution(
+        "enhanced_first_power_error_dbw",
+        masked_enhanced_raw,
+        masked_target_raw,
+    )
+    _print_binned_scalar_error_distribution(
+        "final_first_power_error_dbw",
+        masked_final_raw,
+        masked_target_raw,
     )
 
 

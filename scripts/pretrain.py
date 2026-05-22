@@ -57,6 +57,49 @@ def cfg_get(config: dict, key: str, fallback):
     return fallback if value is None else value
 
 
+DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS = {
+    "very_weak": 2.0,
+    "weak": 1.5,
+    "moderate": 1.0,
+    "strong": 1.0,
+}
+
+
+def parse_first_path_power_bin_weights(value) -> dict[str, float]:
+    if value is None:
+        return dict(DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS)
+    entries = [value] if isinstance(value, str) else value
+    if isinstance(entries, dict):
+        parsed = {str(label): float(weight) for label, weight in entries.items()}
+    else:
+        parsed = dict(DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS)
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--first-path-power-bin-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown first-path-power bin labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"first-path-power bin weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_first_path_power_bin_weights(weights: dict[str, float]) -> str:
+    return ",".join(
+        f"{label}={float(weights[label]):.3f}"
+        for label in DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS
+    )
+
+
 def parse_aux_regression_targets(value) -> tuple[str, ...]:
     if value is None:
         return ("all",)
@@ -715,6 +758,7 @@ def run_smoke_test(
     aux_regression_weight: float = 0.0,
     aux_regression_targets: tuple[str, ...] = ("all",),
     direct_power_weight: float = 0.0,
+    first_path_power_bin_weights: dict[str, float] | None = None,
     multipositive_distance_threshold: float = 0.25,
     multipositive_positive_mode: str = "semantic_and_physics",
     min_class_size_for_multipositive: int = 2,
@@ -769,6 +813,7 @@ def run_smoke_test(
                     aux_regression_weight=aux_regression_weight,
                     aux_regression_indices=aux_regression_indices(aux_regression_targets),
                     direct_power_weight=direct_power_weight,
+                    first_path_power_bin_weights=first_path_power_bin_weights,
                     prototype_warmup_epochs=1,
                     multipositive_distance_threshold=multipositive_distance_threshold,
                     multipositive_positive_mode=multipositive_positive_mode,
@@ -812,6 +857,7 @@ def run_real_pretrain(
     aux_regression_weight: float,
     aux_regression_targets: tuple[str, ...],
     direct_power_weight: float,
+    first_path_power_bin_weights: dict[str, float],
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
     min_class_size_for_multipositive: int,
@@ -900,6 +946,7 @@ def run_real_pretrain(
         aux_regression_weight=aux_regression_weight,
         aux_regression_indices=aux_regression_indices(aux_regression_targets),
         direct_power_weight=direct_power_weight,
+        first_path_power_bin_weights=first_path_power_bin_weights,
         freeze_csi=freeze_csi,
         freeze_text_prototypes=freeze_text_prototypes,
         multipositive_distance_threshold=multipositive_distance_threshold,
@@ -943,6 +990,7 @@ def run_real_pretrain(
         f"aux_regression_weight={aux_regression_weight} "
         f"aux_regression_targets={','.join(aux_regression_targets)} "
         f"direct_power_weight={direct_power_weight} "
+        f"first_path_power_bin_weights={format_first_path_power_bin_weights(first_path_power_bin_weights)} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
         f"min_class_size_for_multipositive={min_class_size_for_multipositive} "
@@ -1015,6 +1063,9 @@ def run_real_pretrain(
         ) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_direct_power = sum(m.get("loss_direct_power", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_first_path_power_sample_weight = sum(
+            m.get("first_path_power_sample_weight_mean", 1.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
         mean_positive_count = sum(m.get("multipositive_positive_count_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_logit_scale = sum(m["logit_scale"] for m in epoch_metrics) / len(epoch_metrics)
         mean_prototype_warmup_active = sum(m.get("prototype_warmup_active", 0.0) for m in epoch_metrics) / len(epoch_metrics)
@@ -1052,6 +1103,7 @@ def run_real_pretrain(
             f"{attribute_debug} "
             f"aux_reg={mean_aux_regression:.4f} "
             f"direct_power={mean_direct_power:.4f} "
+            f"fp_power_w={mean_first_path_power_sample_weight:.3f} "
             f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
         )
         with log_path.open("a", encoding="utf-8") as f:
@@ -1092,6 +1144,7 @@ def run_real_pretrain(
                         "grad_norm_attribute_classifiers": mean_grad_attribute_classifiers,
                         "loss_aux_regression": mean_aux_regression,
                         "loss_direct_power": mean_direct_power,
+                        "first_path_power_sample_weight_mean": mean_first_path_power_sample_weight,
                         "logit_scale": mean_logit_scale,
                         "text_mode": text_mode,
                         "prototype_warmup_epochs": prototype_warmup_epochs,
@@ -1115,6 +1168,7 @@ def run_real_pretrain(
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
                         "direct_power_weight": direct_power_weight,
+                        "first_path_power_bin_weights": first_path_power_bin_weights,
                         "multipositive_distance_threshold": multipositive_distance_threshold,
                         "multipositive_positive_mode": multipositive_positive_mode,
                         "min_class_size_for_multipositive": min_class_size_for_multipositive,
@@ -1179,6 +1233,7 @@ def run_real_pretrain(
                     "aux_regression_weight": aux_regression_weight,
                     "aux_regression_targets": list(aux_regression_targets),
                     "direct_power_weight": direct_power_weight,
+                    "first_path_power_bin_weights": first_path_power_bin_weights,
                     "multipositive_distance_threshold": multipositive_distance_threshold,
                     "multipositive_positive_mode": multipositive_positive_mode,
                     "min_class_size_for_multipositive": min_class_size_for_multipositive,
@@ -1283,6 +1338,14 @@ def main() -> None:
         "--direct-power-weight",
         type=float,
         help="Small explicit supervision weight for the direct first-path-power head.",
+    )
+    parser.add_argument(
+        "--first-path-power-bin-weight",
+        action="append",
+        help=(
+            "Per-bin weighting for first-path-power losses as LABEL=WEIGHT. "
+            "Labels: very_weak, weak, moderate, strong."
+        ),
     )
     parser.add_argument("--multipositive-distance-threshold", type=float)
     parser.add_argument(
@@ -1443,6 +1506,11 @@ def main() -> None:
         if args.direct_power_weight is not None
         else float(cfg_get(train_cfg, "direct_power_weight", 0.0))
     )
+    first_path_power_bin_weights = parse_first_path_power_bin_weights(
+        args.first_path_power_bin_weight
+        if args.first_path_power_bin_weight is not None
+        else cfg_get(train_cfg, "first_path_power_bin_weights", None)
+    )
     aux_regression_targets = parse_aux_regression_targets(
         args.aux_regression_targets
         if args.aux_regression_targets is not None
@@ -1517,6 +1585,7 @@ def main() -> None:
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
             direct_power_weight=direct_power_weight,
+            first_path_power_bin_weights=first_path_power_bin_weights,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
@@ -1557,6 +1626,7 @@ def main() -> None:
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
             direct_power_weight=direct_power_weight,
+            first_path_power_bin_weights=first_path_power_bin_weights,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,

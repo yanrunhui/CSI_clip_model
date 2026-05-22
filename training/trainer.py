@@ -11,7 +11,6 @@ from .losses import (
     PrototypeClipLoss,
     cosine_alignment_loss,
     instance_contrastive_loss,
-    masked_regression_loss,
     multipositive_contrastive_loss,
     paired_contrastive_loss,
     semantic_classification_loss,
@@ -36,6 +35,7 @@ class TrainConfig:
     aux_regression_weight: float = 0.0
     aux_regression_indices: tuple[int, ...] | None = None
     direct_power_weight: float = 0.0
+    first_path_power_bin_weights: dict[str, float] | None = None
     freeze_csi: bool = False
     freeze_text_prototypes: bool = False
     prototype_warmup_epochs: int = 0
@@ -45,6 +45,13 @@ class TrainConfig:
 
 
 class Trainer:
+    FIRST_PATH_POWER_BINS = (
+        ("very_weak", -220.0, -180.0),
+        ("weak", -180.0, -140.0),
+        ("moderate", -140.0, -100.0),
+        ("strong", -100.0, -60.0),
+    )
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -209,6 +216,21 @@ class Trainer:
                     f"Semantic label roundtrip mismatch at sample {sample_idx}: "
                     f"key={key} label={label} roundtrip_key={roundtrip_key}."
                 )
+
+    def _first_path_power_sample_weights(
+        self,
+        raw_first_path_power: torch.Tensor,
+        cfg: TrainConfig,
+    ) -> torch.Tensor:
+        weights_cfg = cfg.first_path_power_bin_weights or {}
+        weights = torch.ones_like(raw_first_path_power)
+        for label, lower, upper in self.FIRST_PATH_POWER_BINS:
+            bin_weight = float(weights_cfg.get(label, 1.0))
+            if bin_weight == 1.0:
+                continue
+            mask = (raw_first_path_power >= lower) & (raw_first_path_power < upper)
+            weights = torch.where(mask, torch.full_like(weights, bin_weight), weights)
+        return weights
 
     @staticmethod
     def _multipositive_mask(
@@ -444,15 +466,36 @@ class Trainer:
             regression_predictions = physics_predictions
             regression_targets = batch["physics_targets"]
             regression_mask = batch["physics_target_mask"]
+            regression_weights = torch.ones_like(regression_targets)
             if cfg.aux_regression_indices:
                 indices = torch.tensor(cfg.aux_regression_indices, device=self.device, dtype=torch.long)
                 regression_predictions = regression_predictions.index_select(dim=1, index=indices)
                 regression_targets = regression_targets.index_select(dim=1, index=indices)
                 regression_mask = regression_mask.index_select(dim=1, index=indices)
-            losses["loss_aux_regression"] = masked_regression_loss(
+                regression_weights = torch.ones_like(regression_targets)
+                if 5 in cfg.aux_regression_indices:
+                    first_path_position = cfg.aux_regression_indices.index(5)
+                    regression_weights[:, first_path_position] = self._first_path_power_sample_weights(
+                        batch["physics_raw_targets"][:, 5],
+                        cfg,
+                    )
+            else:
+                regression_weights[:, 5] = self._first_path_power_sample_weights(
+                    batch["physics_raw_targets"][:, 5],
+                    cfg,
+                )
+            regression_errors = torch.nn.functional.smooth_l1_loss(
                 regression_predictions,
                 regression_targets,
-                regression_mask,
+                reduction="none",
+            )
+            weighted_regression_mask = (
+                regression_mask.to(dtype=regression_errors.dtype)
+                * regression_weights.to(dtype=regression_errors.dtype)
+            )
+            losses["loss_aux_regression"] = (
+                (regression_errors * weighted_regression_mask).sum()
+                / weighted_regression_mask.sum().clamp(min=1).to(dtype=regression_errors.dtype)
             )
             if (
                 physics_outputs is not None
@@ -468,12 +511,18 @@ class Trainer:
                     direct_power_target,
                     reduction="none",
                 )
-                direct_power_errors = direct_power_errors * direct_power_mask.to(
-                    dtype=direct_power_errors.dtype
+                direct_power_weights = self._first_path_power_sample_weights(
+                    batch["physics_raw_targets"][:, first_path_power_idx],
+                    cfg,
                 )
+                weighted_direct_power_mask = (
+                    direct_power_mask.to(dtype=direct_power_errors.dtype)
+                    * direct_power_weights.to(dtype=direct_power_errors.dtype)
+                )
+                direct_power_errors = direct_power_errors * weighted_direct_power_mask
                 losses["loss_direct_power"] = (
                     direct_power_errors.sum()
-                    / direct_power_mask.sum().clamp(min=1).to(dtype=direct_power_errors.dtype)
+                    / weighted_direct_power_mask.sum().clamp(min=1).to(dtype=direct_power_errors.dtype)
                 )
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
@@ -505,6 +554,13 @@ class Trainer:
         metrics.update(grad_metrics)
         metrics["csi_feature_raw_std"] = float(csi_features_raw.detach().float().std())
         metrics["csi_feature_normalized_std"] = float(csi_features.detach().float().std())
+        if physics_outputs is not None and "enhanced_gate" in physics_outputs:
+            metrics["enhanced_gate_mean"] = float(
+                physics_outputs["enhanced_gate"].detach().float().mean()
+            )
+            metrics["enhanced_gate_std"] = float(
+                physics_outputs["enhanced_gate"].detach().float().std()
+            )
         metrics["csi_to_text_weight"] = float(effective_csi_to_text_weight)
         metrics["prototype_weight"] = float(effective_prototype_weight)
         metrics["text_prototype_weight"] = float(cfg.text_prototype_weight)
@@ -520,6 +576,13 @@ class Trainer:
         )
         metrics["aux_regression_weight"] = float(effective_aux_regression_weight)
         metrics["direct_power_weight"] = float(cfg.direct_power_weight)
+        if physics_predictions is not None:
+            metrics["first_path_power_sample_weight_mean"] = float(
+                self._first_path_power_sample_weights(
+                    batch["physics_raw_targets"][:, 5],
+                    cfg,
+                ).detach().float().mean()
+            )
         metrics["prototype_warmup_active"] = float(warmup_active)
         metrics["prototype_warmup_epochs"] = float(cfg.prototype_warmup_epochs)
         metrics["min_class_size_for_multipositive"] = float(cfg.min_class_size_for_multipositive)
