@@ -7,6 +7,7 @@ train:
   weight_decay: 1.0e-2
   epochs: 100
   temperature: 0.07
+  use_power_branch: true
   warmup_epochs: 5
   min_lr: 1.0e-5
   csi_to_text_weight: 1.0
@@ -23,6 +24,8 @@ train:
   attribute_classifier_logit_adjustment: 0.0
   semantic_key_mode: coarse_k
   aux_regression_weight: 0.02
+  first_path_power_bin_classifier_weight: 0.05
+  first_path_power_bin_position_weight: 0.1
   aux_regression_targets:
     - delay_spread_ns
     - azimuth_spread_deg

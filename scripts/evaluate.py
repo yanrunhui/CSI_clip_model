@@ -25,6 +25,9 @@ from data.dataset import (
     semantic_key_mode_choices,
 )
 from data.semantic_key import (
+    FIRST_POWER_DBW_BIN_LABELS,
+    FIRST_POWER_DBW_BINS,
+    FIRST_POWER_DBW_POSITION_BINS,
     SemanticKey,
     default_attribute_fields,
     implied_attribute_value_filters,
@@ -52,6 +55,9 @@ PHYSICAL_DESCRIPTION_TOLERANCES = {
     "azimuth_spread_deg": 10.0,
     "first_path_power_dbw": 3.0,
 }
+
+FIRST_PATH_POWER_BINS = FIRST_POWER_DBW_BINS
+FIRST_PATH_POWER_POSITION_BINS = FIRST_POWER_DBW_POSITION_BINS
 
 
 def build_tokenizer(samples, checkpoint: dict | None) -> CaptionTokenizer:
@@ -612,6 +618,8 @@ def evaluate(
     all_physics_predictions = []
     all_base_physics_predictions = []
     all_enhanced_first_path_power_predictions = []
+    all_first_path_power_bin_logits = []
+    all_first_path_power_bin_positions = []
     all_enhanced_gates = []
     all_physics_targets = []
     all_physics_raw_targets = []
@@ -665,6 +673,12 @@ def evaluate(
         all_enhanced_first_path_power_predictions.append(
             physics_outputs["enhanced_first_path_power"].cpu()
         )
+        all_first_path_power_bin_logits.append(
+            physics_outputs["first_path_power_bin_logits"].cpu()
+        )
+        all_first_path_power_bin_positions.append(
+            physics_outputs["first_path_power_bin_position"].cpu()
+        )
         all_enhanced_gates.append(physics_outputs["enhanced_gate"].cpu())
         all_enhanced_delta.append(physics_outputs["enhanced_delta"].cpu())
         all_physics_predictions.append(physics_predictions.cpu())
@@ -703,6 +717,8 @@ def evaluate(
     physics_predictions = torch.cat(all_physics_predictions, dim=0)
     base_physics_predictions = torch.cat(all_base_physics_predictions, dim=0)
     enhanced_first_path_power_predictions = torch.cat(all_enhanced_first_path_power_predictions, dim=0)
+    first_path_power_bin_logits = torch.cat(all_first_path_power_bin_logits, dim=0)
+    first_path_power_bin_positions = torch.cat(all_first_path_power_bin_positions, dim=0)
     enhanced_gate = torch.cat(all_enhanced_gates, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
@@ -791,6 +807,19 @@ def evaluate(
         physics_targets=physics_targets,
         physics_masks=physics_masks,
     )
+    if checkpoint is not None and float(checkpoint.get("args", {}).get("first_path_power_bin_classifier_weight", 0.0)) > 0:
+        print(f"first_path_power_bin_label_order={','.join(FIRST_POWER_DBW_BIN_LABELS)}")
+        _print_first_path_power_bin_classifier_metrics(
+            first_path_power_bin_logits,
+            physics_raw_targets[:, _physics_target_index("first_path_power_dbw")],
+            checkpoint.get("args", {}).get("first_path_power_bin_weights"),
+        )
+    if checkpoint is not None and float(checkpoint.get("args", {}).get("first_path_power_bin_position_weight", 0.0)) > 0:
+        _print_first_path_power_bin_position_metrics(
+            first_path_power_bin_positions,
+            first_path_power_bin_logits,
+            physics_raw_targets[:, _physics_target_index("first_path_power_dbw")],
+        )
     print(f"enhanced_delta_mean={float(enhanced_delta.mean()):.6f}")
     print(f"enhanced_delta_std={float(enhanced_delta.std()):.6f}")
     print(f"enhanced_gate_mean={float(enhanced_gate.mean()):.6f}")
@@ -866,6 +895,230 @@ def _safe_pearson(x: torch.Tensor, y: torch.Tensor) -> float:
     if float(denom) == 0.0:
         return 0.0
     return float((x * y).sum() / denom)
+
+
+def _first_path_power_bin_targets(raw_first_path_power: torch.Tensor) -> torch.Tensor:
+    targets = torch.full_like(raw_first_path_power, fill_value=-1, dtype=torch.long)
+    for class_idx, (_, lower, upper) in enumerate(FIRST_PATH_POWER_BINS):
+        mask = (raw_first_path_power >= lower) & (raw_first_path_power < upper)
+        targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
+    return targets
+
+
+def _first_path_power_bin_position_targets(
+    raw_first_path_power: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    targets = torch.zeros_like(raw_first_path_power)
+    valid_mask = torch.zeros_like(raw_first_path_power, dtype=torch.bool)
+    clipped_raw = raw_first_path_power.clamp(
+        min=FIRST_PATH_POWER_POSITION_BINS[0][1],
+        max=FIRST_PATH_POWER_POSITION_BINS[-1][2],
+    )
+    for _, lower, upper in FIRST_PATH_POWER_POSITION_BINS:
+        mask = torch.isfinite(raw_first_path_power) & (clipped_raw >= lower) & (clipped_raw <= upper)
+        position = (clipped_raw - lower) / max(upper - lower, 1e-6)
+        targets = torch.where(mask, position.clamp(0.0, 1.0), targets)
+        valid_mask = valid_mask | mask
+    return targets, valid_mask
+
+
+def _first_path_power_from_bin_position(
+    bin_indices: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    lowers = torch.tensor(
+        [lower for _, lower, _ in FIRST_PATH_POWER_POSITION_BINS],
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+    uppers = torch.tensor(
+        [upper for _, _, upper in FIRST_PATH_POWER_POSITION_BINS],
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+    bin_indices = bin_indices.clamp(min=0, max=len(FIRST_PATH_POWER_POSITION_BINS) - 1)
+    lower = lowers[bin_indices]
+    upper = uppers[bin_indices]
+    return lower + positions.clamp(0.0, 1.0) * (upper - lower)
+
+
+def _first_path_power_bin_class_weights(
+    value,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        weights = {
+            str(label): float(weight)
+            for label, weight in value.items()
+        }
+    else:
+        entries = [value] if isinstance(value, str) else value
+        weights = {}
+        for entry in entries or []:
+            if "=" not in str(entry):
+                continue
+            label, raw_weight = str(entry).split("=", 1)
+            weights[label.strip()] = float(raw_weight)
+    if not weights:
+        return None
+    return torch.tensor(
+        [
+            float(weights.get(label, 1.0))
+            for label in FIRST_POWER_DBW_BIN_LABELS
+        ],
+        dtype=dtype,
+    )
+
+
+def _print_first_path_power_bin_classifier_metrics(
+    logits: torch.Tensor,
+    raw_targets: torch.Tensor,
+    class_weights_value=None,
+) -> None:
+    labels = _first_path_power_bin_targets(raw_targets)
+    valid_mask = labels >= 0
+    if not bool(valid_mask.any()):
+        print("first_path_power_bin_classifier_loss=nan")
+        print("first_path_power_bin_classifier_top1=nan")
+        print("first_path_power_bin_classifier_macro_top1=nan")
+        return
+    logits = logits[valid_mask]
+    labels = labels[valid_mask]
+    per_sample_loss = F.cross_entropy(logits, labels, reduction="none")
+    class_weights = _first_path_power_bin_class_weights(
+        class_weights_value,
+        per_sample_loss.dtype,
+    )
+    if class_weights is None:
+        sample_weights = torch.ones_like(per_sample_loss)
+    else:
+        sample_weights = class_weights[labels]
+    loss_sum = (per_sample_loss * sample_weights).sum()
+    loss_denominator = sample_weights.sum().clamp(min=1.0)
+    mean_loss = loss_sum / loss_denominator
+    unweighted_mean_loss = per_sample_loss.mean()
+    predictions = logits.argmax(dim=1)
+    num_classes = len(FIRST_PATH_POWER_BINS)
+    confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
+    for true_label, pred_label in zip(labels.tolist(), predictions.tolist()):
+        confusion[int(true_label), int(pred_label)] += 1
+    class_sizes = confusion.sum(dim=1)
+    class_correct = confusion.diag()
+    nonempty = class_sizes > 0
+    class_accuracy = torch.zeros(num_classes, dtype=torch.float32)
+    class_accuracy[nonempty] = class_correct[nonempty].float() / class_sizes[nonempty].float()
+    top1 = (predictions == labels).float().mean()
+    macro_acc = class_accuracy[nonempty].mean() if bool(nonempty.any()) else torch.zeros(())
+    true_logits = logits.gather(1, labels[:, None]).squeeze(1)
+    best_other_logits = logits.masked_fill(
+        F.one_hot(labels, num_classes=num_classes).bool(),
+        float("-inf"),
+    ).max(dim=1).values
+    margins = true_logits - best_other_logits
+    print(f"first_path_power_bin_classifier_loss={float(mean_loss):.4f}")
+    print(
+        "first_path_power_bin_classifier_loss_unweighted_mean="
+        f"{float(unweighted_mean_loss):.4f}"
+    )
+    print(f"first_path_power_bin_classifier_loss_sum={float(loss_sum):.4f}")
+    print(
+        "first_path_power_bin_classifier_loss_denominator="
+        f"{float(loss_denominator):.4f}"
+    )
+    print(f"first_path_power_bin_classifier_valid_count={int(labels.numel())}")
+    print(f"first_path_power_bin_classifier_top1={float(top1):.4f}")
+    print(f"first_path_power_bin_classifier_macro_top1={float(macro_acc):.4f}")
+    print(
+        "first_path_power_bin_classifier_logit_range="
+        f"{float(logits.min()):.4f},{float(logits.max()):.4f}"
+    )
+    print(
+        "first_path_power_bin_classifier_margin_mean="
+        f"{float(margins.mean()):.4f}"
+    )
+    print(
+        "first_path_power_bin_classifier_loss_p50_p95_max="
+        f"{float(per_sample_loss.quantile(0.50)):.4f},"
+        f"{float(per_sample_loss.quantile(0.95)):.4f},"
+        f"{float(per_sample_loss.max()):.4f}"
+    )
+    print(
+        "first_path_power_bin_classifier_pred_distribution="
+        + ",".join(
+            f"{label}:{int((predictions == class_idx).sum().item())}"
+            for class_idx, (label, _, _) in enumerate(FIRST_PATH_POWER_BINS)
+        )
+    )
+    print(
+        "first_path_power_bin_classifier_target_distribution="
+        + ",".join(
+            f"{label}:{int(class_sizes[class_idx])}"
+            for class_idx, (label, _, _) in enumerate(FIRST_PATH_POWER_BINS)
+        )
+    )
+    for class_idx, (label, _, _) in enumerate(FIRST_PATH_POWER_BINS):
+        print(
+            f"first_path_power_bin_classifier_{label}="
+            f"size:{int(class_sizes[class_idx])} "
+            f"acc:{float(class_accuracy[class_idx]):.4f}"
+        )
+
+
+def _print_first_path_power_bin_position_metrics(
+    positions: torch.Tensor,
+    logits: torch.Tensor,
+    raw_targets: torch.Tensor,
+) -> None:
+    targets, valid_mask = _first_path_power_bin_position_targets(raw_targets)
+    if not bool(valid_mask.any()):
+        print("first_path_power_bin_position_loss=nan")
+        print("first_path_power_bin_position_mae=nan")
+        return
+    positions = positions[valid_mask].clamp(0.0, 1.0)
+    targets = targets[valid_mask]
+    raw_targets = raw_targets[valid_mask]
+    true_bins = _first_path_power_bin_targets(raw_targets)
+    pred_bins = logits[valid_mask].argmax(dim=1)
+    loss = F.smooth_l1_loss(positions, targets)
+    mae = (positions - targets).abs().mean()
+    pred_dbw = _first_path_power_from_bin_position(pred_bins, positions)
+    oracle_bin_dbw = _first_path_power_from_bin_position(true_bins, positions)
+    print(f"first_path_power_bin_position_loss={float(loss):.4f}")
+    print(f"first_path_power_bin_position_mae={float(mae):.4f}")
+    print(f"first_path_power_bin_position_valid_count={int(valid_mask.sum().item())}")
+    print(
+        "first_path_power_bin_position_pred_range="
+        f"{float(positions.min()):.4f},{float(positions.max()):.4f}"
+    )
+    print(
+        "first_path_power_bin_position_target_range="
+        f"{float(targets.min()):.4f},{float(targets.max()):.4f}"
+    )
+    print(
+        "first_path_power_bin_position_predbin_dbw_MAE="
+        f"{float((pred_dbw - raw_targets).abs().mean()):.4f}"
+    )
+    print(
+        "first_path_power_bin_position_oraclebin_dbw_MAE="
+        f"{float((oracle_bin_dbw - raw_targets).abs().mean()):.4f}"
+    )
+    for class_idx, (label, _, _) in enumerate(FIRST_PATH_POWER_POSITION_BINS):
+        bin_mask = true_bins == class_idx
+        count = int(bin_mask.sum().item())
+        print(f"{label}_position_count={count}")
+        if count == 0:
+            print(f"{label}_position_mae=nan")
+            print(f"{label}_position_oraclebin_dbw_MAE=nan")
+            continue
+        bin_position_errors = (positions[bin_mask] - targets[bin_mask]).abs()
+        bin_oracle_dbw_errors = (oracle_bin_dbw[bin_mask] - raw_targets[bin_mask]).abs()
+        print(f"{label}_position_mae={float(bin_position_errors.mean()):.4f}")
+        print(
+            f"{label}_position_oraclebin_dbw_MAE="
+            f"{float(bin_oracle_dbw_errors.mean()):.4f}"
+        )
 
 
 def _binary_threshold_metrics(
@@ -1364,18 +1617,12 @@ def _print_binned_scalar_error_distribution(
     predictions: torch.Tensor,
     targets: torch.Tensor,
 ) -> None:
-    bins = (
-        ("very_weak", -220.0, -180.0),
-        ("weak", -180.0, -140.0),
-        ("moderate", -140.0, -100.0),
-        ("strong", -100.0, -60.0),
-    )
     quantiles = torch.tensor(
         [0.50, 0.75, 0.95],
         dtype=targets.dtype,
         device=targets.device,
     )
-    for label, lower, upper in bins:
+    for label, lower, upper in FIRST_PATH_POWER_BINS:
         mask = (targets >= lower) & (targets < upper)
         count = int(mask.sum().item())
         print(f"{prefix}_{label}_count={count}")

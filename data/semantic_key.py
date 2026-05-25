@@ -11,6 +11,20 @@ PATH_RICHNESS_LABELS = (
     "high",
 )
 
+FIRST_POWER_DBW_BINS = (
+    ("very_weak", float("-inf"), -180),
+    ("weak", -180, -140),
+    ("moderate", -140, -100),
+    ("strong", -100, float("inf")),
+)
+FIRST_POWER_DBW_BIN_LABELS = tuple(label for label, _, _ in FIRST_POWER_DBW_BINS)
+FIRST_POWER_DBW_POSITION_BINS = (
+    ("very_weak", -220.0, -180.0),
+    ("weak", -180.0, -140.0),
+    ("moderate", -140.0, -100.0),
+    ("strong", -100.0, -60.0),
+)
+
 PROP_DISC = {
     "n_paths": {
         "zero": (0, 1),
@@ -35,9 +49,10 @@ PROP_DISC = {
     },
     "first_power_dbw": {
         "unknown": (float("nan"), float("nan")),
-        "weak": (float("-inf"), -105),
-        "moderate": (-105, -85),
-        "strong": (-85, float("inf")),
+        **{
+            label: (lower, upper)
+            for label, lower, upper in FIRST_POWER_DBW_BINS
+        },
     },
     "azimuth_spread_deg": {
         "narrow": (0, 10),
@@ -138,7 +153,9 @@ def semantic_key_attribute_raw_value(key: SemanticKey, field: str) -> str:
     if field == "k_factor_binary":
         return normalize_k_factor_bin(key.k_factor_bin)
     if field == "first_power_binary":
-        return key.first_power_bin if key.first_power_bin in {"weak", "strong"} else "moderate"
+        if key.first_power_bin in {"very_weak", "weak"}:
+            return "weak"
+        return key.first_power_bin if key.first_power_bin == "strong" else "moderate"
     return str(getattr(key, field))
 
 

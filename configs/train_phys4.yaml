@@ -8,7 +8,7 @@ train:
   epochs: 100
   temperature: 0.07
   token_norm_mode: std
-  use_power_branch: false
+  use_power_branch: true
   warmup_epochs: 5
   min_lr: 1.0e-5
 
@@ -31,6 +31,8 @@ train:
   semantic_key_mode: coarse_k
 
   aux_regression_weight: 0.005
+  first_path_power_bin_classifier_weight: 0.05
+  first_path_power_bin_position_weight: 0.1
   direct_power_weight: 0.2
   aux_regression_targets:
     - first_path_power_dbw

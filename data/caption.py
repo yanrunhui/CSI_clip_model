@@ -174,6 +174,7 @@ SLOT_VOCAB = {
     },
     "first_power": {
         "unknown": ["unknown"],
+        "very_weak": ["very weak"],
         "weak": ["weak"],
         "moderate": ["moderate"],
         "strong": ["strong"],

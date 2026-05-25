@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from data.semantic_key import FIRST_POWER_DBW_BIN_LABELS
+
 
 class PowerFeatureEncoder(nn.Module):
     def __init__(
@@ -214,6 +216,7 @@ class CSIClip(nn.Module):
         self.first_path_power_index = 5
         self.first_path_power_delta_limit = 0.5
         self.first_path_power_fusion_scale = 0.1
+        self.first_path_power_bin_labels = FIRST_POWER_DBW_BIN_LABELS
         self.physics_head = nn.Sequential(
             nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
             nn.Linear(embed_dim, hidden_dim),
@@ -232,6 +235,19 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.first_path_power_bin_classifier = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(self.first_path_power_bin_labels)),
+        )
+        self.first_path_power_bin_position_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self._init_first_path_power_bin_classifier()
         self.semantic_classifier = None
         if semantic_num_classes is not None:
             self.semantic_classifier = nn.Sequential(
@@ -254,6 +270,16 @@ class CSIClip(nn.Module):
         self.prototypes = None
         if num_prototypes is not None:
             self.prototypes = nn.Parameter(torch.randn(num_prototypes, embed_dim) * 0.02)
+
+    def _init_first_path_power_bin_classifier(self) -> None:
+        for module in (
+            *self.first_path_power_bin_classifier.modules(),
+            *self.first_path_power_bin_position_head.modules(),
+        ):
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=1e-3)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     @torch.no_grad()
     def initialize_prototypes(
@@ -347,6 +373,12 @@ class CSIClip(nn.Module):
         power_context: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         base = self.physics_head(csi_features)
+        first_path_power_bin_logits = self.first_path_power_bin_classifier(
+            csi_features
+        )
+        first_path_power_bin_position = torch.sigmoid(
+            self.first_path_power_bin_position_head(csi_features).squeeze(-1)
+        )
         if not self.use_power_branch or power_context is None:
             zeros = torch.zeros(
                 base.shape[0],
@@ -358,6 +390,8 @@ class CSIClip(nn.Module):
                 "enhanced_first_path_power": base[:, self.first_path_power_index],
                 "enhanced_gate": zeros,
                 "enhanced_delta": zeros,
+                "first_path_power_bin_logits": first_path_power_bin_logits,
+                "first_path_power_bin_position": first_path_power_bin_position,
                 "final": base,
             }
         enhanced_input = torch.cat(
@@ -387,6 +421,8 @@ class CSIClip(nn.Module):
             "enhanced_first_path_power": enhanced_first_path_power,
             "enhanced_gate": enhanced_gate,
             "enhanced_delta": enhanced_delta,
+            "first_path_power_bin_logits": first_path_power_bin_logits,
+            "first_path_power_bin_position": first_path_power_bin_position,
             "final": final,
         }
 

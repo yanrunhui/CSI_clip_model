@@ -5,7 +5,13 @@ import math
 
 import torch
 
-from data.semantic_key import AttributeRemap, semantic_key_attribute_value
+from data.semantic_key import (
+    FIRST_POWER_DBW_BIN_LABELS,
+    FIRST_POWER_DBW_BINS,
+    FIRST_POWER_DBW_POSITION_BINS,
+    AttributeRemap,
+    semantic_key_attribute_value,
+)
 
 from .losses import (
     PrototypeClipLoss,
@@ -35,6 +41,8 @@ class TrainConfig:
     aux_regression_weight: float = 0.0
     aux_regression_indices: tuple[int, ...] | None = None
     direct_power_weight: float = 0.0
+    first_path_power_bin_classifier_weight: float = 0.0
+    first_path_power_bin_position_weight: float = 0.0
     first_path_power_bin_weights: dict[str, float] | None = None
     freeze_csi: bool = False
     freeze_text_prototypes: bool = False
@@ -45,12 +53,9 @@ class TrainConfig:
 
 
 class Trainer:
-    FIRST_PATH_POWER_BINS = (
-        ("very_weak", -220.0, -180.0),
-        ("weak", -180.0, -140.0),
-        ("moderate", -140.0, -100.0),
-        ("strong", -100.0, -60.0),
-    )
+    FIRST_PATH_POWER_BINS = FIRST_POWER_DBW_BINS
+    FIRST_PATH_POWER_POSITION_BINS = FIRST_POWER_DBW_POSITION_BINS
+    FIRST_PATH_POWER_BIN_LABELS = FIRST_POWER_DBW_BIN_LABELS
 
     def __init__(
         self,
@@ -92,6 +97,34 @@ class Trainer:
         }
         self.attribute_remap = attribute_remap or {}
         self.loss = loss or PrototypeClipLoss()
+        model_bin_labels = tuple(
+            getattr(model, "first_path_power_bin_labels", self.FIRST_PATH_POWER_BIN_LABELS)
+        )
+        if model_bin_labels != self.FIRST_PATH_POWER_BIN_LABELS:
+            raise ValueError(
+                "first-path-power bin label order mismatch: "
+                f"model={model_bin_labels} trainer={self.FIRST_PATH_POWER_BIN_LABELS}."
+            )
+        bin_classifier_linear = self._last_linear(
+            getattr(model, "first_path_power_bin_classifier", None)
+        )
+        if (
+            bin_classifier_linear is not None
+            and bin_classifier_linear.out_features != len(self.FIRST_PATH_POWER_BIN_LABELS)
+        ):
+            raise ValueError(
+                "first-path-power bin classifier output size mismatch: "
+                f"out_features={bin_classifier_linear.out_features} "
+                f"labels={self.FIRST_PATH_POWER_BIN_LABELS}."
+            )
+        bin_position_linear = self._last_linear(
+            getattr(model, "first_path_power_bin_position_head", None)
+        )
+        if bin_position_linear is not None and bin_position_linear.out_features != 1:
+            raise ValueError(
+                "first-path-power bin-position head output size mismatch: "
+                f"out_features={bin_position_linear.out_features}, expected 1."
+            )
 
     def _attribute_targets(self, semantic_keys: list[object]) -> dict[str, torch.Tensor]:
         targets = {}
@@ -232,6 +265,54 @@ class Trainer:
             weights = torch.where(mask, torch.full_like(weights, bin_weight), weights)
         return weights
 
+    def _first_path_power_bin_targets(self, raw_first_path_power: torch.Tensor) -> torch.Tensor:
+        targets = torch.full_like(raw_first_path_power, fill_value=-1, dtype=torch.long)
+        for class_idx, (_, lower, upper) in enumerate(self.FIRST_PATH_POWER_BINS):
+            mask = (raw_first_path_power >= lower) & (raw_first_path_power < upper)
+            targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
+        return targets
+
+    def _first_path_power_bin_class_weight(
+        self,
+        dtype: torch.dtype,
+        cfg: TrainConfig,
+    ) -> torch.Tensor | None:
+        if not cfg.first_path_power_bin_weights:
+            return None
+        return torch.tensor(
+            [
+                float(cfg.first_path_power_bin_weights.get(label, 1.0))
+                for label, _, _ in self.FIRST_PATH_POWER_BINS
+            ],
+            device=self.device,
+            dtype=dtype,
+        )
+
+    def _first_path_power_bin_position_targets(
+        self,
+        raw_first_path_power: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        targets = torch.zeros_like(raw_first_path_power)
+        valid_mask = torch.zeros_like(raw_first_path_power, dtype=torch.bool)
+        for _, lower, upper in self.FIRST_PATH_POWER_POSITION_BINS:
+            mask = (raw_first_path_power >= lower) & (raw_first_path_power < upper)
+            if upper == self.FIRST_PATH_POWER_POSITION_BINS[-1][2]:
+                mask = (raw_first_path_power >= lower) & (raw_first_path_power <= upper)
+            position = (raw_first_path_power - lower) / max(upper - lower, 1e-6)
+            targets = torch.where(mask, position.clamp(0.0, 1.0), targets)
+            valid_mask = valid_mask | mask
+        finite_mask = torch.isfinite(raw_first_path_power)
+        clipped_raw = raw_first_path_power.clamp(
+            min=self.FIRST_PATH_POWER_POSITION_BINS[0][1],
+            max=self.FIRST_PATH_POWER_POSITION_BINS[-1][2],
+        )
+        for _, lower, upper in self.FIRST_PATH_POWER_POSITION_BINS:
+            mask = finite_mask & ~valid_mask & (clipped_raw >= lower) & (clipped_raw <= upper)
+            position = (clipped_raw - lower) / max(upper - lower, 1e-6)
+            targets = torch.where(mask, position.clamp(0.0, 1.0), targets)
+            valid_mask = valid_mask | mask
+        return targets, valid_mask
+
     @staticmethod
     def _multipositive_mask(
         labels: torch.Tensor,
@@ -287,6 +368,12 @@ class Trainer:
         effective_semantic_classifier_weight = 0.0 if warmup_active else cfg.semantic_classifier_weight
         effective_attribute_classifier_weight = 0.0 if warmup_active else cfg.attribute_classifier_weight
         effective_aux_regression_weight = 0.0 if warmup_active else cfg.aux_regression_weight
+        effective_first_path_power_bin_classifier_weight = (
+            0.0 if warmup_active else cfg.first_path_power_bin_classifier_weight
+        )
+        effective_first_path_power_bin_position_weight = (
+            0.0 if warmup_active else cfg.first_path_power_bin_position_weight
+        )
         self.optimizer.zero_grad(set_to_none=True)
         csi_features_raw = self.model.encode_csi(
             batch["tokens"],
@@ -318,7 +405,16 @@ class Trainer:
         semantic_prediction_histogram = None
         semantic_head_bias = None
         physics_outputs = None
-        if effective_aux_regression_weight > 0 or cfg.direct_power_weight > 0.0:
+        first_path_power_bin_target_histogram = None
+        first_path_power_bin_prediction_histogram = None
+        first_path_power_bin_loss_denominator = None
+        first_path_power_bin_position_mae = None
+        if (
+            effective_aux_regression_weight > 0
+            or effective_first_path_power_bin_classifier_weight > 0.0
+            or effective_first_path_power_bin_position_weight > 0.0
+            or cfg.direct_power_weight > 0.0
+        ):
             power_context = None
             if bool(getattr(self.model, "use_power_branch", False)):
                 power_context = self.model.encode_power_context(
@@ -462,7 +558,73 @@ class Trainer:
                 losses["loss_attribute_classifier"] = torch.stack(attribute_losses).mean()
                 losses["accuracy_attribute_classifier"] = torch.stack(attribute_accuracies).mean()
                 losses["logit_std_attribute_classifier"] = torch.stack(attribute_logit_stds).mean()
-        if physics_predictions is not None:
+        if (
+            physics_outputs is not None
+            and effective_first_path_power_bin_classifier_weight > 0.0
+        ):
+            first_path_power_bin_logits = physics_outputs["first_path_power_bin_logits"]
+            first_path_power_bin_targets = self._first_path_power_bin_targets(
+                batch["physics_raw_targets"][:, 5]
+            )
+            first_path_power_bin_mask = first_path_power_bin_targets >= 0
+            if bool(first_path_power_bin_mask.any()):
+                valid_logits = first_path_power_bin_logits[first_path_power_bin_mask]
+                valid_targets = first_path_power_bin_targets[first_path_power_bin_mask]
+                per_sample_classifier_loss = torch.nn.functional.cross_entropy(
+                    valid_logits,
+                    valid_targets,
+                    reduction="none",
+                )
+                class_weight = self._first_path_power_bin_class_weight(valid_logits.dtype, cfg)
+                if class_weight is None:
+                    losses["loss_first_path_power_bin_classifier"] = (
+                        per_sample_classifier_loss.mean()
+                    )
+                    first_path_power_bin_loss_denominator = torch.tensor(
+                        valid_targets.numel(),
+                        device=self.device,
+                        dtype=valid_logits.dtype,
+                    )
+                else:
+                    sample_weight = class_weight[valid_targets]
+                    first_path_power_bin_loss_denominator = sample_weight.sum()
+                    losses["loss_first_path_power_bin_classifier"] = (
+                        (per_sample_classifier_loss * sample_weight).sum()
+                        / first_path_power_bin_loss_denominator.clamp(min=1.0)
+                    )
+                first_path_power_bin_predictions = valid_logits.argmax(dim=1)
+                losses["accuracy_first_path_power_bin_classifier"] = (
+                    (first_path_power_bin_predictions == valid_targets).float().mean()
+                )
+                first_path_power_bin_target_histogram = self._histogram(
+                    valid_targets,
+                    len(self.FIRST_PATH_POWER_BIN_LABELS),
+                )
+                first_path_power_bin_prediction_histogram = self._histogram(
+                    first_path_power_bin_predictions,
+                    len(self.FIRST_PATH_POWER_BIN_LABELS),
+                )
+        if (
+            physics_outputs is not None
+            and effective_first_path_power_bin_position_weight > 0.0
+        ):
+            position_predictions = physics_outputs["first_path_power_bin_position"]
+            position_targets, position_mask = self._first_path_power_bin_position_targets(
+                batch["physics_raw_targets"][:, 5]
+            )
+            if bool(position_mask.any()):
+                valid_position_predictions = position_predictions[position_mask]
+                valid_position_targets = position_targets[position_mask]
+                position_errors = torch.nn.functional.smooth_l1_loss(
+                    valid_position_predictions,
+                    valid_position_targets,
+                    reduction="none",
+                )
+                losses["loss_first_path_power_bin_position"] = position_errors.mean()
+                first_path_power_bin_position_mae = (
+                    valid_position_predictions - valid_position_targets
+                ).abs().mean()
+        if physics_predictions is not None and effective_aux_regression_weight > 0:
             regression_predictions = physics_predictions
             regression_targets = batch["physics_targets"]
             regression_mask = batch["physics_target_mask"]
@@ -497,33 +659,33 @@ class Trainer:
                 (regression_errors * weighted_regression_mask).sum()
                 / weighted_regression_mask.sum().clamp(min=1).to(dtype=regression_errors.dtype)
             )
-            if (
-                physics_outputs is not None
-                and bool(getattr(self.model, "use_power_branch", False))
-                and cfg.direct_power_weight > 0.0
-            ):
-                first_path_power_idx = 5
-                enhanced_first_path_power = physics_outputs["enhanced_first_path_power"]
-                direct_power_target = batch["physics_targets"][:, first_path_power_idx]
-                direct_power_mask = batch["physics_target_mask"][:, first_path_power_idx]
-                direct_power_errors = torch.nn.functional.smooth_l1_loss(
-                    enhanced_first_path_power,
-                    direct_power_target,
-                    reduction="none",
-                )
-                direct_power_weights = self._first_path_power_sample_weights(
-                    batch["physics_raw_targets"][:, first_path_power_idx],
-                    cfg,
-                )
-                weighted_direct_power_mask = (
-                    direct_power_mask.to(dtype=direct_power_errors.dtype)
-                    * direct_power_weights.to(dtype=direct_power_errors.dtype)
-                )
-                direct_power_errors = direct_power_errors * weighted_direct_power_mask
-                losses["loss_direct_power"] = (
-                    direct_power_errors.sum()
-                    / weighted_direct_power_mask.sum().clamp(min=1).to(dtype=direct_power_errors.dtype)
-                )
+        if (
+            physics_outputs is not None
+            and bool(getattr(self.model, "use_power_branch", False))
+            and cfg.direct_power_weight > 0.0
+        ):
+            first_path_power_idx = 5
+            enhanced_first_path_power = physics_outputs["enhanced_first_path_power"]
+            direct_power_target = batch["physics_targets"][:, first_path_power_idx]
+            direct_power_mask = batch["physics_target_mask"][:, first_path_power_idx]
+            direct_power_errors = torch.nn.functional.smooth_l1_loss(
+                enhanced_first_path_power,
+                direct_power_target,
+                reduction="none",
+            )
+            direct_power_weights = self._first_path_power_sample_weights(
+                batch["physics_raw_targets"][:, first_path_power_idx],
+                cfg,
+            )
+            weighted_direct_power_mask = (
+                direct_power_mask.to(dtype=direct_power_errors.dtype)
+                * direct_power_weights.to(dtype=direct_power_errors.dtype)
+            )
+            direct_power_errors = direct_power_errors * weighted_direct_power_mask
+            losses["loss_direct_power"] = (
+                direct_power_errors.sum()
+                / weighted_direct_power_mask.sum().clamp(min=1).to(dtype=direct_power_errors.dtype)
+            )
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
             effective_prototype_weight * losses["loss_csi_to_prototype"] +
@@ -531,6 +693,8 @@ class Trainer:
             effective_semantic_classifier_weight * losses.get("loss_semantic_classifier", torch.zeros((), device=self.device)) +
             effective_attribute_classifier_weight * losses.get("loss_attribute_classifier", torch.zeros((), device=self.device)) +
             effective_aux_regression_weight * losses.get("loss_aux_regression", torch.zeros((), device=self.device)) +
+            effective_first_path_power_bin_classifier_weight * losses.get("loss_first_path_power_bin_classifier", torch.zeros((), device=self.device)) +
+            effective_first_path_power_bin_position_weight * losses.get("loss_first_path_power_bin_position", torch.zeros((), device=self.device)) +
             cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device))
         )
         total_loss.backward()
@@ -575,6 +739,29 @@ class Trainer:
             cfg.attribute_classifier_logit_adjustment
         )
         metrics["aux_regression_weight"] = float(effective_aux_regression_weight)
+        metrics["first_path_power_bin_classifier_weight"] = float(
+            effective_first_path_power_bin_classifier_weight
+        )
+        metrics["first_path_power_bin_position_weight"] = float(
+            effective_first_path_power_bin_position_weight
+        )
+        metrics["first_path_power_bin_label_order"] = ",".join(self.FIRST_PATH_POWER_BIN_LABELS)
+        if first_path_power_bin_target_histogram is not None:
+            metrics["first_path_power_bin_target_histogram"] = self._format_histogram(
+                first_path_power_bin_target_histogram
+            )
+        if first_path_power_bin_prediction_histogram is not None:
+            metrics["first_path_power_bin_prediction_histogram"] = self._format_histogram(
+                first_path_power_bin_prediction_histogram
+            )
+        if first_path_power_bin_loss_denominator is not None:
+            metrics["first_path_power_bin_loss_denominator"] = float(
+                first_path_power_bin_loss_denominator.detach()
+            )
+        if first_path_power_bin_position_mae is not None:
+            metrics["first_path_power_bin_position_mae"] = float(
+                first_path_power_bin_position_mae.detach()
+            )
         metrics["direct_power_weight"] = float(cfg.direct_power_weight)
         if physics_predictions is not None:
             metrics["first_path_power_sample_weight_mean"] = float(

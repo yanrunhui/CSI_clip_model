@@ -28,6 +28,8 @@ from data.dataset import (
     semantic_key_mode_choices,
 )
 from data.semantic_key import (
+    FIRST_POWER_DBW_BIN_LABELS,
+    FIRST_POWER_DBW_BINS,
     SemanticKey,
     default_attribute_fields,
     implied_attribute_value_filters,
@@ -58,10 +60,8 @@ def cfg_get(config: dict, key: str, fallback):
 
 
 DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS = {
-    "very_weak": 2.0,
-    "weak": 1.5,
-    "moderate": 1.0,
-    "strong": 1.0,
+    label: 1.0
+    for label, _, _ in FIRST_POWER_DBW_BINS
 }
 
 
@@ -98,6 +98,31 @@ def format_first_path_power_bin_weights(weights: dict[str, float]) -> str:
         f"{label}={float(weights[label]):.3f}"
         for label in DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS
     )
+
+
+def parse_histogram_text(value: str, num_bins: int) -> list[int]:
+    if not value:
+        return [0] * num_bins
+    parts = [part for part in str(value).split(",") if part != ""]
+    if len(parts) != num_bins:
+        return [0] * num_bins
+    return [int(part) for part in parts]
+
+
+def sum_histogram_metric(
+    metrics: list[dict[str, float]],
+    key: str,
+    num_bins: int,
+) -> list[int]:
+    total = [0] * num_bins
+    for item in metrics:
+        values = parse_histogram_text(str(item.get(key, "")), num_bins)
+        total = [left + right for left, right in zip(total, values)]
+    return total
+
+
+def format_histogram_counts(labels: tuple[str, ...], counts: list[int]) -> str:
+    return ",".join(f"{label}:{count}" for label, count in zip(labels, counts))
 
 
 def parse_aux_regression_targets(value) -> tuple[str, ...]:
@@ -758,6 +783,8 @@ def run_smoke_test(
     aux_regression_weight: float = 0.0,
     aux_regression_targets: tuple[str, ...] = ("all",),
     direct_power_weight: float = 0.0,
+    first_path_power_bin_classifier_weight: float = 0.0,
+    first_path_power_bin_position_weight: float = 0.0,
     first_path_power_bin_weights: dict[str, float] | None = None,
     multipositive_distance_threshold: float = 0.25,
     multipositive_positive_mode: str = "semantic_and_physics",
@@ -812,6 +839,8 @@ def run_smoke_test(
                     attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
                     aux_regression_weight=aux_regression_weight,
                     aux_regression_indices=aux_regression_indices(aux_regression_targets),
+                    first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
+                    first_path_power_bin_position_weight=first_path_power_bin_position_weight,
                     direct_power_weight=direct_power_weight,
                     first_path_power_bin_weights=first_path_power_bin_weights,
                     prototype_warmup_epochs=1,
@@ -856,6 +885,8 @@ def run_real_pretrain(
     attribute_classifier_logit_adjustment: float,
     aux_regression_weight: float,
     aux_regression_targets: tuple[str, ...],
+    first_path_power_bin_classifier_weight: float,
+    first_path_power_bin_position_weight: float,
     direct_power_weight: float,
     first_path_power_bin_weights: dict[str, float],
     multipositive_distance_threshold: float,
@@ -945,6 +976,8 @@ def run_real_pretrain(
         attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
         aux_regression_weight=aux_regression_weight,
         aux_regression_indices=aux_regression_indices(aux_regression_targets),
+        first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
+        first_path_power_bin_position_weight=first_path_power_bin_position_weight,
         direct_power_weight=direct_power_weight,
         first_path_power_bin_weights=first_path_power_bin_weights,
         freeze_csi=freeze_csi,
@@ -989,6 +1022,9 @@ def run_real_pretrain(
         f"attribute_remap={format_attribute_remap(attribute_remap)} "
         f"aux_regression_weight={aux_regression_weight} "
         f"aux_regression_targets={','.join(aux_regression_targets)} "
+        f"first_path_power_bin_classifier_weight={first_path_power_bin_classifier_weight} "
+        f"first_path_power_bin_position_weight={first_path_power_bin_position_weight} "
+        f"first_path_power_bin_label_order={','.join(FIRST_POWER_DBW_BIN_LABELS)} "
         f"direct_power_weight={direct_power_weight} "
         f"first_path_power_bin_weights={format_first_path_power_bin_weights(first_path_power_bin_weights)} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
@@ -1062,6 +1098,39 @@ def run_real_pretrain(
             m.get("batch_label_unique_classes", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_first_path_power_bin_classifier = sum(
+            m.get("loss_first_path_power_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_bin_accuracy = sum(
+            m.get("accuracy_first_path_power_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_bin_position = sum(
+            m.get("loss_first_path_power_bin_position", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_bin_position_mae = sum(
+            m.get("first_path_power_bin_position_mae", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_bin_loss_denominator = sum(
+            m.get("first_path_power_bin_loss_denominator", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        first_path_power_bin_target_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "first_path_power_bin_target_histogram",
+            len(FIRST_POWER_DBW_BIN_LABELS),
+        )
+        first_path_power_bin_prediction_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "first_path_power_bin_prediction_histogram",
+            len(FIRST_POWER_DBW_BIN_LABELS),
+        )
+        first_path_power_bin_target_distribution = format_histogram_counts(
+            FIRST_POWER_DBW_BIN_LABELS,
+            first_path_power_bin_target_histogram,
+        )
+        first_path_power_bin_prediction_distribution = format_histogram_counts(
+            FIRST_POWER_DBW_BIN_LABELS,
+            first_path_power_bin_prediction_histogram,
+        )
         mean_direct_power = sum(m.get("loss_direct_power", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_first_path_power_sample_weight = sum(
             m.get("first_path_power_sample_weight_mean", 1.0) for m in epoch_metrics
@@ -1102,6 +1171,13 @@ def run_real_pretrain(
             f"proto_warmup_active={mean_prototype_warmup_active:.2f} "
             f"{attribute_debug} "
             f"aux_reg={mean_aux_regression:.4f} "
+            f"fp_bin_cls={mean_first_path_power_bin_classifier:.4f} "
+            f"fp_bin_acc={mean_first_path_power_bin_accuracy:.4f} "
+            f"fp_bin_pos={mean_first_path_power_bin_position:.4f} "
+            f"fp_bin_pos_mae={mean_first_path_power_bin_position_mae:.4f} "
+            f"fp_bin_loss_den={mean_first_path_power_bin_loss_denominator:.1f} "
+            f"fp_bin_target={first_path_power_bin_target_distribution} "
+            f"fp_bin_pred={first_path_power_bin_prediction_distribution} "
             f"direct_power={mean_direct_power:.4f} "
             f"fp_power_w={mean_first_path_power_sample_weight:.3f} "
             f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
@@ -1143,6 +1219,14 @@ def run_real_pretrain(
                         "grad_norm_semantic_classifier": mean_grad_semantic_classifier,
                         "grad_norm_attribute_classifiers": mean_grad_attribute_classifiers,
                         "loss_aux_regression": mean_aux_regression,
+                        "loss_first_path_power_bin_classifier": mean_first_path_power_bin_classifier,
+                        "accuracy_first_path_power_bin_classifier": mean_first_path_power_bin_accuracy,
+                        "loss_first_path_power_bin_position": mean_first_path_power_bin_position,
+                        "first_path_power_bin_position_mae": mean_first_path_power_bin_position_mae,
+                        "first_path_power_bin_loss_denominator": mean_first_path_power_bin_loss_denominator,
+                        "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
+                        "first_path_power_bin_target_histogram": first_path_power_bin_target_histogram,
+                        "first_path_power_bin_prediction_histogram": first_path_power_bin_prediction_histogram,
                         "loss_direct_power": mean_direct_power,
                         "first_path_power_sample_weight_mean": mean_first_path_power_sample_weight,
                         "logit_scale": mean_logit_scale,
@@ -1167,6 +1251,9 @@ def run_real_pretrain(
                         "use_power_branch": use_power_branch,
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
+                        "first_path_power_bin_classifier_weight": first_path_power_bin_classifier_weight,
+                        "first_path_power_bin_position_weight": first_path_power_bin_position_weight,
+                        "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
                         "direct_power_weight": direct_power_weight,
                         "first_path_power_bin_weights": first_path_power_bin_weights,
                         "multipositive_distance_threshold": multipositive_distance_threshold,
@@ -1232,6 +1319,9 @@ def run_real_pretrain(
                     "token_norm_mode": token_norm_mode,
                     "aux_regression_weight": aux_regression_weight,
                     "aux_regression_targets": list(aux_regression_targets),
+                    "first_path_power_bin_classifier_weight": first_path_power_bin_classifier_weight,
+                    "first_path_power_bin_position_weight": first_path_power_bin_position_weight,
+                    "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
                     "direct_power_weight": direct_power_weight,
                     "first_path_power_bin_weights": first_path_power_bin_weights,
                     "multipositive_distance_threshold": multipositive_distance_threshold,
@@ -1328,6 +1418,16 @@ def main() -> None:
         ),
     )
     parser.add_argument("--aux-regression-weight", type=float)
+    parser.add_argument(
+        "--first-path-power-bin-classifier-weight",
+        type=float,
+        help="Auxiliary classification weight for first-path-power bin prediction.",
+    )
+    parser.add_argument(
+        "--first-path-power-bin-position-weight",
+        type=float,
+        help="Auxiliary regression weight for first-path-power position within its dBW bin.",
+    )
     parser.add_argument(
         "--aux-regression-targets",
         nargs="+",
@@ -1501,6 +1601,16 @@ def main() -> None:
         if args.aux_regression_weight is not None
         else float(cfg_get(train_cfg, "aux_regression_weight", 0.0))
     )
+    first_path_power_bin_classifier_weight = (
+        args.first_path_power_bin_classifier_weight
+        if args.first_path_power_bin_classifier_weight is not None
+        else float(cfg_get(train_cfg, "first_path_power_bin_classifier_weight", 0.0))
+    )
+    first_path_power_bin_position_weight = (
+        args.first_path_power_bin_position_weight
+        if args.first_path_power_bin_position_weight is not None
+        else float(cfg_get(train_cfg, "first_path_power_bin_position_weight", 0.0))
+    )
     direct_power_weight = (
         args.direct_power_weight
         if args.direct_power_weight is not None
@@ -1511,6 +1621,15 @@ def main() -> None:
         if args.first_path_power_bin_weight is not None
         else cfg_get(train_cfg, "first_path_power_bin_weights", None)
     )
+    if (
+        (
+            first_path_power_bin_classifier_weight > 0.0
+            or first_path_power_bin_position_weight > 0.0
+            or direct_power_weight > 0.0
+        )
+        and not use_power_branch
+    ):
+        use_power_branch = True
     aux_regression_targets = parse_aux_regression_targets(
         args.aux_regression_targets
         if args.aux_regression_targets is not None
@@ -1584,6 +1703,8 @@ def main() -> None:
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
+            first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
+            first_path_power_bin_position_weight=first_path_power_bin_position_weight,
             direct_power_weight=direct_power_weight,
             first_path_power_bin_weights=first_path_power_bin_weights,
             multipositive_distance_threshold=multipositive_distance_threshold,
@@ -1625,6 +1746,8 @@ def main() -> None:
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
+            first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
+            first_path_power_bin_position_weight=first_path_power_bin_position_weight,
             direct_power_weight=direct_power_weight,
             first_path_power_bin_weights=first_path_power_bin_weights,
             multipositive_distance_threshold=multipositive_distance_threshold,
