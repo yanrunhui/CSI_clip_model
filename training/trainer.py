@@ -40,7 +40,12 @@ class TrainConfig:
     attribute_classifier_logit_adjustment: float = 0.0
     aux_regression_weight: float = 0.0
     aux_regression_indices: tuple[int, ...] | None = None
+    k_factor_loss_weights: dict[str, float] | None = None
+    strong_k_bin_classifier_weight: float = 0.0
+    strong_k_position_weight: float = 0.0
+    strong_k_bin_weights: dict[str, float] | None = None
     direct_power_weight: float = 0.0
+    delay_spread_weight: float = 0.0
     first_path_power_bin_classifier_weight: float = 0.0
     first_path_power_bin_position_weight: float = 0.0
     first_path_power_bin_weights: dict[str, float] | None = None
@@ -56,6 +61,19 @@ class Trainer:
     FIRST_PATH_POWER_BINS = FIRST_POWER_DBW_BINS
     FIRST_PATH_POWER_POSITION_BINS = FIRST_POWER_DBW_POSITION_BINS
     FIRST_PATH_POWER_BIN_LABELS = FIRST_POWER_DBW_BIN_LABELS
+    K_FACTOR_LOSS_BINS = (
+        ("strong_low", 3.0, 15.0),
+        ("strong_mid", 15.0, 30.0),
+        ("strong_high", 30.0, 45.0),
+        ("strong_very_high", 45.0, 70.0),
+    )
+    STRONG_K_BIN_LABELS = ("low", "mid", "high", "very_high")
+    STRONG_K_POSITION_BINS = (
+        ("low", 3.0, 15.0),
+        ("mid", 15.0, 30.0),
+        ("high", 30.0, 45.0),
+        ("very_high", 45.0, 70.0),
+    )
 
     def __init__(
         self,
@@ -124,6 +142,34 @@ class Trainer:
             raise ValueError(
                 "first-path-power bin-position head output size mismatch: "
                 f"out_features={bin_position_linear.out_features}, expected 1."
+            )
+        strong_k_labels = tuple(
+            getattr(model, "k_factor_strong_bin_labels", self.STRONG_K_BIN_LABELS)
+        )
+        if strong_k_labels != self.STRONG_K_BIN_LABELS:
+            raise ValueError(
+                "strong K-factor bin label order mismatch: "
+                f"model={strong_k_labels} trainer={self.STRONG_K_BIN_LABELS}."
+            )
+        strong_k_classifier_linear = self._last_linear(
+            getattr(model, "k_factor_strong_bin_classifier", None)
+        )
+        if (
+            strong_k_classifier_linear is not None
+            and strong_k_classifier_linear.out_features != len(self.STRONG_K_BIN_LABELS)
+        ):
+            raise ValueError(
+                "strong K-factor bin classifier output size mismatch: "
+                f"out_features={strong_k_classifier_linear.out_features} "
+                f"labels={self.STRONG_K_BIN_LABELS}."
+            )
+        strong_k_position_linear = self._last_linear(
+            getattr(model, "k_factor_strong_position_head", None)
+        )
+        if strong_k_position_linear is not None and strong_k_position_linear.out_features != 1:
+            raise ValueError(
+                "strong K-factor bin-position head output size mismatch: "
+                f"out_features={strong_k_position_linear.out_features}, expected 1."
             )
 
     def _attribute_targets(self, semantic_keys: list[object]) -> dict[str, torch.Tensor]:
@@ -265,6 +311,44 @@ class Trainer:
             weights = torch.where(mask, torch.full_like(weights, bin_weight), weights)
         return weights
 
+    def _k_factor_sample_weights(
+        self,
+        raw_k_factor: torch.Tensor,
+        semantic_keys: list[object],
+        cfg: TrainConfig,
+    ) -> torch.Tensor:
+        weights_cfg = cfg.k_factor_loss_weights or {}
+        weights = torch.ones_like(raw_k_factor)
+        if not weights_cfg:
+            return weights
+
+        weak_weight = float(weights_cfg.get("weak", 1.0))
+        if weak_weight != 1.0:
+            weak_mask = torch.tensor(
+                [getattr(key, "k_factor_bin", None) == "weak" for key in semantic_keys],
+                dtype=torch.bool,
+                device=raw_k_factor.device,
+            )
+            weights = torch.where(weak_mask, torch.full_like(weights, weak_weight), weights)
+
+        strong_mask = torch.tensor(
+            [getattr(key, "k_factor_bin", None) == "strong" for key in semantic_keys],
+            dtype=torch.bool,
+            device=raw_k_factor.device,
+        )
+        for bin_idx, (label, lower, upper) in enumerate(self.K_FACTOR_LOSS_BINS):
+            bin_weight = float(weights_cfg.get(label, 1.0))
+            if bin_weight == 1.0:
+                continue
+            upper_mask = (
+                raw_k_factor <= upper
+                if bin_idx == len(self.K_FACTOR_LOSS_BINS) - 1
+                else raw_k_factor < upper
+            )
+            mask = strong_mask & (raw_k_factor >= lower) & upper_mask
+            weights = torch.where(mask, torch.full_like(weights, bin_weight), weights)
+        return weights
+
     def _first_path_power_bin_targets(self, raw_first_path_power: torch.Tensor) -> torch.Tensor:
         targets = torch.full_like(raw_first_path_power, fill_value=-1, dtype=torch.long)
         for class_idx, (_, lower, upper) in enumerate(self.FIRST_PATH_POWER_BINS):
@@ -312,6 +396,67 @@ class Trainer:
             targets = torch.where(mask, position.clamp(0.0, 1.0), targets)
             valid_mask = valid_mask | mask
         return targets, valid_mask
+
+    def _strong_k_bin_targets(
+        self,
+        raw_k_factor: torch.Tensor,
+        semantic_keys: list[object],
+    ) -> torch.Tensor:
+        targets = torch.full_like(raw_k_factor, fill_value=-1, dtype=torch.long)
+        strong_mask = torch.tensor(
+            [getattr(key, "k_factor_bin", None) == "strong" for key in semantic_keys],
+            dtype=torch.bool,
+            device=raw_k_factor.device,
+        )
+        for class_idx, (_, lower, upper) in enumerate(self.STRONG_K_POSITION_BINS):
+            upper_mask = (
+                raw_k_factor <= upper
+                if class_idx == len(self.STRONG_K_POSITION_BINS) - 1
+                else raw_k_factor < upper
+            )
+            mask = strong_mask & (raw_k_factor >= lower) & upper_mask
+            targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
+        return targets
+
+    def _strong_k_position_targets(
+        self,
+        raw_k_factor: torch.Tensor,
+        semantic_keys: list[object],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        targets = torch.zeros_like(raw_k_factor)
+        valid_mask = torch.zeros_like(raw_k_factor, dtype=torch.bool)
+        strong_mask = torch.tensor(
+            [getattr(key, "k_factor_bin", None) == "strong" for key in semantic_keys],
+            dtype=torch.bool,
+            device=raw_k_factor.device,
+        )
+        for bin_idx, (_, lower, upper) in enumerate(self.STRONG_K_POSITION_BINS):
+            upper_mask = (
+                raw_k_factor <= upper
+                if bin_idx == len(self.STRONG_K_POSITION_BINS) - 1
+                else raw_k_factor < upper
+            )
+            mask = strong_mask & (raw_k_factor >= lower) & upper_mask
+            position = (raw_k_factor - lower) / max(upper - lower, 1e-6)
+            targets = torch.where(mask, position.clamp(0.0, 1.0), targets)
+            valid_mask = valid_mask | mask
+        return targets, valid_mask
+
+    def _strong_k_bin_class_weight(
+        self,
+        dtype: torch.dtype,
+        cfg: TrainConfig,
+    ) -> torch.Tensor | None:
+        if not cfg.strong_k_bin_weights:
+            return None
+        return torch.tensor(
+            [
+                float(cfg.strong_k_bin_weights.get(label, 1.0))
+                for label in self.STRONG_K_BIN_LABELS
+            ],
+            device=self.device,
+            dtype=dtype,
+        )
 
     @staticmethod
     def _multipositive_mask(
@@ -368,11 +513,20 @@ class Trainer:
         effective_semantic_classifier_weight = 0.0 if warmup_active else cfg.semantic_classifier_weight
         effective_attribute_classifier_weight = 0.0 if warmup_active else cfg.attribute_classifier_weight
         effective_aux_regression_weight = 0.0 if warmup_active else cfg.aux_regression_weight
+        effective_strong_k_bin_classifier_weight = (
+            0.0 if warmup_active else cfg.strong_k_bin_classifier_weight
+        )
+        effective_strong_k_position_weight = (
+            0.0 if warmup_active else cfg.strong_k_position_weight
+        )
         effective_first_path_power_bin_classifier_weight = (
             0.0 if warmup_active else cfg.first_path_power_bin_classifier_weight
         )
         effective_first_path_power_bin_position_weight = (
             0.0 if warmup_active else cfg.first_path_power_bin_position_weight
+        )
+        effective_delay_spread_weight = (
+            0.0 if warmup_active else cfg.delay_spread_weight
         )
         self.optimizer.zero_grad(set_to_none=True)
         csi_features_raw = self.model.encode_csi(
@@ -409,8 +563,14 @@ class Trainer:
         first_path_power_bin_prediction_histogram = None
         first_path_power_bin_loss_denominator = None
         first_path_power_bin_position_mae = None
+        strong_k_bin_target_histogram = None
+        strong_k_bin_prediction_histogram = None
+        strong_k_bin_loss_denominator = None
+        strong_k_position_mae = None
         if (
             effective_aux_regression_weight > 0
+            or effective_strong_k_bin_classifier_weight > 0.0
+            or effective_strong_k_position_weight > 0.0
             or effective_first_path_power_bin_classifier_weight > 0.0
             or effective_first_path_power_bin_position_weight > 0.0
             or cfg.direct_power_weight > 0.0
@@ -560,6 +720,67 @@ class Trainer:
                 losses["logit_std_attribute_classifier"] = torch.stack(attribute_logit_stds).mean()
         if (
             physics_outputs is not None
+            and effective_strong_k_bin_classifier_weight > 0.0
+        ):
+            strong_k_bin_logits = physics_outputs["k_factor_strong_bin_logits"]
+            strong_k_bin_targets = self._strong_k_bin_targets(
+                batch["physics_raw_targets"][:, 3],
+                batch["semantic_keys"],
+            )
+            strong_k_bin_mask = strong_k_bin_targets >= 0
+            if bool(strong_k_bin_mask.any()):
+                valid_logits = strong_k_bin_logits[strong_k_bin_mask]
+                valid_targets = strong_k_bin_targets[strong_k_bin_mask]
+                per_sample_classifier_loss = torch.nn.functional.cross_entropy(
+                    valid_logits,
+                    valid_targets,
+                    reduction="none",
+                )
+                class_weight = self._strong_k_bin_class_weight(valid_logits.dtype, cfg)
+                if class_weight is None:
+                    sample_weight = torch.ones_like(per_sample_classifier_loss)
+                else:
+                    sample_weight = class_weight[valid_targets]
+                strong_k_bin_loss_denominator = sample_weight.sum()
+                losses["loss_strong_k_bin_classifier"] = (
+                    (per_sample_classifier_loss * sample_weight).sum()
+                    / strong_k_bin_loss_denominator.clamp(min=1.0)
+                )
+                strong_k_bin_predictions = valid_logits.argmax(dim=1)
+                losses["accuracy_strong_k_bin_classifier"] = (
+                    (strong_k_bin_predictions == valid_targets).float().mean()
+                )
+                strong_k_bin_target_histogram = self._histogram(
+                    valid_targets,
+                    len(self.STRONG_K_BIN_LABELS),
+                )
+                strong_k_bin_prediction_histogram = self._histogram(
+                    strong_k_bin_predictions,
+                    len(self.STRONG_K_BIN_LABELS),
+                )
+        if (
+            physics_outputs is not None
+            and effective_strong_k_position_weight > 0.0
+        ):
+            strong_k_position_predictions = physics_outputs["k_factor_strong_position"]
+            strong_k_position_targets, strong_k_position_mask = self._strong_k_position_targets(
+                batch["physics_raw_targets"][:, 3],
+                batch["semantic_keys"],
+            )
+            if bool(strong_k_position_mask.any()):
+                valid_position_predictions = strong_k_position_predictions[strong_k_position_mask]
+                valid_position_targets = strong_k_position_targets[strong_k_position_mask]
+                position_errors = torch.nn.functional.smooth_l1_loss(
+                    valid_position_predictions,
+                    valid_position_targets,
+                    reduction="none",
+                )
+                losses["loss_strong_k_position"] = position_errors.mean()
+                strong_k_position_mae = (
+                    valid_position_predictions - valid_position_targets
+                ).abs().mean()
+        if (
+            physics_outputs is not None
             and effective_first_path_power_bin_classifier_weight > 0.0
         ):
             first_path_power_bin_logits = physics_outputs["first_path_power_bin_logits"]
@@ -635,6 +856,13 @@ class Trainer:
                 regression_targets = regression_targets.index_select(dim=1, index=indices)
                 regression_mask = regression_mask.index_select(dim=1, index=indices)
                 regression_weights = torch.ones_like(regression_targets)
+                if 3 in cfg.aux_regression_indices:
+                    k_factor_position = cfg.aux_regression_indices.index(3)
+                    regression_weights[:, k_factor_position] = self._k_factor_sample_weights(
+                        batch["physics_raw_targets"][:, 3],
+                        batch["semantic_keys"],
+                        cfg,
+                    )
                 if 5 in cfg.aux_regression_indices:
                     first_path_position = cfg.aux_regression_indices.index(5)
                     regression_weights[:, first_path_position] = self._first_path_power_sample_weights(
@@ -642,6 +870,11 @@ class Trainer:
                         cfg,
                     )
             else:
+                regression_weights[:, 3] = self._k_factor_sample_weights(
+                    batch["physics_raw_targets"][:, 3],
+                    batch["semantic_keys"],
+                    cfg,
+                )
                 regression_weights[:, 5] = self._first_path_power_sample_weights(
                     batch["physics_raw_targets"][:, 5],
                     cfg,
@@ -686,6 +919,25 @@ class Trainer:
                 direct_power_errors.sum()
                 / weighted_direct_power_mask.sum().clamp(min=1).to(dtype=direct_power_errors.dtype)
             )
+        if (
+            physics_outputs is not None
+            and bool(getattr(self.model, "use_power_branch", False))
+            and effective_delay_spread_weight > 0.0
+        ):
+            delay_spread_idx = 1
+            enhanced_delay_spread = physics_outputs["enhanced_delay_spread"]
+            delay_spread_target = batch["physics_targets"][:, delay_spread_idx]
+            delay_spread_mask = batch["physics_target_mask"][:, delay_spread_idx]
+            delay_spread_errors = torch.nn.functional.smooth_l1_loss(
+                enhanced_delay_spread,
+                delay_spread_target,
+                reduction="none",
+            )
+            weighted_delay_spread_mask = delay_spread_mask.to(dtype=delay_spread_errors.dtype)
+            losses["loss_delay_spread"] = (
+                (delay_spread_errors * weighted_delay_spread_mask).sum()
+                / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=delay_spread_errors.dtype)
+            )
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
             effective_prototype_weight * losses["loss_csi_to_prototype"] +
@@ -693,9 +945,12 @@ class Trainer:
             effective_semantic_classifier_weight * losses.get("loss_semantic_classifier", torch.zeros((), device=self.device)) +
             effective_attribute_classifier_weight * losses.get("loss_attribute_classifier", torch.zeros((), device=self.device)) +
             effective_aux_regression_weight * losses.get("loss_aux_regression", torch.zeros((), device=self.device)) +
+            effective_strong_k_bin_classifier_weight * losses.get("loss_strong_k_bin_classifier", torch.zeros((), device=self.device)) +
+            effective_strong_k_position_weight * losses.get("loss_strong_k_position", torch.zeros((), device=self.device)) +
             effective_first_path_power_bin_classifier_weight * losses.get("loss_first_path_power_bin_classifier", torch.zeros((), device=self.device)) +
             effective_first_path_power_bin_position_weight * losses.get("loss_first_path_power_bin_position", torch.zeros((), device=self.device)) +
-            cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device))
+            cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device)) +
+            effective_delay_spread_weight * losses.get("loss_delay_spread", torch.zeros((), device=self.device))
         )
         total_loss.backward()
         grad_metrics = {
@@ -725,6 +980,16 @@ class Trainer:
             metrics["enhanced_gate_std"] = float(
                 physics_outputs["enhanced_gate"].detach().float().std()
             )
+        if physics_outputs is not None and "enhanced_delay_spread_gate" in physics_outputs:
+            metrics["delay_spread_gate_mean"] = float(
+                physics_outputs["enhanced_delay_spread_gate"].detach().float().mean()
+            )
+            metrics["delay_spread_delta_mean"] = float(
+                physics_outputs["enhanced_delay_spread_delta"].detach().float().mean()
+            )
+            metrics["delay_spread_delta_std"] = float(
+                physics_outputs["enhanced_delay_spread_delta"].detach().float().std()
+            )
         metrics["csi_to_text_weight"] = float(effective_csi_to_text_weight)
         metrics["prototype_weight"] = float(effective_prototype_weight)
         metrics["text_prototype_weight"] = float(cfg.text_prototype_weight)
@@ -739,6 +1004,36 @@ class Trainer:
             cfg.attribute_classifier_logit_adjustment
         )
         metrics["aux_regression_weight"] = float(effective_aux_regression_weight)
+        metrics["delay_spread_weight"] = float(effective_delay_spread_weight)
+        metrics["strong_k_bin_classifier_weight"] = float(
+            effective_strong_k_bin_classifier_weight
+        )
+        metrics["strong_k_position_weight"] = float(
+            effective_strong_k_position_weight
+        )
+        metrics["strong_k_bin_label_order"] = ",".join(self.STRONG_K_BIN_LABELS)
+        metrics["strong_k_bin_class_weights"] = self._format_float_vector(
+            self._strong_k_bin_class_weight(
+                torch.float32,
+                cfg,
+            )
+            if cfg.strong_k_bin_weights
+            else torch.ones(len(self.STRONG_K_BIN_LABELS), device=self.device)
+        )
+        if strong_k_bin_target_histogram is not None:
+            metrics["strong_k_bin_target_histogram"] = self._format_histogram(
+                strong_k_bin_target_histogram
+            )
+        if strong_k_bin_prediction_histogram is not None:
+            metrics["strong_k_bin_prediction_histogram"] = self._format_histogram(
+                strong_k_bin_prediction_histogram
+            )
+        if strong_k_bin_loss_denominator is not None:
+            metrics["strong_k_bin_loss_denominator"] = float(
+                strong_k_bin_loss_denominator.detach()
+            )
+        if strong_k_position_mae is not None:
+            metrics["strong_k_position_mae"] = float(strong_k_position_mae.detach())
         metrics["first_path_power_bin_classifier_weight"] = float(
             effective_first_path_power_bin_classifier_weight
         )
@@ -764,6 +1059,13 @@ class Trainer:
             )
         metrics["direct_power_weight"] = float(cfg.direct_power_weight)
         if physics_predictions is not None:
+            metrics["k_factor_sample_weight_mean"] = float(
+                self._k_factor_sample_weights(
+                    batch["physics_raw_targets"][:, 3],
+                    batch["semantic_keys"],
+                    cfg,
+                ).detach().float().mean()
+            )
             metrics["first_path_power_sample_weight_mean"] = float(
                 self._first_path_power_sample_weights(
                     batch["physics_raw_targets"][:, 5],

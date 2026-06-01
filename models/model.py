@@ -6,6 +6,8 @@ from torch import nn
 
 from data.semantic_key import FIRST_POWER_DBW_BIN_LABELS
 
+K_FACTOR_STRONG_BIN_LABELS = ("low", "mid", "high", "very_high")
+
 
 class PowerFeatureEncoder(nn.Module):
     def __init__(
@@ -16,6 +18,7 @@ class PowerFeatureEncoder(nn.Module):
     ):
         super().__init__()
         self.eps = eps
+        self.stats_scale = 4.0
         self.proj = nn.Sequential(
             nn.Linear(16, hidden_dim),
             nn.GELU(),
@@ -108,6 +111,8 @@ class PowerFeatureEncoder(nn.Module):
             ],
             dim=1,
         )
+        stats = torch.log1p(torch.nan_to_num(stats.clamp(min=0.0), nan=0.0, posinf=0.0, neginf=0.0))
+        stats = stats / self.stats_scale
         return self.proj(stats)
 
 
@@ -202,21 +207,27 @@ class CSIClip(nn.Module):
         num_physics_targets: int = 10,
         attribute_num_classes: dict[str, int] | None = None,
         use_power_branch: bool = False,
+        use_delay_spread_head: bool = False,
         output_dict: bool = True,
     ):
         super().__init__()
         self.output_dict = output_dict
         self.use_power_branch = use_power_branch
+        self.use_delay_spread_head = use_delay_spread_head
         self.csi = csi_encoder
         self.text = text_encoder
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
         hidden_dim = embed_dim * 2
         self.power_feature_encoder = PowerFeatureEncoder()
         self.delay_power_map_encoder = DelayPowerMapEncoder()
+        self.power_context_dim = embed_dim + 32 + 32
+        self.delay_spread_index = 1
         self.first_path_power_index = 5
+        self.delay_spread_delta_limit = 0.5
         self.first_path_power_delta_limit = 0.5
         self.first_path_power_fusion_scale = 0.1
         self.first_path_power_bin_labels = FIRST_POWER_DBW_BIN_LABELS
+        self.k_factor_strong_bin_labels = K_FACTOR_STRONG_BIN_LABELS
         self.physics_head = nn.Sequential(
             nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
             nn.Linear(embed_dim, hidden_dim),
@@ -224,14 +235,26 @@ class CSIClip(nn.Module):
             nn.Linear(hidden_dim, num_physics_targets),
         )
         self.first_path_power_head = nn.Sequential(
-            nn.BatchNorm1d(embed_dim + 32 + 32, eps=1e-12, momentum=None),
-            nn.Linear(embed_dim + 32 + 32, hidden_dim),
+            nn.BatchNorm1d(self.power_context_dim, eps=1e-12, momentum=None),
+            nn.Linear(self.power_context_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
         self.first_path_power_gate = nn.Sequential(
-            nn.BatchNorm1d(embed_dim + 32 + 32, eps=1e-12, momentum=None),
-            nn.Linear(embed_dim + 32 + 32, hidden_dim),
+            nn.BatchNorm1d(self.power_context_dim, eps=1e-12, momentum=None),
+            nn.Linear(self.power_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.delay_spread_head = nn.Sequential(
+            nn.BatchNorm1d(self.power_context_dim, eps=1e-12, momentum=None),
+            nn.Linear(self.power_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.delay_spread_gate = nn.Sequential(
+            nn.BatchNorm1d(self.power_context_dim, eps=1e-12, momentum=None),
+            nn.Linear(self.power_context_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -247,7 +270,32 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.k_factor_strong_bin_classifier = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(self.k_factor_strong_bin_labels)),
+        )
+        self.k_factor_strong_position_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.k_factor_strong_power_bin_classifier = nn.Sequential(
+            nn.LayerNorm(self.power_context_dim),
+            nn.Linear(self.power_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(self.k_factor_strong_bin_labels)),
+        )
+        self.k_factor_strong_power_position_head = nn.Sequential(
+            nn.LayerNorm(self.power_context_dim),
+            nn.Linear(self.power_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
         self._init_first_path_power_bin_classifier()
+        self._init_delay_spread_head_identity()
         self.semantic_classifier = None
         if semantic_num_classes is not None:
             self.semantic_classifier = nn.Sequential(
@@ -275,11 +323,27 @@ class CSIClip(nn.Module):
         for module in (
             *self.first_path_power_bin_classifier.modules(),
             *self.first_path_power_bin_position_head.modules(),
+            *self.k_factor_strong_bin_classifier.modules(),
+            *self.k_factor_strong_position_head.modules(),
+            *self.k_factor_strong_power_bin_classifier.modules(),
+            *self.k_factor_strong_power_position_head.modules(),
         ):
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=1e-3)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+    def _init_delay_spread_head_identity(self) -> None:
+        delta_linear = self.delay_spread_head[-1]
+        gate_linear = self.delay_spread_gate[-1]
+        if isinstance(delta_linear, nn.Linear):
+            nn.init.zeros_(delta_linear.weight)
+            if delta_linear.bias is not None:
+                nn.init.zeros_(delta_linear.bias)
+        if isinstance(gate_linear, nn.Linear):
+            nn.init.zeros_(gate_linear.weight)
+            if gate_linear.bias is not None:
+                nn.init.constant_(gate_linear.bias, -4.0)
 
     @torch.no_grad()
     def initialize_prototypes(
@@ -379,6 +443,10 @@ class CSIClip(nn.Module):
         first_path_power_bin_position = torch.sigmoid(
             self.first_path_power_bin_position_head(csi_features).squeeze(-1)
         )
+        k_factor_strong_bin_logits = self.k_factor_strong_bin_classifier(csi_features)
+        k_factor_strong_position = torch.sigmoid(
+            self.k_factor_strong_position_head(csi_features).squeeze(-1)
+        )
         if not self.use_power_branch or power_context is None:
             zeros = torch.zeros(
                 base.shape[0],
@@ -388,10 +456,15 @@ class CSIClip(nn.Module):
             return {
                 "base": base,
                 "enhanced_first_path_power": base[:, self.first_path_power_index],
+                "enhanced_delay_spread": base[:, self.delay_spread_index],
+                "enhanced_delay_spread_gate": zeros,
+                "enhanced_delay_spread_delta": zeros,
                 "enhanced_gate": zeros,
                 "enhanced_delta": zeros,
                 "first_path_power_bin_logits": first_path_power_bin_logits,
                 "first_path_power_bin_position": first_path_power_bin_position,
+                "k_factor_strong_bin_logits": k_factor_strong_bin_logits,
+                "k_factor_strong_position": k_factor_strong_position,
                 "final": base,
             }
         enhanced_input = torch.cat(
@@ -402,6 +475,10 @@ class CSIClip(nn.Module):
             ],
             dim=-1,
         )
+        k_factor_strong_bin_logits = self.k_factor_strong_power_bin_classifier(enhanced_input)
+        k_factor_strong_position = torch.sigmoid(
+            self.k_factor_strong_power_position_head(enhanced_input).squeeze(-1)
+        )
         enhanced_delta = self.first_path_power_head(enhanced_input).squeeze(-1)
         enhanced_delta = self.first_path_power_delta_limit * torch.tanh(
             enhanced_delta / max(self.first_path_power_delta_limit, 1e-6)
@@ -409,20 +486,36 @@ class CSIClip(nn.Module):
         enhanced_gate = torch.sigmoid(
             self.first_path_power_gate(enhanced_input).squeeze(-1)
         )
+        delay_spread_delta = self.delay_spread_head(enhanced_input).squeeze(-1)
+        delay_spread_delta = self.delay_spread_delta_limit * torch.tanh(
+            delay_spread_delta / max(self.delay_spread_delta_limit, 1e-6)
+        )
+        delay_spread_gate = torch.sigmoid(
+            self.delay_spread_gate(enhanced_input).squeeze(-1)
+        )
+        base_delay_spread = base[:, self.delay_spread_index]
+        enhanced_delay_spread = base_delay_spread + delay_spread_gate * delay_spread_delta
         base_first_path_power = base[:, self.first_path_power_index]
         gated_delta = enhanced_gate * enhanced_delta
         enhanced_first_path_power = base_first_path_power + gated_delta
         final = base.clone()
+        if self.use_delay_spread_head:
+            final[:, self.delay_spread_index] = enhanced_delay_spread
         final[:, self.first_path_power_index] = (
             base_first_path_power + self.first_path_power_fusion_scale * gated_delta
         )
         return {
             "base": base,
             "enhanced_first_path_power": enhanced_first_path_power,
+            "enhanced_delay_spread": enhanced_delay_spread,
+            "enhanced_delay_spread_gate": delay_spread_gate,
+            "enhanced_delay_spread_delta": delay_spread_delta,
             "enhanced_gate": enhanced_gate,
             "enhanced_delta": enhanced_delta,
             "first_path_power_bin_logits": first_path_power_bin_logits,
             "first_path_power_bin_position": first_path_power_bin_position,
+            "k_factor_strong_bin_logits": k_factor_strong_bin_logits,
+            "k_factor_strong_position": k_factor_strong_position,
             "final": final,
         }
 

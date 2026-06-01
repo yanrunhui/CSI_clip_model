@@ -1,0 +1,61 @@
+train:
+  data_path: artifacts/d2los_k_factor_5bin_balanced_2000_train.pt
+  output_dir: artifacts/pretrain_k_factor_5bin_balanced_2000_power_k_heads_logstats
+  save_every: 20
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  epochs: 100
+  temperature: 0.07
+  token_norm_mode: std
+  use_power_branch: true
+  warmup_epochs: 5
+  min_lr: 1.0e-5
+
+  csi_to_text_weight: 1.0
+  prototype_weight: 1.0
+  text_prototype_weight: 1.0
+  text_mode: prototype
+  prototype_warmup_epochs: 0
+  freeze_text_prototypes: true
+
+  semantic_classifier_weight: 0.5
+  semantic_classifier_class_weight: none
+  semantic_classifier_logit_adjustment: 0.0
+
+  attribute_classifier_weight: 0.1
+  attribute_classifier_fields:
+    - k_factor_bin
+  attribute_classifier_class_weight: balanced
+  attribute_classifier_logit_adjustment: 0.0
+
+  semantic_key_mode: coarse_k
+
+  aux_regression_weight: 0.005
+  k_factor_loss_weights:
+    weak: 1.0
+    strong_low: 1.0
+    strong_mid: 0.8
+    strong_high: 1.1
+    strong_very_high: 1.4
+  strong_k_bin_classifier_weight: 0.5
+  strong_k_position_weight: 0.1
+  strong_k_bin_weights:
+    low: 1.1
+    mid: 0.7
+    high: 1.5
+    very_high: 1.2
+  first_path_power_bin_classifier_weight: 0.0
+  first_path_power_bin_position_weight: 0.0
+  direct_power_weight: 0.0
+  delay_spread_weight: 0.0
+  aux_regression_targets:
+    - first_path_power_dbw
+    - k_factor_db
+    - delay_spread_ns
+    - azimuth_spread_deg
+
+  multipositive_distance_threshold: 0.25
+  multipositive_positive_mode: semantic_and_physics
+  min_class_size: 5
+  min_class_size_for_multipositive: 2

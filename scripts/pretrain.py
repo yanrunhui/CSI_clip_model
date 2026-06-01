@@ -39,7 +39,7 @@ from data.semantic_key import (
 )
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
-from models.model import CSIClip
+from models.model import CSIClip, K_FACTOR_STRONG_BIN_LABELS
 from models.text_encoder import PhysicsTextEncoder
 from training.scheduler import build_lr_scheduler
 from training.trainer import TrainConfig, Trainer
@@ -62,6 +62,19 @@ def cfg_get(config: dict, key: str, fallback):
 DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS = {
     label: 1.0
     for label, _, _ in FIRST_POWER_DBW_BINS
+}
+
+DEFAULT_K_FACTOR_LOSS_WEIGHTS = {
+    "weak": 1.0,
+    "strong_low": 1.0,
+    "strong_mid": 1.0,
+    "strong_high": 1.0,
+    "strong_very_high": 1.0,
+}
+
+DEFAULT_STRONG_K_BIN_WEIGHTS = {
+    label: 1.0
+    for label in K_FACTOR_STRONG_BIN_LABELS
 }
 
 
@@ -97,6 +110,80 @@ def format_first_path_power_bin_weights(weights: dict[str, float]) -> str:
     return ",".join(
         f"{label}={float(weights[label]):.3f}"
         for label in DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS
+    )
+
+
+def parse_k_factor_loss_weights(value) -> dict[str, float] | None:
+    if value is None:
+        return None
+    entries = [value] if isinstance(value, str) else value
+    parsed = dict(DEFAULT_K_FACTOR_LOSS_WEIGHTS)
+    if isinstance(entries, dict):
+        parsed.update({str(label): float(weight) for label, weight in entries.items()})
+    else:
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--k-factor-loss-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_K_FACTOR_LOSS_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown K-factor loss weight labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_K_FACTOR_LOSS_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"K-factor loss weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_k_factor_loss_weights(weights: dict[str, float] | None) -> str:
+    if weights is None:
+        return "none"
+    return ",".join(
+        f"{label}={float(weights[label]):.3f}"
+        for label in DEFAULT_K_FACTOR_LOSS_WEIGHTS
+    )
+
+
+def parse_strong_k_bin_weights(value) -> dict[str, float] | None:
+    if value is None:
+        return None
+    entries = [value] if isinstance(value, str) else value
+    parsed = dict(DEFAULT_STRONG_K_BIN_WEIGHTS)
+    if isinstance(entries, dict):
+        parsed.update({str(label): float(weight) for label, weight in entries.items()})
+    else:
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--strong-k-bin-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_STRONG_K_BIN_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown strong K-factor bin labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_STRONG_K_BIN_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"strong K-factor bin weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_strong_k_bin_weights(weights: dict[str, float] | None) -> str:
+    if weights is None:
+        return "none"
+    return ",".join(
+        f"{label}={float(weights[label]):.3f}"
+        for label in DEFAULT_STRONG_K_BIN_WEIGHTS
     )
 
 
@@ -395,6 +482,7 @@ def build_components_from_samples(
     temperature: float = 0.07,
     token_norm_mode: str = "std",
     use_power_branch: bool = False,
+    use_delay_spread_head: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
@@ -444,6 +532,7 @@ def build_components_from_samples(
         temperature=temperature,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
         use_power_branch=use_power_branch,
+        use_delay_spread_head=use_delay_spread_head,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -633,6 +722,7 @@ def build_demo_components(
     semantic_key_mode: str = "full",
     token_norm_mode: str = "std",
     use_power_branch: bool = False,
+    use_delay_spread_head: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ):
@@ -649,6 +739,7 @@ def build_demo_components(
         batch_size=32,
         token_norm_mode=token_norm_mode,
         use_power_branch=use_power_branch,
+        use_delay_spread_head=use_delay_spread_head,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
     )
@@ -661,6 +752,7 @@ def build_real_components(
     temperature: float = 0.07,
     token_norm_mode: str = "std",
     use_power_branch: bool = False,
+    use_delay_spread_head: bool = False,
     min_class_size: int = 1,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
@@ -763,6 +855,7 @@ def build_real_components(
         temperature=temperature,
         token_norm_mode=token_norm_mode,
         use_power_branch=use_power_branch,
+        use_delay_spread_head=use_delay_spread_head,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
         tokenizer_word2id=tokenizer_word2id,
@@ -782,7 +875,12 @@ def run_smoke_test(
     attribute_classifier_logit_adjustment: float = 0.0,
     aux_regression_weight: float = 0.0,
     aux_regression_targets: tuple[str, ...] = ("all",),
+    k_factor_loss_weights: dict[str, float] | None = None,
+    strong_k_bin_classifier_weight: float = 0.0,
+    strong_k_position_weight: float = 0.0,
+    strong_k_bin_weights: dict[str, float] | None = None,
     direct_power_weight: float = 0.0,
+    delay_spread_weight: float = 0.0,
     first_path_power_bin_classifier_weight: float = 0.0,
     first_path_power_bin_position_weight: float = 0.0,
     first_path_power_bin_weights: dict[str, float] | None = None,
@@ -799,6 +897,7 @@ def run_smoke_test(
         semantic_key_mode=semantic_key_mode,
         token_norm_mode=token_norm_mode,
         use_power_branch=use_power_branch,
+        use_delay_spread_head=delay_spread_weight > 0.0,
         attribute_fields=attribute_classifier_fields,
         attribute_remap=attribute_remap,
     )
@@ -839,9 +938,14 @@ def run_smoke_test(
                     attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
                     aux_regression_weight=aux_regression_weight,
                     aux_regression_indices=aux_regression_indices(aux_regression_targets),
+                    k_factor_loss_weights=k_factor_loss_weights,
+                    strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
+                    strong_k_position_weight=strong_k_position_weight,
+                    strong_k_bin_weights=strong_k_bin_weights,
                     first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
                     first_path_power_bin_position_weight=first_path_power_bin_position_weight,
                     direct_power_weight=direct_power_weight,
+                    delay_spread_weight=delay_spread_weight,
                     first_path_power_bin_weights=first_path_power_bin_weights,
                     prototype_warmup_epochs=1,
                     multipositive_distance_threshold=multipositive_distance_threshold,
@@ -885,9 +989,14 @@ def run_real_pretrain(
     attribute_classifier_logit_adjustment: float,
     aux_regression_weight: float,
     aux_regression_targets: tuple[str, ...],
+    k_factor_loss_weights: dict[str, float] | None,
+    strong_k_bin_classifier_weight: float,
+    strong_k_position_weight: float,
+    strong_k_bin_weights: dict[str, float] | None,
     first_path_power_bin_classifier_weight: float,
     first_path_power_bin_position_weight: float,
     direct_power_weight: float,
+    delay_spread_weight: float,
     first_path_power_bin_weights: dict[str, float],
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
@@ -916,6 +1025,7 @@ def run_real_pretrain(
         temperature=temperature,
         token_norm_mode=token_norm_mode,
         use_power_branch=use_power_branch,
+        use_delay_spread_head=delay_spread_weight > 0.0,
         min_class_size=min_class_size,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
@@ -976,9 +1086,14 @@ def run_real_pretrain(
         attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
         aux_regression_weight=aux_regression_weight,
         aux_regression_indices=aux_regression_indices(aux_regression_targets),
+        k_factor_loss_weights=k_factor_loss_weights,
+        strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
+        strong_k_position_weight=strong_k_position_weight,
+        strong_k_bin_weights=strong_k_bin_weights,
         first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
         first_path_power_bin_position_weight=first_path_power_bin_position_weight,
         direct_power_weight=direct_power_weight,
+        delay_spread_weight=delay_spread_weight,
         first_path_power_bin_weights=first_path_power_bin_weights,
         freeze_csi=freeze_csi,
         freeze_text_prototypes=freeze_text_prototypes,
@@ -1022,10 +1137,16 @@ def run_real_pretrain(
         f"attribute_remap={format_attribute_remap(attribute_remap)} "
         f"aux_regression_weight={aux_regression_weight} "
         f"aux_regression_targets={','.join(aux_regression_targets)} "
+        f"k_factor_loss_weights={format_k_factor_loss_weights(k_factor_loss_weights)} "
+        f"strong_k_bin_classifier_weight={strong_k_bin_classifier_weight} "
+        f"strong_k_position_weight={strong_k_position_weight} "
+        f"strong_k_bin_weights={format_strong_k_bin_weights(strong_k_bin_weights)} "
+        f"strong_k_bin_label_order={','.join(K_FACTOR_STRONG_BIN_LABELS)} "
         f"first_path_power_bin_classifier_weight={first_path_power_bin_classifier_weight} "
         f"first_path_power_bin_position_weight={first_path_power_bin_position_weight} "
         f"first_path_power_bin_label_order={','.join(FIRST_POWER_DBW_BIN_LABELS)} "
         f"direct_power_weight={direct_power_weight} "
+        f"delay_spread_weight={delay_spread_weight} "
         f"first_path_power_bin_weights={format_first_path_power_bin_weights(first_path_power_bin_weights)} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
@@ -1098,6 +1219,40 @@ def run_real_pretrain(
             m.get("batch_label_unique_classes", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_strong_k_bin_classifier = sum(
+            m.get("loss_strong_k_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_strong_k_bin_accuracy = sum(
+            m.get("accuracy_strong_k_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_strong_k_position = sum(
+            m.get("loss_strong_k_position", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_strong_k_position_mae = sum(
+            m.get("strong_k_position_mae", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_strong_k_bin_loss_denominator = sum(
+            m.get("strong_k_bin_loss_denominator", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        last_strong_k_bin_class_weights = epoch_metrics[-1].get("strong_k_bin_class_weights", "")
+        strong_k_bin_target_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "strong_k_bin_target_histogram",
+            len(K_FACTOR_STRONG_BIN_LABELS),
+        )
+        strong_k_bin_prediction_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "strong_k_bin_prediction_histogram",
+            len(K_FACTOR_STRONG_BIN_LABELS),
+        )
+        strong_k_bin_target_distribution = format_histogram_counts(
+            K_FACTOR_STRONG_BIN_LABELS,
+            strong_k_bin_target_histogram,
+        )
+        strong_k_bin_prediction_distribution = format_histogram_counts(
+            K_FACTOR_STRONG_BIN_LABELS,
+            strong_k_bin_prediction_histogram,
+        )
         mean_first_path_power_bin_classifier = sum(
             m.get("loss_first_path_power_bin_classifier", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
@@ -1132,6 +1287,9 @@ def run_real_pretrain(
             first_path_power_bin_prediction_histogram,
         )
         mean_direct_power = sum(m.get("loss_direct_power", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_k_factor_sample_weight = sum(
+            m.get("k_factor_sample_weight_mean", 1.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
         mean_first_path_power_sample_weight = sum(
             m.get("first_path_power_sample_weight_mean", 1.0) for m in epoch_metrics
         ) / len(epoch_metrics)
@@ -1171,6 +1329,14 @@ def run_real_pretrain(
             f"proto_warmup_active={mean_prototype_warmup_active:.2f} "
             f"{attribute_debug} "
             f"aux_reg={mean_aux_regression:.4f} "
+            f"strong_k_cls={mean_strong_k_bin_classifier:.4f} "
+            f"strong_k_acc={mean_strong_k_bin_accuracy:.4f} "
+            f"strong_k_pos={mean_strong_k_position:.4f} "
+            f"strong_k_pos_mae={mean_strong_k_position_mae:.4f} "
+            f"strong_k_loss_den={mean_strong_k_bin_loss_denominator:.1f} "
+            f"strong_k_w={last_strong_k_bin_class_weights} "
+            f"strong_k_target={strong_k_bin_target_distribution} "
+            f"strong_k_pred={strong_k_bin_prediction_distribution} "
             f"fp_bin_cls={mean_first_path_power_bin_classifier:.4f} "
             f"fp_bin_acc={mean_first_path_power_bin_accuracy:.4f} "
             f"fp_bin_pos={mean_first_path_power_bin_position:.4f} "
@@ -1179,6 +1345,7 @@ def run_real_pretrain(
             f"fp_bin_target={first_path_power_bin_target_distribution} "
             f"fp_bin_pred={first_path_power_bin_prediction_distribution} "
             f"direct_power={mean_direct_power:.4f} "
+            f"k_factor_w={mean_k_factor_sample_weight:.3f} "
             f"fp_power_w={mean_first_path_power_sample_weight:.3f} "
             f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
         )
@@ -1219,6 +1386,15 @@ def run_real_pretrain(
                         "grad_norm_semantic_classifier": mean_grad_semantic_classifier,
                         "grad_norm_attribute_classifiers": mean_grad_attribute_classifiers,
                         "loss_aux_regression": mean_aux_regression,
+                        "loss_strong_k_bin_classifier": mean_strong_k_bin_classifier,
+                        "accuracy_strong_k_bin_classifier": mean_strong_k_bin_accuracy,
+                        "loss_strong_k_position": mean_strong_k_position,
+                        "strong_k_position_mae": mean_strong_k_position_mae,
+                        "strong_k_bin_loss_denominator": mean_strong_k_bin_loss_denominator,
+                        "strong_k_bin_class_weights": last_strong_k_bin_class_weights,
+                        "strong_k_bin_label_order": list(K_FACTOR_STRONG_BIN_LABELS),
+                        "strong_k_bin_target_histogram": strong_k_bin_target_histogram,
+                        "strong_k_bin_prediction_histogram": strong_k_bin_prediction_histogram,
                         "loss_first_path_power_bin_classifier": mean_first_path_power_bin_classifier,
                         "accuracy_first_path_power_bin_classifier": mean_first_path_power_bin_accuracy,
                         "loss_first_path_power_bin_position": mean_first_path_power_bin_position,
@@ -1228,6 +1404,7 @@ def run_real_pretrain(
                         "first_path_power_bin_target_histogram": first_path_power_bin_target_histogram,
                         "first_path_power_bin_prediction_histogram": first_path_power_bin_prediction_histogram,
                         "loss_direct_power": mean_direct_power,
+                        "k_factor_sample_weight_mean": mean_k_factor_sample_weight,
                         "first_path_power_sample_weight_mean": mean_first_path_power_sample_weight,
                         "logit_scale": mean_logit_scale,
                         "text_mode": text_mode,
@@ -1251,10 +1428,16 @@ def run_real_pretrain(
                         "use_power_branch": use_power_branch,
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
+                        "k_factor_loss_weights": k_factor_loss_weights,
+                        "strong_k_bin_classifier_weight": strong_k_bin_classifier_weight,
+                        "strong_k_position_weight": strong_k_position_weight,
+                        "strong_k_bin_weights": strong_k_bin_weights,
+                        "strong_k_bin_label_order": list(K_FACTOR_STRONG_BIN_LABELS),
                         "first_path_power_bin_classifier_weight": first_path_power_bin_classifier_weight,
                         "first_path_power_bin_position_weight": first_path_power_bin_position_weight,
                         "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
                         "direct_power_weight": direct_power_weight,
+                        "delay_spread_weight": delay_spread_weight,
                         "first_path_power_bin_weights": first_path_power_bin_weights,
                         "multipositive_distance_threshold": multipositive_distance_threshold,
                         "multipositive_positive_mode": multipositive_positive_mode,
@@ -1319,10 +1502,16 @@ def run_real_pretrain(
                     "token_norm_mode": token_norm_mode,
                     "aux_regression_weight": aux_regression_weight,
                     "aux_regression_targets": list(aux_regression_targets),
+                    "k_factor_loss_weights": k_factor_loss_weights,
+                    "strong_k_bin_classifier_weight": strong_k_bin_classifier_weight,
+                    "strong_k_position_weight": strong_k_position_weight,
+                    "strong_k_bin_weights": strong_k_bin_weights,
+                    "strong_k_bin_label_order": list(K_FACTOR_STRONG_BIN_LABELS),
                     "first_path_power_bin_classifier_weight": first_path_power_bin_classifier_weight,
                     "first_path_power_bin_position_weight": first_path_power_bin_position_weight,
                     "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
                     "direct_power_weight": direct_power_weight,
+                    "delay_spread_weight": delay_spread_weight,
                     "first_path_power_bin_weights": first_path_power_bin_weights,
                     "multipositive_distance_threshold": multipositive_distance_threshold,
                     "multipositive_positive_mode": multipositive_positive_mode,
@@ -1419,6 +1608,32 @@ def main() -> None:
     )
     parser.add_argument("--aux-regression-weight", type=float)
     parser.add_argument(
+        "--k-factor-loss-weight",
+        action="append",
+        help=(
+            "Per-bin weighting for K-factor aux regression as LABEL=WEIGHT. "
+            "Labels: weak, strong_low, strong_mid, strong_high, strong_very_high."
+        ),
+    )
+    parser.add_argument(
+        "--strong-k-bin-classifier-weight",
+        type=float,
+        help="Auxiliary classification weight for strong K-factor low/mid/high/very_high prediction.",
+    )
+    parser.add_argument(
+        "--strong-k-position-weight",
+        type=float,
+        help="Auxiliary regression weight for strong K-factor position within its predicted dB bin.",
+    )
+    parser.add_argument(
+        "--strong-k-bin-weight",
+        action="append",
+        help=(
+            "Per-class weighting for strong K-factor bin classification as LABEL=WEIGHT. "
+            "Labels: low, mid, high, very_high."
+        ),
+    )
+    parser.add_argument(
         "--first-path-power-bin-classifier-weight",
         type=float,
         help="Auxiliary classification weight for first-path-power bin prediction.",
@@ -1438,6 +1653,11 @@ def main() -> None:
         "--direct-power-weight",
         type=float,
         help="Small explicit supervision weight for the direct first-path-power head.",
+    )
+    parser.add_argument(
+        "--delay-spread-weight",
+        type=float,
+        help="Explicit supervision weight for the independent delay-spread head.",
     )
     parser.add_argument(
         "--first-path-power-bin-weight",
@@ -1601,6 +1821,26 @@ def main() -> None:
         if args.aux_regression_weight is not None
         else float(cfg_get(train_cfg, "aux_regression_weight", 0.0))
     )
+    k_factor_loss_weights = parse_k_factor_loss_weights(
+        args.k_factor_loss_weight
+        if args.k_factor_loss_weight is not None
+        else cfg_get(train_cfg, "k_factor_loss_weights", None)
+    )
+    strong_k_bin_classifier_weight = (
+        args.strong_k_bin_classifier_weight
+        if args.strong_k_bin_classifier_weight is not None
+        else float(cfg_get(train_cfg, "strong_k_bin_classifier_weight", 0.0))
+    )
+    strong_k_position_weight = (
+        args.strong_k_position_weight
+        if args.strong_k_position_weight is not None
+        else float(cfg_get(train_cfg, "strong_k_position_weight", 0.0))
+    )
+    strong_k_bin_weights = parse_strong_k_bin_weights(
+        args.strong_k_bin_weight
+        if args.strong_k_bin_weight is not None
+        else cfg_get(train_cfg, "strong_k_bin_weights", None)
+    )
     first_path_power_bin_classifier_weight = (
         args.first_path_power_bin_classifier_weight
         if args.first_path_power_bin_classifier_weight is not None
@@ -1616,6 +1856,11 @@ def main() -> None:
         if args.direct_power_weight is not None
         else float(cfg_get(train_cfg, "direct_power_weight", 0.0))
     )
+    delay_spread_weight = (
+        args.delay_spread_weight
+        if args.delay_spread_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_weight", 0.0))
+    )
     first_path_power_bin_weights = parse_first_path_power_bin_weights(
         args.first_path_power_bin_weight
         if args.first_path_power_bin_weight is not None
@@ -1626,6 +1871,7 @@ def main() -> None:
             first_path_power_bin_classifier_weight > 0.0
             or first_path_power_bin_position_weight > 0.0
             or direct_power_weight > 0.0
+            or delay_spread_weight > 0.0
         )
         and not use_power_branch
     ):
@@ -1703,9 +1949,14 @@ def main() -> None:
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
+            k_factor_loss_weights=k_factor_loss_weights,
+            strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
+            strong_k_position_weight=strong_k_position_weight,
+            strong_k_bin_weights=strong_k_bin_weights,
             first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
             first_path_power_bin_position_weight=first_path_power_bin_position_weight,
             direct_power_weight=direct_power_weight,
+            delay_spread_weight=delay_spread_weight,
             first_path_power_bin_weights=first_path_power_bin_weights,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
@@ -1746,9 +1997,14 @@ def main() -> None:
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
             aux_regression_targets=aux_regression_targets,
+            k_factor_loss_weights=k_factor_loss_weights,
+            strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
+            strong_k_position_weight=strong_k_position_weight,
+            strong_k_bin_weights=strong_k_bin_weights,
             first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
             first_path_power_bin_position_weight=first_path_power_bin_position_weight,
             direct_power_weight=direct_power_weight,
+            delay_spread_weight=delay_spread_weight,
             first_path_power_bin_weights=first_path_power_bin_weights,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,

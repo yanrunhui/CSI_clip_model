@@ -25,9 +25,6 @@ from data.dataset import (
     semantic_key_mode_choices,
 )
 from data.semantic_key import (
-    FIRST_POWER_DBW_BIN_LABELS,
-    FIRST_POWER_DBW_BINS,
-    FIRST_POWER_DBW_POSITION_BINS,
     SemanticKey,
     default_attribute_fields,
     implied_attribute_value_filters,
@@ -37,27 +34,29 @@ from data.semantic_key import (
 )
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
-from models.model import CSIClip
+from models.model import CSIClip, K_FACTOR_STRONG_BIN_LABELS
 from models.text_encoder import PhysicsTextEncoder
-from scripts.pretrain import assert_checkpoint_prototype_compatibility
+from scripts.pretrain import assert_checkpoint_prototype_compatibility, deserialize_prototype_keys
 from training.losses import cosine_alignment_loss, paired_contrastive_loss
 
 PHYSICAL_DESCRIPTION_FIELDS = (
     "delay_spread_ns",
     "k_factor_db",
     "azimuth_spread_deg",
-    "first_path_power_dbw",
 )
 
 PHYSICAL_DESCRIPTION_TOLERANCES = {
     "delay_spread_ns": 20.0,
     "k_factor_db": 3.0,
     "azimuth_spread_deg": 10.0,
-    "first_path_power_dbw": 3.0,
 }
 
-FIRST_PATH_POWER_BINS = FIRST_POWER_DBW_BINS
-FIRST_PATH_POWER_POSITION_BINS = FIRST_POWER_DBW_POSITION_BINS
+STRONG_K_FACTOR_DIAGNOSTIC_BINS = (
+    ("low", 3.0, 15.0),
+    ("mid", 15.0, 30.0),
+    ("high", 30.0, 45.0),
+    ("very_high", 45.0, 70.0),
+)
 
 
 def build_tokenizer(samples, checkpoint: dict | None) -> CaptionTokenizer:
@@ -99,9 +98,14 @@ def build_prototype_bank(
     samples,
     tokenizer: CaptionTokenizer,
     max_caption_len: int = 48,
+    prototype_keys_override: list[SemanticKey] | None = None,
 ) -> tuple[list[SemanticKey], torch.Tensor, torch.Tensor, dict[SemanticKey, int]]:
     generator = CaptionGenerator()
-    unique_keys = sorted({sample.semantic_key for sample in samples}, key=semantic_key_sort_key)
+    unique_keys = (
+        list(prototype_keys_override)
+        if prototype_keys_override is not None
+        else sorted({sample.semantic_key for sample in samples}, key=semantic_key_sort_key)
+    )
     captions = [generator.generate_canonical(key) for key in unique_keys]
     tokenized = [tokenizer.encode(caption, max_len=max_caption_len) for caption in captions]
     token_ids = torch.stack([item.ids for item in tokenized], dim=0)
@@ -132,7 +136,6 @@ def _structured_physical_record(
         "delay_spread_ns": float(raw_values[_physics_target_index("delay_spread_ns")]),
         "k_factor_db": float(raw_values[_physics_target_index("k_factor_db")]),
         "azimuth_spread_deg": float(raw_values[_physics_target_index("azimuth_spread_deg")]),
-        "first_path_power_dbw": float(raw_values[_physics_target_index("first_path_power_dbw")]),
     }
 
 
@@ -141,9 +144,8 @@ def _render_physical_description(record: dict[str, float | str]) -> str:
     return (
         f"This channel is likely {los_text}, with a delay spread of about "
         f"{_format_scalar(float(record['delay_spread_ns']))} ns, a K-factor of about "
-        f"{_format_scalar(float(record['k_factor_db']))} dB, an azimuth spread of about "
-        f"{_format_scalar(float(record['azimuth_spread_deg']))} deg, and a first-path power "
-        f"of about {_format_scalar(float(record['first_path_power_dbw']))} dBW."
+        f"{_format_scalar(float(record['k_factor_db']))} dB, and an azimuth spread of about "
+        f"{_format_scalar(float(record['azimuth_spread_deg']))} deg."
     )
 
 
@@ -196,6 +198,12 @@ def _infer_use_power_branch(checkpoint: dict | None, override: bool | None) -> b
         return override
     if checkpoint is not None:
         return bool(checkpoint.get("args", {}).get("use_power_branch", False))
+    return False
+
+
+def _infer_use_delay_spread_head(checkpoint: dict | None) -> bool:
+    if checkpoint is not None:
+        return float(checkpoint.get("args", {}).get("delay_spread_weight", 0.0)) > 0.0
     return False
 
 
@@ -442,6 +450,36 @@ def limit_samples_by_attribute_value_for_debug(
     return limited
 
 
+def align_samples_to_checkpoint_prototypes(samples, checkpoint: dict | None):
+    if checkpoint is None:
+        return samples, None
+    checkpoint_keys = deserialize_prototype_keys(checkpoint.get("prototype_keys"))
+    if checkpoint_keys is None:
+        return samples, None
+    allowed_keys = set(checkpoint_keys)
+    aligned = [sample for sample in samples if sample.semantic_key in allowed_keys]
+    if not aligned:
+        raise ValueError(
+            "No evaluation samples match checkpoint prototype_keys after filtering. "
+            "Use an eval split drawn from the same semantic-key space as the checkpoint."
+        )
+    if len(aligned) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in aligned)
+        dropped_keys = sorted(
+            set(before_counts) - set(after_counts),
+            key=semantic_key_sort_key,
+        )
+        print(
+            "aligned evaluation samples to checkpoint prototypes: "
+            f"samples {len(samples)} -> {len(aligned)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}, "
+            f"checkpoint_prototypes={len(checkpoint_keys)}, "
+            f"dropped_extra_eval_prototypes={len(dropped_keys)}"
+        )
+    return aligned, checkpoint_keys
+
+
 @torch.no_grad()
 def evaluate(
     data_path: str,
@@ -468,6 +506,7 @@ def evaluate(
     semantic_key_mode = _infer_semantic_key_mode(checkpoint, semantic_key_mode_override)
     token_norm_mode = _infer_token_norm_mode(checkpoint, token_norm_mode_override)
     use_power_branch = _infer_use_power_branch(checkpoint, use_power_branch_override)
+    use_delay_spread_head = _infer_use_delay_spread_head(checkpoint)
     attribute_fields = _infer_attribute_fields(checkpoint, attribute_fields_override)
     attribute_remap = _infer_attribute_remap(checkpoint)
     filter_attribute_values = _infer_filter_attribute_values(
@@ -567,10 +606,15 @@ def evaluate(
             f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
         )
     samples = limited_samples
+    samples, checkpoint_prototype_keys = align_samples_to_checkpoint_prototypes(
+        samples,
+        checkpoint,
+    )
     tokenizer = build_tokenizer(samples, checkpoint)
     prototype_keys, prototype_token_ids, prototype_token_mask, prototype_label_map = build_prototype_bank(
         samples,
         tokenizer,
+        prototype_keys_override=checkpoint_prototype_keys,
     )
     attribute_label_maps = build_attribute_label_maps(
         samples,
@@ -596,6 +640,7 @@ def evaluate(
         embed_dim=256,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
         use_power_branch=use_power_branch,
+        use_delay_spread_head=use_delay_spread_head,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -618,13 +663,12 @@ def evaluate(
     all_physics_predictions = []
     all_base_physics_predictions = []
     all_enhanced_first_path_power_predictions = []
-    all_first_path_power_bin_logits = []
-    all_first_path_power_bin_positions = []
-    all_enhanced_gates = []
+    all_enhanced_delay_spread_predictions = []
+    all_strong_k_bin_logits = []
+    all_strong_k_positions = []
     all_physics_targets = []
     all_physics_raw_targets = []
     all_physics_masks = []
-    all_enhanced_delta = []
     all_labels = []
     all_text_labels = []
     all_semantic_keys = []
@@ -673,14 +717,11 @@ def evaluate(
         all_enhanced_first_path_power_predictions.append(
             physics_outputs["enhanced_first_path_power"].cpu()
         )
-        all_first_path_power_bin_logits.append(
-            physics_outputs["first_path_power_bin_logits"].cpu()
+        all_enhanced_delay_spread_predictions.append(
+            physics_outputs["enhanced_delay_spread"].cpu()
         )
-        all_first_path_power_bin_positions.append(
-            physics_outputs["first_path_power_bin_position"].cpu()
-        )
-        all_enhanced_gates.append(physics_outputs["enhanced_gate"].cpu())
-        all_enhanced_delta.append(physics_outputs["enhanced_delta"].cpu())
+        all_strong_k_bin_logits.append(physics_outputs["k_factor_strong_bin_logits"].cpu())
+        all_strong_k_positions.append(physics_outputs["k_factor_strong_position"].cpu())
         all_physics_predictions.append(physics_predictions.cpu())
         all_physics_targets.append(batch["physics_targets"].cpu())
         all_physics_raw_targets.append(batch["physics_raw_targets"].cpu())
@@ -717,13 +758,12 @@ def evaluate(
     physics_predictions = torch.cat(all_physics_predictions, dim=0)
     base_physics_predictions = torch.cat(all_base_physics_predictions, dim=0)
     enhanced_first_path_power_predictions = torch.cat(all_enhanced_first_path_power_predictions, dim=0)
-    first_path_power_bin_logits = torch.cat(all_first_path_power_bin_logits, dim=0)
-    first_path_power_bin_positions = torch.cat(all_first_path_power_bin_positions, dim=0)
-    enhanced_gate = torch.cat(all_enhanced_gates, dim=0)
+    enhanced_delay_spread_predictions = torch.cat(all_enhanced_delay_spread_predictions, dim=0)
+    strong_k_bin_logits = torch.cat(all_strong_k_bin_logits, dim=0)
+    strong_k_positions = torch.cat(all_strong_k_positions, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
     physics_masks = torch.cat(all_physics_masks, dim=0)
-    enhanced_delta = torch.cat(all_enhanced_delta, dim=0)
     labels = torch.tensor(all_labels, dtype=torch.long)
     logit_scale = float(model.logit_scale.exp().detach().cpu().item())
     prototype_logits = logit_scale * csi_features @ prototype_features.T
@@ -767,6 +807,7 @@ def evaluate(
     print(f"semantic_key_mode={semantic_key_mode}")
     print(f"token_norm_mode={token_norm_mode}")
     print(f"use_power_branch={use_power_branch}")
+    print(f"use_delay_spread_head={use_delay_spread_head}")
     print(f"min_class_size={min_class_size}")
     print(f"attribute_remap={format_attribute_remap(attribute_remap)}")
     print(f"filter_attribute_values={format_attribute_value_filters(filter_attribute_values)}")
@@ -799,31 +840,26 @@ def evaluate(
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
     )
+    _print_k_factor_diagnostics(
+        physics_predictions=physics_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
+    )
     _print_first_path_power_diagnostics(
         base_physics_predictions=base_physics_predictions,
         physics_predictions=physics_predictions,
         enhanced_first_path_power_predictions=enhanced_first_path_power_predictions,
         physics_raw_targets=physics_raw_targets,
-        physics_targets=physics_targets,
         physics_masks=physics_masks,
     )
-    if checkpoint is not None and float(checkpoint.get("args", {}).get("first_path_power_bin_classifier_weight", 0.0)) > 0:
-        print(f"first_path_power_bin_label_order={','.join(FIRST_POWER_DBW_BIN_LABELS)}")
-        _print_first_path_power_bin_classifier_metrics(
-            first_path_power_bin_logits,
-            physics_raw_targets[:, _physics_target_index("first_path_power_dbw")],
-            checkpoint.get("args", {}).get("first_path_power_bin_weights"),
-        )
-    if checkpoint is not None and float(checkpoint.get("args", {}).get("first_path_power_bin_position_weight", 0.0)) > 0:
-        _print_first_path_power_bin_position_metrics(
-            first_path_power_bin_positions,
-            first_path_power_bin_logits,
-            physics_raw_targets[:, _physics_target_index("first_path_power_dbw")],
-        )
-    print(f"enhanced_delta_mean={float(enhanced_delta.mean()):.6f}")
-    print(f"enhanced_delta_std={float(enhanced_delta.std()):.6f}")
-    print(f"enhanced_gate_mean={float(enhanced_gate.mean()):.6f}")
-    print(f"enhanced_gate_std={float(enhanced_gate.std()):.6f}")
+    _print_delay_spread_diagnostics(
+        base_physics_predictions=base_physics_predictions,
+        physics_predictions=physics_predictions,
+        enhanced_delay_spread_predictions=enhanced_delay_spread_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_masks=physics_masks,
+    )
     _print_structured_physical_description_metrics(
         physics_predictions=physics_predictions,
         physics_raw_targets=physics_raw_targets,
@@ -895,230 +931,6 @@ def _safe_pearson(x: torch.Tensor, y: torch.Tensor) -> float:
     if float(denom) == 0.0:
         return 0.0
     return float((x * y).sum() / denom)
-
-
-def _first_path_power_bin_targets(raw_first_path_power: torch.Tensor) -> torch.Tensor:
-    targets = torch.full_like(raw_first_path_power, fill_value=-1, dtype=torch.long)
-    for class_idx, (_, lower, upper) in enumerate(FIRST_PATH_POWER_BINS):
-        mask = (raw_first_path_power >= lower) & (raw_first_path_power < upper)
-        targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
-    return targets
-
-
-def _first_path_power_bin_position_targets(
-    raw_first_path_power: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    targets = torch.zeros_like(raw_first_path_power)
-    valid_mask = torch.zeros_like(raw_first_path_power, dtype=torch.bool)
-    clipped_raw = raw_first_path_power.clamp(
-        min=FIRST_PATH_POWER_POSITION_BINS[0][1],
-        max=FIRST_PATH_POWER_POSITION_BINS[-1][2],
-    )
-    for _, lower, upper in FIRST_PATH_POWER_POSITION_BINS:
-        mask = torch.isfinite(raw_first_path_power) & (clipped_raw >= lower) & (clipped_raw <= upper)
-        position = (clipped_raw - lower) / max(upper - lower, 1e-6)
-        targets = torch.where(mask, position.clamp(0.0, 1.0), targets)
-        valid_mask = valid_mask | mask
-    return targets, valid_mask
-
-
-def _first_path_power_from_bin_position(
-    bin_indices: torch.Tensor,
-    positions: torch.Tensor,
-) -> torch.Tensor:
-    lowers = torch.tensor(
-        [lower for _, lower, _ in FIRST_PATH_POWER_POSITION_BINS],
-        dtype=positions.dtype,
-        device=positions.device,
-    )
-    uppers = torch.tensor(
-        [upper for _, _, upper in FIRST_PATH_POWER_POSITION_BINS],
-        dtype=positions.dtype,
-        device=positions.device,
-    )
-    bin_indices = bin_indices.clamp(min=0, max=len(FIRST_PATH_POWER_POSITION_BINS) - 1)
-    lower = lowers[bin_indices]
-    upper = uppers[bin_indices]
-    return lower + positions.clamp(0.0, 1.0) * (upper - lower)
-
-
-def _first_path_power_bin_class_weights(
-    value,
-    dtype: torch.dtype,
-) -> torch.Tensor | None:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        weights = {
-            str(label): float(weight)
-            for label, weight in value.items()
-        }
-    else:
-        entries = [value] if isinstance(value, str) else value
-        weights = {}
-        for entry in entries or []:
-            if "=" not in str(entry):
-                continue
-            label, raw_weight = str(entry).split("=", 1)
-            weights[label.strip()] = float(raw_weight)
-    if not weights:
-        return None
-    return torch.tensor(
-        [
-            float(weights.get(label, 1.0))
-            for label in FIRST_POWER_DBW_BIN_LABELS
-        ],
-        dtype=dtype,
-    )
-
-
-def _print_first_path_power_bin_classifier_metrics(
-    logits: torch.Tensor,
-    raw_targets: torch.Tensor,
-    class_weights_value=None,
-) -> None:
-    labels = _first_path_power_bin_targets(raw_targets)
-    valid_mask = labels >= 0
-    if not bool(valid_mask.any()):
-        print("first_path_power_bin_classifier_loss=nan")
-        print("first_path_power_bin_classifier_top1=nan")
-        print("first_path_power_bin_classifier_macro_top1=nan")
-        return
-    logits = logits[valid_mask]
-    labels = labels[valid_mask]
-    per_sample_loss = F.cross_entropy(logits, labels, reduction="none")
-    class_weights = _first_path_power_bin_class_weights(
-        class_weights_value,
-        per_sample_loss.dtype,
-    )
-    if class_weights is None:
-        sample_weights = torch.ones_like(per_sample_loss)
-    else:
-        sample_weights = class_weights[labels]
-    loss_sum = (per_sample_loss * sample_weights).sum()
-    loss_denominator = sample_weights.sum().clamp(min=1.0)
-    mean_loss = loss_sum / loss_denominator
-    unweighted_mean_loss = per_sample_loss.mean()
-    predictions = logits.argmax(dim=1)
-    num_classes = len(FIRST_PATH_POWER_BINS)
-    confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
-    for true_label, pred_label in zip(labels.tolist(), predictions.tolist()):
-        confusion[int(true_label), int(pred_label)] += 1
-    class_sizes = confusion.sum(dim=1)
-    class_correct = confusion.diag()
-    nonempty = class_sizes > 0
-    class_accuracy = torch.zeros(num_classes, dtype=torch.float32)
-    class_accuracy[nonempty] = class_correct[nonempty].float() / class_sizes[nonempty].float()
-    top1 = (predictions == labels).float().mean()
-    macro_acc = class_accuracy[nonempty].mean() if bool(nonempty.any()) else torch.zeros(())
-    true_logits = logits.gather(1, labels[:, None]).squeeze(1)
-    best_other_logits = logits.masked_fill(
-        F.one_hot(labels, num_classes=num_classes).bool(),
-        float("-inf"),
-    ).max(dim=1).values
-    margins = true_logits - best_other_logits
-    print(f"first_path_power_bin_classifier_loss={float(mean_loss):.4f}")
-    print(
-        "first_path_power_bin_classifier_loss_unweighted_mean="
-        f"{float(unweighted_mean_loss):.4f}"
-    )
-    print(f"first_path_power_bin_classifier_loss_sum={float(loss_sum):.4f}")
-    print(
-        "first_path_power_bin_classifier_loss_denominator="
-        f"{float(loss_denominator):.4f}"
-    )
-    print(f"first_path_power_bin_classifier_valid_count={int(labels.numel())}")
-    print(f"first_path_power_bin_classifier_top1={float(top1):.4f}")
-    print(f"first_path_power_bin_classifier_macro_top1={float(macro_acc):.4f}")
-    print(
-        "first_path_power_bin_classifier_logit_range="
-        f"{float(logits.min()):.4f},{float(logits.max()):.4f}"
-    )
-    print(
-        "first_path_power_bin_classifier_margin_mean="
-        f"{float(margins.mean()):.4f}"
-    )
-    print(
-        "first_path_power_bin_classifier_loss_p50_p95_max="
-        f"{float(per_sample_loss.quantile(0.50)):.4f},"
-        f"{float(per_sample_loss.quantile(0.95)):.4f},"
-        f"{float(per_sample_loss.max()):.4f}"
-    )
-    print(
-        "first_path_power_bin_classifier_pred_distribution="
-        + ",".join(
-            f"{label}:{int((predictions == class_idx).sum().item())}"
-            for class_idx, (label, _, _) in enumerate(FIRST_PATH_POWER_BINS)
-        )
-    )
-    print(
-        "first_path_power_bin_classifier_target_distribution="
-        + ",".join(
-            f"{label}:{int(class_sizes[class_idx])}"
-            for class_idx, (label, _, _) in enumerate(FIRST_PATH_POWER_BINS)
-        )
-    )
-    for class_idx, (label, _, _) in enumerate(FIRST_PATH_POWER_BINS):
-        print(
-            f"first_path_power_bin_classifier_{label}="
-            f"size:{int(class_sizes[class_idx])} "
-            f"acc:{float(class_accuracy[class_idx]):.4f}"
-        )
-
-
-def _print_first_path_power_bin_position_metrics(
-    positions: torch.Tensor,
-    logits: torch.Tensor,
-    raw_targets: torch.Tensor,
-) -> None:
-    targets, valid_mask = _first_path_power_bin_position_targets(raw_targets)
-    if not bool(valid_mask.any()):
-        print("first_path_power_bin_position_loss=nan")
-        print("first_path_power_bin_position_mae=nan")
-        return
-    positions = positions[valid_mask].clamp(0.0, 1.0)
-    targets = targets[valid_mask]
-    raw_targets = raw_targets[valid_mask]
-    true_bins = _first_path_power_bin_targets(raw_targets)
-    pred_bins = logits[valid_mask].argmax(dim=1)
-    loss = F.smooth_l1_loss(positions, targets)
-    mae = (positions - targets).abs().mean()
-    pred_dbw = _first_path_power_from_bin_position(pred_bins, positions)
-    oracle_bin_dbw = _first_path_power_from_bin_position(true_bins, positions)
-    print(f"first_path_power_bin_position_loss={float(loss):.4f}")
-    print(f"first_path_power_bin_position_mae={float(mae):.4f}")
-    print(f"first_path_power_bin_position_valid_count={int(valid_mask.sum().item())}")
-    print(
-        "first_path_power_bin_position_pred_range="
-        f"{float(positions.min()):.4f},{float(positions.max()):.4f}"
-    )
-    print(
-        "first_path_power_bin_position_target_range="
-        f"{float(targets.min()):.4f},{float(targets.max()):.4f}"
-    )
-    print(
-        "first_path_power_bin_position_predbin_dbw_MAE="
-        f"{float((pred_dbw - raw_targets).abs().mean()):.4f}"
-    )
-    print(
-        "first_path_power_bin_position_oraclebin_dbw_MAE="
-        f"{float((oracle_bin_dbw - raw_targets).abs().mean()):.4f}"
-    )
-    for class_idx, (label, _, _) in enumerate(FIRST_PATH_POWER_POSITION_BINS):
-        bin_mask = true_bins == class_idx
-        count = int(bin_mask.sum().item())
-        print(f"{label}_position_count={count}")
-        if count == 0:
-            print(f"{label}_position_mae=nan")
-            print(f"{label}_position_oraclebin_dbw_MAE=nan")
-            continue
-        bin_position_errors = (positions[bin_mask] - targets[bin_mask]).abs()
-        bin_oracle_dbw_errors = (oracle_bin_dbw[bin_mask] - raw_targets[bin_mask]).abs()
-        print(f"{label}_position_mae={float(bin_position_errors.mean()):.4f}")
-        print(
-            f"{label}_position_oraclebin_dbw_MAE="
-            f"{float(bin_oracle_dbw_errors.mean()):.4f}"
-        )
 
 
 def _binary_threshold_metrics(
@@ -1454,7 +1266,11 @@ def _print_physics_regression_metrics(
     angle_sin_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_sin")
     angle_cos_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_cos")
     for idx, name in enumerate(PHYSICS_TARGET_NAMES):
-        if name in {"first_path_aoa_az_sin", "first_path_aoa_az_cos"}:
+        if name in {
+            "first_path_aoa_az_sin",
+            "first_path_aoa_az_cos",
+            "first_path_power_dbw",
+        }:
             continue
         mask = physics_masks[:, idx]
         if not bool(mask.any()):
@@ -1482,6 +1298,295 @@ def _print_physics_regression_metrics(
     else:
         total_mae = torch.zeros(())
     print(f"physics_regression_MAE_mean={float(total_mae):.4f}")
+
+
+def _strong_k_targets(
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    k_idx = _physics_target_index("k_factor_db")
+    raw_k = physics_raw_targets[:, k_idx]
+    valid_mask = physics_masks[:, k_idx] & torch.tensor(
+        [key.k_factor_bin == "strong" for key in semantic_keys],
+        dtype=torch.bool,
+        device=raw_k.device,
+    )
+    labels = torch.full_like(raw_k, fill_value=-1, dtype=torch.long)
+    positions = torch.zeros_like(raw_k)
+    for bin_idx, (_, lower, upper) in enumerate(STRONG_K_FACTOR_DIAGNOSTIC_BINS):
+        upper_mask = (
+            raw_k <= upper
+            if bin_idx == len(STRONG_K_FACTOR_DIAGNOSTIC_BINS) - 1
+            else raw_k < upper
+        )
+        mask = valid_mask & (raw_k >= lower) & upper_mask
+        labels = torch.where(mask, torch.full_like(labels, bin_idx), labels)
+        positions = torch.where(
+            mask,
+            ((raw_k - lower) / max(upper - lower, 1e-6)).clamp(0.0, 1.0),
+            positions,
+        )
+    return labels, positions, labels >= 0
+
+
+def _decode_strong_k(bin_labels: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    lowers = torch.tensor(
+        [lower for _, lower, _ in STRONG_K_FACTOR_DIAGNOSTIC_BINS],
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+    widths = torch.tensor(
+        [upper - lower for _, lower, upper in STRONG_K_FACTOR_DIAGNOSTIC_BINS],
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+    return lowers[bin_labels] + positions.clamp(0.0, 1.0) * widths[bin_labels]
+
+
+def _print_strong_k_factor_head_metrics(
+    strong_k_bin_logits: torch.Tensor,
+    strong_k_positions: torch.Tensor,
+    physics_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+) -> None:
+    target_labels, target_positions, mask = _strong_k_targets(
+        physics_raw_targets,
+        physics_masks,
+        semantic_keys,
+    )
+    count = int(mask.sum().item())
+    print(f"strong_k_head_valid_count={count}")
+    print(f"strong_k_head_label_order={','.join(K_FACTOR_STRONG_BIN_LABELS)}")
+    if count == 0:
+        print("strong_k_head_bin_loss=nan")
+        print("strong_k_head_bin_top1=nan")
+        print("strong_k_head_position_MAE=nan")
+        print("strong_k_head_decoded_MAE=nan")
+        return
+
+    valid_logits = strong_k_bin_logits[mask]
+    valid_target_labels = target_labels[mask]
+    valid_positions = strong_k_positions[mask]
+    valid_target_positions = target_positions[mask]
+    predictions = valid_logits.argmax(dim=1)
+    num_classes = len(K_FACTOR_STRONG_BIN_LABELS)
+    confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
+    for true_label, pred_label in zip(valid_target_labels.tolist(), predictions.tolist()):
+        confusion[int(true_label), int(pred_label)] += 1
+
+    class_sizes = confusion.sum(dim=1)
+    class_correct = confusion.diag()
+    nonempty = class_sizes > 0
+    class_accuracy = torch.zeros(num_classes, dtype=torch.float32)
+    class_accuracy[nonempty] = class_correct[nonempty].float() / class_sizes[nonempty].float()
+    top1 = (predictions == valid_target_labels).float().mean()
+    macro_top1 = class_accuracy[nonempty].mean() if bool(nonempty.any()) else torch.zeros(())
+    decoded_predictions = _decode_strong_k(predictions, valid_positions)
+    oracle_bin_decoded_predictions = _decode_strong_k(valid_target_labels, valid_positions)
+    raw_regression_predictions = _physics_raw_predictions(physics_predictions)[
+        :, _physics_target_index("k_factor_db")
+    ][mask]
+    raw_k_targets = physics_raw_targets[:, _physics_target_index("k_factor_db")][mask]
+    decoded_errors = decoded_predictions - raw_k_targets
+    oracle_bin_decoded_errors = oracle_bin_decoded_predictions - raw_k_targets
+
+    print(f"strong_k_head_bin_loss={float(F.cross_entropy(valid_logits, valid_target_labels)):.4f}")
+    print(f"strong_k_head_bin_top1={float(top1):.4f}")
+    print(f"strong_k_head_bin_macro_top1={float(macro_top1):.4f}")
+    print(f"strong_k_head_position_MAE={float((valid_positions - valid_target_positions).abs().mean()):.4f}")
+    print(f"strong_k_head_decoded_MAE={float(decoded_errors.abs().mean()):.4f}")
+    print(f"strong_k_head_decoded_accuracy@3={float((decoded_errors.abs() <= 3.0).float().mean()):.4f}")
+    print(f"strong_k_head_decoded_signed_mean={float(decoded_errors.mean()):.4f}")
+    print(f"strong_k_head_decoded_pearson={_safe_pearson(decoded_predictions, raw_k_targets):.4f}")
+    print(f"strong_k_head_oracle_bin_decoded_MAE={float(oracle_bin_decoded_errors.abs().mean()):.4f}")
+    print(
+        f"strong_k_head_decoded_pred_range="
+        f"{float(decoded_predictions.min()):.4f},{float(decoded_predictions.max()):.4f}"
+    )
+    print(
+        f"strong_k_head_decoded_target_range="
+        f"{float(raw_k_targets.min()):.4f},{float(raw_k_targets.max()):.4f}"
+    )
+    for class_idx, label in enumerate(K_FACTOR_STRONG_BIN_LABELS):
+        class_mask = valid_target_labels == class_idx
+        print(
+            f"strong_k_head_bin_{label}=size:{int(class_sizes[class_idx])} "
+            f"acc:{float(class_accuracy[class_idx]):.4f} "
+            f"pred:{int((predictions == class_idx).sum().item())}"
+        )
+        _print_k_factor_group_diagnostics(
+            f"strong_k_head_decoded_{label}",
+            decoded_predictions,
+            raw_k_targets,
+            class_mask,
+        )
+    _print_strong_k_hybrid_metrics(
+        valid_logits=valid_logits,
+        valid_positions=valid_positions,
+        decoded_predictions=decoded_predictions,
+        regression_predictions=raw_regression_predictions,
+        targets=raw_k_targets,
+        target_labels=valid_target_labels,
+    )
+
+
+def _print_strong_k_hybrid_metrics(
+    valid_logits: torch.Tensor,
+    valid_positions: torch.Tensor,
+    decoded_predictions: torch.Tensor,
+    regression_predictions: torch.Tensor,
+    targets: torch.Tensor,
+    target_labels: torch.Tensor,
+) -> None:
+    very_high_idx = K_FACTOR_STRONG_BIN_LABELS.index("very_high")
+    probabilities = valid_logits.softmax(dim=1)
+    very_high_probabilities = probabilities[:, very_high_idx]
+    predicted_labels = valid_logits.argmax(dim=1)
+    argmax_gate = predicted_labels == very_high_idx
+    force_very_high_predictions = 45.0 + valid_positions.clamp(0.0, 1.0) * 25.0
+    _print_single_strong_k_hybrid_metrics(
+        "strong_k_hybrid_argmax_vhigh",
+        gate=argmax_gate,
+        decoded_predictions=decoded_predictions,
+        regression_predictions=regression_predictions,
+        targets=targets,
+        target_labels=target_labels,
+    )
+    for threshold in (0.20, 0.30, 0.40, 0.50):
+        gate = argmax_gate | (very_high_probabilities >= threshold)
+        prefix = f"strong_k_hybrid_vhigh_p{int(threshold * 100):02d}"
+        _print_single_strong_k_hybrid_metrics(
+            prefix,
+            gate=gate,
+            decoded_predictions=decoded_predictions,
+            regression_predictions=regression_predictions,
+            targets=targets,
+            target_labels=target_labels,
+        )
+    for probability_threshold in (0.20, 0.30):
+        for regression_threshold in (35.0, 40.0, 45.0):
+            gate = (very_high_probabilities >= probability_threshold) & (
+                regression_predictions >= regression_threshold
+            )
+            _print_single_strong_k_hybrid_metrics(
+                (
+                    f"strong_k_hybrid_force_vhigh_p{int(probability_threshold * 100):02d}"
+                    f"_reg{int(regression_threshold)}"
+                ),
+                gate=gate,
+                decoded_predictions=force_very_high_predictions,
+                regression_predictions=regression_predictions,
+                targets=targets,
+                target_labels=target_labels,
+            )
+
+def _print_single_strong_k_hybrid_metrics(
+    prefix: str,
+    gate: torch.Tensor,
+    decoded_predictions: torch.Tensor,
+    regression_predictions: torch.Tensor,
+    targets: torch.Tensor,
+    target_labels: torch.Tensor,
+) -> None:
+    hybrid_predictions = torch.where(
+        gate,
+        torch.maximum(regression_predictions, decoded_predictions),
+        regression_predictions,
+    )
+    errors = hybrid_predictions - targets
+    very_high_idx = K_FACTOR_STRONG_BIN_LABELS.index("very_high")
+    true_very_high = target_labels == very_high_idx
+    gate_count = int(gate.sum().item())
+    print(f"{prefix}_gate_count={gate_count}")
+    print(f"{prefix}_gate_fraction={float(gate.float().mean()):.4f}")
+    if bool(true_very_high.any()):
+        print(f"{prefix}_very_high_recall={float(gate[true_very_high].float().mean()):.4f}")
+    else:
+        print(f"{prefix}_very_high_recall=nan")
+    if gate_count > 0:
+        print(f"{prefix}_very_high_precision={float(true_very_high[gate].float().mean()):.4f}")
+    else:
+        print(f"{prefix}_very_high_precision=nan")
+    print(f"{prefix}_MAE={float(errors.abs().mean()):.4f}")
+    print(f"{prefix}_accuracy@3={float((errors.abs() <= 3.0).float().mean()):.4f}")
+    print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
+    print(f"{prefix}_pearson={_safe_pearson(hybrid_predictions, targets):.4f}")
+    print(
+        f"{prefix}_pred_range="
+        f"{float(hybrid_predictions.min()):.4f},{float(hybrid_predictions.max()):.4f}"
+    )
+    for class_idx, label in enumerate(K_FACTOR_STRONG_BIN_LABELS):
+        _print_k_factor_group_diagnostics(
+            f"{prefix}_{label}",
+            hybrid_predictions,
+            targets,
+            target_labels == class_idx,
+        )
+
+
+def _print_k_factor_diagnostics(
+    physics_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+) -> None:
+    k_idx = _physics_target_index("k_factor_db")
+    mask = physics_masks[:, k_idx]
+    if not bool(mask.any()):
+        print("strong_k_MAE=nan")
+        return
+
+    raw_predictions = _physics_raw_predictions(physics_predictions)
+    predictions = raw_predictions[:, k_idx][mask]
+    targets = physics_raw_targets[:, k_idx][mask]
+    valid_indices = torch.nonzero(mask, as_tuple=False).squeeze(1).tolist()
+
+    strong_mask = torch.tensor(
+        [semantic_keys[idx].k_factor_bin == "strong" for idx in valid_indices],
+        dtype=torch.bool,
+        device=predictions.device,
+    )
+    if bool(strong_mask.any()):
+        print(f"strong_k_MAE={float((predictions[strong_mask] - targets[strong_mask]).abs().mean()):.4f}")
+    else:
+        print("strong_k_MAE=nan")
+
+
+def _print_k_factor_group_diagnostics(
+    prefix: str,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    count = int(mask.sum().item())
+    print(f"{prefix}_count={count}")
+    if count == 0:
+        print(f"{prefix}_MAE=nan")
+        print(f"{prefix}_accuracy@3=nan")
+        print(f"{prefix}_signed_mean=nan")
+        print(f"{prefix}_pearson=nan")
+        print(f"{prefix}_target_range=nan,nan")
+        print(f"{prefix}_pred_range=nan,nan")
+        return
+    group_predictions = predictions[mask]
+    group_targets = targets[mask]
+    group_errors = group_predictions - group_targets
+    group_abs_errors = group_errors.abs()
+    print(f"{prefix}_MAE={float(group_abs_errors.mean()):.4f}")
+    print(f"{prefix}_accuracy@3={float((group_abs_errors <= 3.0).float().mean()):.4f}")
+    print(f"{prefix}_signed_mean={float(group_errors.mean()):.4f}")
+    print(f"{prefix}_pearson={_safe_pearson(group_predictions, group_targets):.4f}")
+    print(
+        f"{prefix}_target_range="
+        f"{float(group_targets.min()):.4f},{float(group_targets.max()):.4f}"
+    )
+    print(
+        f"{prefix}_pred_range="
+        f"{float(group_predictions.min()):.4f},{float(group_predictions.max()):.4f}"
+    )
 
 
 def _print_structured_physical_description_metrics(
@@ -1573,86 +1678,11 @@ def _print_structured_physical_description_metrics(
         )
 
 
-def _print_scalar_error_distribution(
-    prefix: str,
-    predictions: torch.Tensor,
-    targets: torch.Tensor,
-) -> None:
-    errors = predictions - targets
-    abs_errors = errors.abs()
-    quantiles = torch.tensor(
-        [0.05, 0.25, 0.50, 0.75, 0.95],
-        dtype=errors.dtype,
-        device=errors.device,
-    )
-    error_quantiles = torch.quantile(errors, quantiles)
-    abs_error_quantiles = torch.quantile(abs_errors, quantiles)
-    print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
-    print(f"{prefix}_signed_std={float(errors.std(correction=0)): .4f}".replace(" ", ""))
-    print(
-        f"{prefix}_signed_quantiles="
-        f"p05:{float(error_quantiles[0]):.4f},"
-        f"p25:{float(error_quantiles[1]):.4f},"
-        f"p50:{float(error_quantiles[2]):.4f},"
-        f"p75:{float(error_quantiles[3]):.4f},"
-        f"p95:{float(error_quantiles[4]):.4f}"
-    )
-    print(
-        f"{prefix}_abs_quantiles="
-        f"p05:{float(abs_error_quantiles[0]):.4f},"
-        f"p25:{float(abs_error_quantiles[1]):.4f},"
-        f"p50:{float(abs_error_quantiles[2]):.4f},"
-        f"p75:{float(abs_error_quantiles[3]):.4f},"
-        f"p95:{float(abs_error_quantiles[4]):.4f}"
-    )
-    print(f"{prefix}_overpredict_fraction={float((errors > 0).float().mean()):.4f}")
-    print(f"{prefix}_underpredict_fraction={float((errors < 0).float().mean()):.4f}")
-    print(f"{prefix}_abs_error_le_1db={float((abs_errors <= 1.0).float().mean()):.4f}")
-    print(f"{prefix}_abs_error_le_3db={float((abs_errors <= 3.0).float().mean()):.4f}")
-    print(f"{prefix}_abs_error_gt_6db={float((abs_errors > 6.0).float().mean()):.4f}")
-
-
-def _print_binned_scalar_error_distribution(
-    prefix: str,
-    predictions: torch.Tensor,
-    targets: torch.Tensor,
-) -> None:
-    quantiles = torch.tensor(
-        [0.50, 0.75, 0.95],
-        dtype=targets.dtype,
-        device=targets.device,
-    )
-    for label, lower, upper in FIRST_PATH_POWER_BINS:
-        mask = (targets >= lower) & (targets < upper)
-        count = int(mask.sum().item())
-        print(f"{prefix}_{label}_count={count}")
-        if count == 0:
-            print(f"{prefix}_{label}_MAE=nan")
-            print(f"{prefix}_{label}_signed_mean=nan")
-            print(f"{prefix}_{label}_abs_p50=nan")
-            print(f"{prefix}_{label}_abs_p75=nan")
-            print(f"{prefix}_{label}_abs_p95=nan")
-            print(f"{prefix}_{label}_abs_error_le_3db=nan")
-            print(f"{prefix}_{label}_abs_error_gt_6db=nan")
-            continue
-        errors = predictions[mask] - targets[mask]
-        abs_errors = errors.abs()
-        abs_error_quantiles = torch.quantile(abs_errors, quantiles)
-        print(f"{prefix}_{label}_MAE={float(abs_errors.mean()):.4f}")
-        print(f"{prefix}_{label}_signed_mean={float(errors.mean()):.4f}")
-        print(f"{prefix}_{label}_abs_p50={float(abs_error_quantiles[0]):.4f}")
-        print(f"{prefix}_{label}_abs_p75={float(abs_error_quantiles[1]):.4f}")
-        print(f"{prefix}_{label}_abs_p95={float(abs_error_quantiles[2]):.4f}")
-        print(f"{prefix}_{label}_abs_error_le_3db={float((abs_errors <= 3.0).float().mean()):.4f}")
-        print(f"{prefix}_{label}_abs_error_gt_6db={float((abs_errors > 6.0).float().mean()):.4f}")
-
-
 def _print_first_path_power_diagnostics(
     base_physics_predictions: torch.Tensor,
     physics_predictions: torch.Tensor,
     enhanced_first_path_power_predictions: torch.Tensor,
     physics_raw_targets: torch.Tensor,
-    physics_targets: torch.Tensor,
     physics_masks: torch.Tensor,
 ) -> None:
     first_path_power_idx = _physics_target_index("first_path_power_dbw")
@@ -1661,11 +1691,6 @@ def _print_first_path_power_diagnostics(
         print("base_first_power_MAE=nan")
         print("enhanced_first_power_MAE=nan")
         print("final_first_power_MAE=nan")
-        print("enhanced_first_power_norm_MAE=nan")
-        print("enhanced_first_power_norm_range=nan,nan")
-        print("enhanced_first_power_dbw_range=nan,nan")
-        print("target_first_power_norm_range=nan,nan")
-        print("target_first_power_dbw_range=nan,nan")
         return
 
     base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
@@ -1677,61 +1702,44 @@ def _print_first_path_power_diagnostics(
 
     masked_base_raw = base_physics_raw_predictions[first_path_power_mask, first_path_power_idx]
     masked_final_raw = final_physics_raw_predictions[first_path_power_mask, first_path_power_idx]
-    masked_enhanced_norm = enhanced_first_path_power_predictions[first_path_power_mask]
     masked_enhanced_raw = enhanced_raw_predictions[first_path_power_mask]
-    masked_target_norm = physics_targets[first_path_power_mask, first_path_power_idx]
     masked_target_raw = physics_raw_targets[first_path_power_mask, first_path_power_idx]
 
     print(f"base_first_power_MAE={float((masked_base_raw - masked_target_raw).abs().mean()):.4f}")
     print(f"enhanced_first_power_MAE={float((masked_enhanced_raw - masked_target_raw).abs().mean()):.4f}")
     print(f"final_first_power_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
-    print(f"enhanced_first_power_norm_MAE={float((masked_enhanced_norm - masked_target_norm).abs().mean()):.4f}")
-    print(
-        "enhanced_first_power_norm_range="
-        f"{float(masked_enhanced_norm.min()):.4f},{float(masked_enhanced_norm.max()):.4f}"
+
+
+def _print_delay_spread_diagnostics(
+    base_physics_predictions: torch.Tensor,
+    physics_predictions: torch.Tensor,
+    enhanced_delay_spread_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+) -> None:
+    delay_spread_idx = _physics_target_index("delay_spread_ns")
+    delay_spread_mask = physics_masks[:, delay_spread_idx]
+    if not bool(delay_spread_mask.any()):
+        print("base_delay_spread_MAE=nan")
+        print("enhanced_delay_spread_MAE=nan")
+        print("final_delay_spread_MAE=nan")
+        return
+
+    base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
+    final_physics_raw_predictions = _physics_raw_predictions(physics_predictions)
+    enhanced_raw_predictions = (
+        enhanced_delay_spread_predictions * PHYSICS_TARGET_SCALES[delay_spread_idx]
+        + PHYSICS_TARGET_OFFSETS[delay_spread_idx]
     )
-    print(
-        "enhanced_first_power_dbw_range="
-        f"{float(masked_enhanced_raw.min()):.4f},{float(masked_enhanced_raw.max()):.4f}"
-    )
-    print(
-        "target_first_power_norm_range="
-        f"{float(masked_target_norm.min()):.4f},{float(masked_target_norm.max()):.4f}"
-    )
-    print(
-        "target_first_power_dbw_range="
-        f"{float(masked_target_raw.min()):.4f},{float(masked_target_raw.max()):.4f}"
-    )
-    _print_scalar_error_distribution(
-        "base_first_power_error_dbw",
-        masked_base_raw,
-        masked_target_raw,
-    )
-    _print_scalar_error_distribution(
-        "enhanced_first_power_error_dbw",
-        masked_enhanced_raw,
-        masked_target_raw,
-    )
-    _print_scalar_error_distribution(
-        "final_first_power_error_dbw",
-        masked_final_raw,
-        masked_target_raw,
-    )
-    _print_binned_scalar_error_distribution(
-        "base_first_power_error_dbw",
-        masked_base_raw,
-        masked_target_raw,
-    )
-    _print_binned_scalar_error_distribution(
-        "enhanced_first_power_error_dbw",
-        masked_enhanced_raw,
-        masked_target_raw,
-    )
-    _print_binned_scalar_error_distribution(
-        "final_first_power_error_dbw",
-        masked_final_raw,
-        masked_target_raw,
-    )
+
+    masked_base_raw = base_physics_raw_predictions[delay_spread_mask, delay_spread_idx]
+    masked_final_raw = final_physics_raw_predictions[delay_spread_mask, delay_spread_idx]
+    masked_enhanced_raw = enhanced_raw_predictions[delay_spread_mask]
+    masked_target_raw = physics_raw_targets[delay_spread_mask, delay_spread_idx]
+
+    print(f"base_delay_spread_MAE={float((masked_base_raw - masked_target_raw).abs().mean()):.4f}")
+    print(f"enhanced_delay_spread_MAE={float((masked_enhanced_raw - masked_target_raw).abs().mean()):.4f}")
+    print(f"final_delay_spread_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
 
 
 def main() -> None:
