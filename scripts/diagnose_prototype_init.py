@@ -82,20 +82,6 @@ def prototype_alignment_artifacts(
     return metrics, artifacts
 
 
-@torch.no_grad()
-def prototype_alignment_metrics(
-    model,
-    prototype_token_ids: torch.Tensor,
-    prototype_token_mask: torch.Tensor,
-) -> dict[str, float]:
-    metrics, _ = prototype_alignment_artifacts(
-        model,
-        prototype_token_ids,
-        prototype_token_mask,
-    )
-    return metrics
-
-
 def print_metrics(prefix: str, metrics: dict[str, float]) -> None:
     for key, value in metrics.items():
         print(f"{prefix}_{key}={value:.6f}")

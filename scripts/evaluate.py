@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections import Counter
 from functools import partial
@@ -34,7 +35,12 @@ from data.semantic_key import (
 )
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
-from models.model import CSIClip, K_FACTOR_STRONG_BIN_LABELS
+from models.model import (
+    CSIClip,
+    CSI_DELAY_CONTEXT_DIM,
+    DELAY_SPREAD_BIN_LABELS,
+    DELAY_SPREAD_POSITION_BINS,
+)
 from models.text_encoder import PhysicsTextEncoder
 from scripts.pretrain import assert_checkpoint_prototype_compatibility, deserialize_prototype_keys
 from training.losses import cosine_alignment_loss, paired_contrastive_loss
@@ -56,6 +62,20 @@ STRONG_K_FACTOR_DIAGNOSTIC_BINS = (
     ("mid", 15.0, 30.0),
     ("high", 30.0, 45.0),
     ("very_high", 45.0, 70.0),
+)
+
+DELAY_SPREAD_DIAGNOSTIC_BINS = (
+    ("0_25", 0.0, 25.0),
+    ("25_50", 25.0, 50.0),
+    ("50_100", 50.0, 100.0),
+    ("100_200", 100.0, 200.0),
+    ("200_400", 200.0, 400.0),
+    ("400_plus", 400.0, float("inf")),
+)
+
+DELAY_SPREAD_BIN_DECODE_BINS = (
+    *DELAY_SPREAD_POSITION_BINS,
+    ("400_plus", 400.0, 600.0),
 )
 
 
@@ -203,8 +223,98 @@ def _infer_use_power_branch(checkpoint: dict | None, override: bool | None) -> b
 
 def _infer_use_delay_spread_head(checkpoint: dict | None) -> bool:
     if checkpoint is not None:
-        return float(checkpoint.get("args", {}).get("delay_spread_weight", 0.0)) > 0.0
+        csi_delay_input_weight = checkpoint.get("model_state", {}).get(
+            "csi_delay_spread_head.1.weight"
+        )
+        context_delay_weight = checkpoint.get("model_state", {}).get(
+            "delay_spread_context_head.3.weight"
+        )
+        context_delay_input_weight = checkpoint.get("model_state", {}).get(
+            "delay_spread_context_head.1.weight"
+        )
+        has_compatible_csi_delay_head = (
+            isinstance(csi_delay_input_weight, torch.Tensor)
+            and csi_delay_input_weight.ndim == 2
+            and csi_delay_input_weight.shape[1] == 256
+        )
+        has_compatible_context_delay_head = (
+            isinstance(context_delay_weight, torch.Tensor)
+            and context_delay_weight.ndim == 2
+            and context_delay_weight.shape[0] == 1
+            and isinstance(context_delay_input_weight, torch.Tensor)
+            and context_delay_input_weight.ndim == 2
+            and context_delay_input_weight.shape[1] == 256 + CSI_DELAY_CONTEXT_DIM
+        )
+        return (
+            float(checkpoint.get("args", {}).get("delay_spread_weight", 0.0)) > 0.0
+            and has_compatible_csi_delay_head
+            and has_compatible_context_delay_head
+        )
     return False
+
+
+def _infer_use_delay_spread_bin_head(checkpoint: dict | None) -> bool:
+    if checkpoint is not None:
+        classifier_weight = checkpoint.get("model_state", {}).get(
+            "delay_spread_bin_classifier.3.weight"
+        )
+        classifier_input_weight = checkpoint.get("model_state", {}).get(
+            "delay_spread_bin_classifier.1.weight"
+        )
+        position_weight = checkpoint.get("model_state", {}).get(
+            "delay_spread_bin_position_head.3.weight"
+        )
+        position_input_weight = checkpoint.get("model_state", {}).get(
+            "delay_spread_bin_position_head.1.weight"
+        )
+        has_compatible_bin_head = (
+            isinstance(classifier_weight, torch.Tensor)
+            and classifier_weight.ndim == 2
+            and classifier_weight.shape[0] == len(DELAY_SPREAD_BIN_LABELS)
+            and isinstance(classifier_input_weight, torch.Tensor)
+            and classifier_input_weight.ndim == 2
+            and classifier_input_weight.shape[1] == 256 + CSI_DELAY_CONTEXT_DIM
+            and isinstance(position_weight, torch.Tensor)
+            and position_weight.ndim == 2
+            and position_weight.shape[0] == 1
+            and isinstance(position_input_weight, torch.Tensor)
+            and position_input_weight.ndim == 2
+            and position_input_weight.shape[1] == 256 + CSI_DELAY_CONTEXT_DIM
+        )
+        args = checkpoint.get("args", {})
+        return (
+            (
+                float(args.get("delay_spread_bin_classifier_weight", 0.0)) > 0.0
+                or float(args.get("delay_spread_bin_position_weight", 0.0)) > 0.0
+            )
+            and has_compatible_bin_head
+        )
+    return False
+
+
+def _infer_use_delay_specific_encoder(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    args = checkpoint.get("args", {})
+    if "use_delay_specific_encoder" in args:
+        return bool(args.get("use_delay_specific_encoder", False))
+    model_state = checkpoint.get("model_state", {})
+    return any(
+        key.startswith("csi_delay_context_encoder.initial_conv.")
+        or key.startswith("csi_delay_context_encoder.multi_scale_convs.")
+        for key in model_state
+    )
+
+
+def _checkpoint_has_delay_family_heads(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    model_state = checkpoint.get("model_state", {})
+    return any(
+        key.startswith("first_path_delay_context_head.")
+        or key.startswith("los_delay_context_head.")
+        for key in model_state
+    )
 
 
 def _infer_limit_samples(checkpoint: dict | None, override: int | None) -> int | None:
@@ -233,6 +343,53 @@ def _infer_limit_samples_per_attribute_value(checkpoint: dict | None, override: 
         if value is not None:
             return int(value)
     return None
+
+
+def _infer_max_delay_spread_ns(checkpoint: dict | None, override: float | None) -> float | None:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        value = checkpoint.get("args", {}).get("max_delay_spread_ns")
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _sample_delay_spread_ns(sample) -> float:
+    scale = 1.0
+    if hasattr(sample, "delay_spread_ns"):
+        value = getattr(sample, "delay_spread_ns")
+    elif hasattr(sample, "delay_spread_s"):
+        value = getattr(sample, "delay_spread_s")
+        scale = 1e9
+    elif hasattr(sample, "delay_spread"):
+        value = getattr(sample, "delay_spread")
+        scale = 1e9
+    else:
+        return math.nan
+    try:
+        value = float(value) * scale
+    except (TypeError, ValueError):
+        return math.nan
+    return value if math.isfinite(value) else math.nan
+
+
+def filter_samples_by_max_delay_spread(samples, max_delay_spread_ns: float | None):
+    if max_delay_spread_ns is None:
+        return samples
+    if max_delay_spread_ns <= 0.0:
+        raise ValueError("max_delay_spread_ns must be positive.")
+    filtered = []
+    for sample in samples:
+        delay_spread_ns = _sample_delay_spread_ns(sample)
+        if math.isfinite(delay_spread_ns) and delay_spread_ns < max_delay_spread_ns:
+            filtered.append(sample)
+    if not filtered:
+        raise ValueError(
+            "No samples remain after applying "
+            f"max_delay_spread_ns={max_delay_spread_ns}."
+        )
+    return filtered
 
 
 def parse_attribute_value_filters(value) -> dict[str, tuple[str, ...]]:
@@ -496,6 +653,7 @@ def evaluate(
     limit_samples_override: int | None = None,
     limit_samples_by_attribute_override: str | None = None,
     limit_samples_per_attribute_value_override: int | None = None,
+    max_delay_spread_ns_override: float | None = None,
     attribute_binary_thresholds: dict[str, float] | None = None,
     physical_caption_examples: int = 3,
 ) -> None:
@@ -507,6 +665,9 @@ def evaluate(
     token_norm_mode = _infer_token_norm_mode(checkpoint, token_norm_mode_override)
     use_power_branch = _infer_use_power_branch(checkpoint, use_power_branch_override)
     use_delay_spread_head = _infer_use_delay_spread_head(checkpoint)
+    use_delay_spread_bin_head = _infer_use_delay_spread_bin_head(checkpoint)
+    use_delay_specific_encoder = _infer_use_delay_specific_encoder(checkpoint)
+    delay_family_heads_enabled = _checkpoint_has_delay_family_heads(checkpoint)
     attribute_fields = _infer_attribute_fields(checkpoint, attribute_fields_override)
     attribute_remap = _infer_attribute_remap(checkpoint)
     filter_attribute_values = _infer_filter_attribute_values(
@@ -525,6 +686,10 @@ def evaluate(
     limit_samples_per_attribute_value = _infer_limit_samples_per_attribute_value(
         checkpoint,
         limit_samples_per_attribute_value_override,
+    )
+    max_delay_spread_ns = _infer_max_delay_spread_ns(
+        checkpoint,
+        max_delay_spread_ns_override,
     )
     mode_samples = apply_semantic_key_mode(dataset.samples, semantic_key_mode)
     if semantic_key_mode != "full":
@@ -567,6 +732,19 @@ def evaluate(
             f"value_counts={value_count_text}"
         )
     samples = value_filtered_samples
+    delay_filtered_samples = filter_samples_by_max_delay_spread(
+        samples,
+        max_delay_spread_ns,
+    )
+    if len(delay_filtered_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in delay_filtered_samples)
+        print(
+            f"filtered samples by max_delay_spread_ns={max_delay_spread_ns}: "
+            f"samples {len(samples)} -> {len(delay_filtered_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
+    samples = delay_filtered_samples
     balanced_limited_samples = limit_samples_by_attribute_value_for_debug(
         samples,
         limit_samples_by_attribute,
@@ -641,6 +819,7 @@ def evaluate(
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
         use_power_branch=use_power_branch,
         use_delay_spread_head=use_delay_spread_head,
+        use_delay_specific_encoder=use_delay_specific_encoder,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -663,12 +842,22 @@ def evaluate(
     all_physics_predictions = []
     all_base_physics_predictions = []
     all_enhanced_first_path_power_predictions = []
+    all_csi_delay_spread_predictions = []
     all_enhanced_delay_spread_predictions = []
+    all_profile_delay_spread_predictions = []
+    all_profile_direct_delay_spread_predictions = []
+    all_delay_spread_context_predictions = []
+    all_first_path_delay_context_predictions = []
+    all_los_delay_context_predictions = []
+    all_delay_spread_bin_logits = []
+    all_delay_spread_bin_positions = []
     all_strong_k_bin_logits = []
     all_strong_k_positions = []
     all_physics_targets = []
     all_physics_raw_targets = []
     all_physics_masks = []
+    all_los_delay_raw_targets = []
+    all_los_delay_masks = []
     all_labels = []
     all_text_labels = []
     all_semantic_keys = []
@@ -701,6 +890,13 @@ def evaluate(
                     for key in batch["semantic_keys"]
                 )
         power_context = None
+        delay_context = None
+        if hasattr(model, "encode_csi_delay_context"):
+            delay_context = model.encode_csi_delay_context(
+                batch["tokens"],
+                batch["token_mask"],
+                subcarrier_spacing=batch.get("subcarrier_spacing"),
+            )
         if use_power_branch:
             power_context = model.encode_power_context(
                 batch["tokens"],
@@ -711,14 +907,39 @@ def evaluate(
         physics_outputs = model.predict_physics_components(
             csi_features_raw,
             power_context=power_context,
+            delay_context=delay_context,
         )
         physics_predictions = physics_outputs["final"]
         all_base_physics_predictions.append(physics_outputs["base"].cpu())
         all_enhanced_first_path_power_predictions.append(
             physics_outputs["enhanced_first_path_power"].cpu()
         )
+        all_csi_delay_spread_predictions.append(
+            physics_outputs["csi_delay_spread"].cpu()
+        )
         all_enhanced_delay_spread_predictions.append(
             physics_outputs["enhanced_delay_spread"].cpu()
+        )
+        all_profile_delay_spread_predictions.append(
+            physics_outputs["profile_delay_spread"].cpu()
+        )
+        all_profile_direct_delay_spread_predictions.append(
+            physics_outputs["profile_direct_delay_spread"].cpu()
+        )
+        all_delay_spread_context_predictions.append(
+            physics_outputs["delay_spread_context"].cpu()
+        )
+        all_first_path_delay_context_predictions.append(
+            physics_outputs["first_path_delay_context"].cpu()
+        )
+        all_los_delay_context_predictions.append(
+            physics_outputs["los_delay_context"].cpu()
+        )
+        all_delay_spread_bin_logits.append(
+            physics_outputs["delay_spread_bin_logits"].cpu()
+        )
+        all_delay_spread_bin_positions.append(
+            physics_outputs["delay_spread_bin_position"].cpu()
         )
         all_strong_k_bin_logits.append(physics_outputs["k_factor_strong_bin_logits"].cpu())
         all_strong_k_positions.append(physics_outputs["k_factor_strong_position"].cpu())
@@ -726,6 +947,8 @@ def evaluate(
         all_physics_targets.append(batch["physics_targets"].cpu())
         all_physics_raw_targets.append(batch["physics_raw_targets"].cpu())
         all_physics_masks.append(batch["physics_target_mask"].cpu())
+        all_los_delay_raw_targets.append(batch["los_delay_raw_target"].cpu())
+        all_los_delay_masks.append(batch["los_delay_target_mask"].cpu())
         all_semantic_keys.extend(batch["semantic_keys"])
         if text_mode in ("instance", "multipositive"):
             instance_text_features = model.encode_text(
@@ -758,12 +981,39 @@ def evaluate(
     physics_predictions = torch.cat(all_physics_predictions, dim=0)
     base_physics_predictions = torch.cat(all_base_physics_predictions, dim=0)
     enhanced_first_path_power_predictions = torch.cat(all_enhanced_first_path_power_predictions, dim=0)
+    csi_delay_spread_predictions = torch.cat(all_csi_delay_spread_predictions, dim=0)
     enhanced_delay_spread_predictions = torch.cat(all_enhanced_delay_spread_predictions, dim=0)
+    if not use_delay_spread_head:
+        csi_delay_spread_predictions = torch.full_like(
+            enhanced_delay_spread_predictions,
+            float("nan"),
+        )
+    profile_delay_spread_predictions = torch.cat(all_profile_delay_spread_predictions, dim=0)
+    profile_direct_delay_spread_predictions = torch.cat(
+        all_profile_direct_delay_spread_predictions,
+        dim=0,
+    )
+    delay_spread_context_predictions = torch.cat(
+        all_delay_spread_context_predictions,
+        dim=0,
+    )
+    first_path_delay_context_predictions = torch.cat(
+        all_first_path_delay_context_predictions,
+        dim=0,
+    )
+    los_delay_context_predictions = torch.cat(
+        all_los_delay_context_predictions,
+        dim=0,
+    )
+    delay_spread_bin_logits = torch.cat(all_delay_spread_bin_logits, dim=0)
+    delay_spread_bin_positions = torch.cat(all_delay_spread_bin_positions, dim=0)
     strong_k_bin_logits = torch.cat(all_strong_k_bin_logits, dim=0)
     strong_k_positions = torch.cat(all_strong_k_positions, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
     physics_masks = torch.cat(all_physics_masks, dim=0)
+    los_delay_raw_targets = torch.cat(all_los_delay_raw_targets, dim=0)
+    los_delay_masks = torch.cat(all_los_delay_masks, dim=0)
     labels = torch.tensor(all_labels, dtype=torch.long)
     logit_scale = float(model.logit_scale.exp().detach().cpu().item())
     prototype_logits = logit_scale * csi_features @ prototype_features.T
@@ -808,12 +1058,16 @@ def evaluate(
     print(f"token_norm_mode={token_norm_mode}")
     print(f"use_power_branch={use_power_branch}")
     print(f"use_delay_spread_head={use_delay_spread_head}")
+    print(f"use_delay_specific_encoder={use_delay_specific_encoder}")
+    print(f"use_delay_family_heads={delay_family_heads_enabled}")
+    print(f"use_delay_spread_bin_head={use_delay_spread_bin_head}")
     print(f"min_class_size={min_class_size}")
     print(f"attribute_remap={format_attribute_remap(attribute_remap)}")
     print(f"filter_attribute_values={format_attribute_value_filters(filter_attribute_values)}")
     print(f"limit_samples={limit_samples}")
     print(f"limit_samples_by_attribute={limit_samples_by_attribute}")
     print(f"limit_samples_per_attribute_value={limit_samples_per_attribute_value}")
+    print(f"max_delay_spread_ns={max_delay_spread_ns}")
     print(f"semantic_prototypes={len(prototype_keys)}")
     if semantic_classifier_enabled and semantic_logits is not None:
         _print_semantic_classifier_metrics(semantic_logits, labels, prototype_keys)
@@ -853,10 +1107,26 @@ def evaluate(
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
     )
+    if delay_family_heads_enabled:
+        _print_delay_family_diagnostics(
+            first_path_delay_predictions=first_path_delay_context_predictions,
+            los_delay_predictions=los_delay_context_predictions,
+            physics_raw_targets=physics_raw_targets,
+            physics_masks=physics_masks,
+            los_delay_raw_targets=los_delay_raw_targets,
+            los_delay_masks=los_delay_masks,
+            semantic_keys=all_semantic_keys,
+        )
     _print_delay_spread_diagnostics(
         base_physics_predictions=base_physics_predictions,
         physics_predictions=physics_predictions,
+        csi_delay_spread_predictions=csi_delay_spread_predictions,
         enhanced_delay_spread_predictions=enhanced_delay_spread_predictions,
+        profile_delay_spread_predictions=profile_delay_spread_predictions,
+        profile_direct_delay_spread_predictions=profile_direct_delay_spread_predictions,
+        delay_spread_context_predictions=delay_spread_context_predictions if use_delay_spread_head else None,
+        delay_spread_bin_logits=delay_spread_bin_logits if use_delay_spread_bin_head else None,
+        delay_spread_bin_positions=delay_spread_bin_positions if use_delay_spread_bin_head else None,
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
     )
@@ -1344,189 +1614,6 @@ def _decode_strong_k(bin_labels: torch.Tensor, positions: torch.Tensor) -> torch
     return lowers[bin_labels] + positions.clamp(0.0, 1.0) * widths[bin_labels]
 
 
-def _print_strong_k_factor_head_metrics(
-    strong_k_bin_logits: torch.Tensor,
-    strong_k_positions: torch.Tensor,
-    physics_predictions: torch.Tensor,
-    physics_raw_targets: torch.Tensor,
-    physics_masks: torch.Tensor,
-    semantic_keys: list[SemanticKey],
-) -> None:
-    target_labels, target_positions, mask = _strong_k_targets(
-        physics_raw_targets,
-        physics_masks,
-        semantic_keys,
-    )
-    count = int(mask.sum().item())
-    print(f"strong_k_head_valid_count={count}")
-    print(f"strong_k_head_label_order={','.join(K_FACTOR_STRONG_BIN_LABELS)}")
-    if count == 0:
-        print("strong_k_head_bin_loss=nan")
-        print("strong_k_head_bin_top1=nan")
-        print("strong_k_head_position_MAE=nan")
-        print("strong_k_head_decoded_MAE=nan")
-        return
-
-    valid_logits = strong_k_bin_logits[mask]
-    valid_target_labels = target_labels[mask]
-    valid_positions = strong_k_positions[mask]
-    valid_target_positions = target_positions[mask]
-    predictions = valid_logits.argmax(dim=1)
-    num_classes = len(K_FACTOR_STRONG_BIN_LABELS)
-    confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
-    for true_label, pred_label in zip(valid_target_labels.tolist(), predictions.tolist()):
-        confusion[int(true_label), int(pred_label)] += 1
-
-    class_sizes = confusion.sum(dim=1)
-    class_correct = confusion.diag()
-    nonempty = class_sizes > 0
-    class_accuracy = torch.zeros(num_classes, dtype=torch.float32)
-    class_accuracy[nonempty] = class_correct[nonempty].float() / class_sizes[nonempty].float()
-    top1 = (predictions == valid_target_labels).float().mean()
-    macro_top1 = class_accuracy[nonempty].mean() if bool(nonempty.any()) else torch.zeros(())
-    decoded_predictions = _decode_strong_k(predictions, valid_positions)
-    oracle_bin_decoded_predictions = _decode_strong_k(valid_target_labels, valid_positions)
-    raw_regression_predictions = _physics_raw_predictions(physics_predictions)[
-        :, _physics_target_index("k_factor_db")
-    ][mask]
-    raw_k_targets = physics_raw_targets[:, _physics_target_index("k_factor_db")][mask]
-    decoded_errors = decoded_predictions - raw_k_targets
-    oracle_bin_decoded_errors = oracle_bin_decoded_predictions - raw_k_targets
-
-    print(f"strong_k_head_bin_loss={float(F.cross_entropy(valid_logits, valid_target_labels)):.4f}")
-    print(f"strong_k_head_bin_top1={float(top1):.4f}")
-    print(f"strong_k_head_bin_macro_top1={float(macro_top1):.4f}")
-    print(f"strong_k_head_position_MAE={float((valid_positions - valid_target_positions).abs().mean()):.4f}")
-    print(f"strong_k_head_decoded_MAE={float(decoded_errors.abs().mean()):.4f}")
-    print(f"strong_k_head_decoded_accuracy@3={float((decoded_errors.abs() <= 3.0).float().mean()):.4f}")
-    print(f"strong_k_head_decoded_signed_mean={float(decoded_errors.mean()):.4f}")
-    print(f"strong_k_head_decoded_pearson={_safe_pearson(decoded_predictions, raw_k_targets):.4f}")
-    print(f"strong_k_head_oracle_bin_decoded_MAE={float(oracle_bin_decoded_errors.abs().mean()):.4f}")
-    print(
-        f"strong_k_head_decoded_pred_range="
-        f"{float(decoded_predictions.min()):.4f},{float(decoded_predictions.max()):.4f}"
-    )
-    print(
-        f"strong_k_head_decoded_target_range="
-        f"{float(raw_k_targets.min()):.4f},{float(raw_k_targets.max()):.4f}"
-    )
-    for class_idx, label in enumerate(K_FACTOR_STRONG_BIN_LABELS):
-        class_mask = valid_target_labels == class_idx
-        print(
-            f"strong_k_head_bin_{label}=size:{int(class_sizes[class_idx])} "
-            f"acc:{float(class_accuracy[class_idx]):.4f} "
-            f"pred:{int((predictions == class_idx).sum().item())}"
-        )
-        _print_k_factor_group_diagnostics(
-            f"strong_k_head_decoded_{label}",
-            decoded_predictions,
-            raw_k_targets,
-            class_mask,
-        )
-    _print_strong_k_hybrid_metrics(
-        valid_logits=valid_logits,
-        valid_positions=valid_positions,
-        decoded_predictions=decoded_predictions,
-        regression_predictions=raw_regression_predictions,
-        targets=raw_k_targets,
-        target_labels=valid_target_labels,
-    )
-
-
-def _print_strong_k_hybrid_metrics(
-    valid_logits: torch.Tensor,
-    valid_positions: torch.Tensor,
-    decoded_predictions: torch.Tensor,
-    regression_predictions: torch.Tensor,
-    targets: torch.Tensor,
-    target_labels: torch.Tensor,
-) -> None:
-    very_high_idx = K_FACTOR_STRONG_BIN_LABELS.index("very_high")
-    probabilities = valid_logits.softmax(dim=1)
-    very_high_probabilities = probabilities[:, very_high_idx]
-    predicted_labels = valid_logits.argmax(dim=1)
-    argmax_gate = predicted_labels == very_high_idx
-    force_very_high_predictions = 45.0 + valid_positions.clamp(0.0, 1.0) * 25.0
-    _print_single_strong_k_hybrid_metrics(
-        "strong_k_hybrid_argmax_vhigh",
-        gate=argmax_gate,
-        decoded_predictions=decoded_predictions,
-        regression_predictions=regression_predictions,
-        targets=targets,
-        target_labels=target_labels,
-    )
-    for threshold in (0.20, 0.30, 0.40, 0.50):
-        gate = argmax_gate | (very_high_probabilities >= threshold)
-        prefix = f"strong_k_hybrid_vhigh_p{int(threshold * 100):02d}"
-        _print_single_strong_k_hybrid_metrics(
-            prefix,
-            gate=gate,
-            decoded_predictions=decoded_predictions,
-            regression_predictions=regression_predictions,
-            targets=targets,
-            target_labels=target_labels,
-        )
-    for probability_threshold in (0.20, 0.30):
-        for regression_threshold in (35.0, 40.0, 45.0):
-            gate = (very_high_probabilities >= probability_threshold) & (
-                regression_predictions >= regression_threshold
-            )
-            _print_single_strong_k_hybrid_metrics(
-                (
-                    f"strong_k_hybrid_force_vhigh_p{int(probability_threshold * 100):02d}"
-                    f"_reg{int(regression_threshold)}"
-                ),
-                gate=gate,
-                decoded_predictions=force_very_high_predictions,
-                regression_predictions=regression_predictions,
-                targets=targets,
-                target_labels=target_labels,
-            )
-
-def _print_single_strong_k_hybrid_metrics(
-    prefix: str,
-    gate: torch.Tensor,
-    decoded_predictions: torch.Tensor,
-    regression_predictions: torch.Tensor,
-    targets: torch.Tensor,
-    target_labels: torch.Tensor,
-) -> None:
-    hybrid_predictions = torch.where(
-        gate,
-        torch.maximum(regression_predictions, decoded_predictions),
-        regression_predictions,
-    )
-    errors = hybrid_predictions - targets
-    very_high_idx = K_FACTOR_STRONG_BIN_LABELS.index("very_high")
-    true_very_high = target_labels == very_high_idx
-    gate_count = int(gate.sum().item())
-    print(f"{prefix}_gate_count={gate_count}")
-    print(f"{prefix}_gate_fraction={float(gate.float().mean()):.4f}")
-    if bool(true_very_high.any()):
-        print(f"{prefix}_very_high_recall={float(gate[true_very_high].float().mean()):.4f}")
-    else:
-        print(f"{prefix}_very_high_recall=nan")
-    if gate_count > 0:
-        print(f"{prefix}_very_high_precision={float(true_very_high[gate].float().mean()):.4f}")
-    else:
-        print(f"{prefix}_very_high_precision=nan")
-    print(f"{prefix}_MAE={float(errors.abs().mean()):.4f}")
-    print(f"{prefix}_accuracy@3={float((errors.abs() <= 3.0).float().mean()):.4f}")
-    print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
-    print(f"{prefix}_pearson={_safe_pearson(hybrid_predictions, targets):.4f}")
-    print(
-        f"{prefix}_pred_range="
-        f"{float(hybrid_predictions.min()):.4f},{float(hybrid_predictions.max()):.4f}"
-    )
-    for class_idx, label in enumerate(K_FACTOR_STRONG_BIN_LABELS):
-        _print_k_factor_group_diagnostics(
-            f"{prefix}_{label}",
-            hybrid_predictions,
-            targets,
-            target_labels == class_idx,
-        )
-
-
 def _print_k_factor_diagnostics(
     physics_predictions: torch.Tensor,
     physics_raw_targets: torch.Tensor,
@@ -1710,36 +1797,249 @@ def _print_first_path_power_diagnostics(
     print(f"final_first_power_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
 
 
+def _print_delay_family_diagnostics(
+    first_path_delay_predictions: torch.Tensor,
+    los_delay_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    los_delay_raw_targets: torch.Tensor,
+    los_delay_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+) -> None:
+    first_delay_idx = _physics_target_index("first_path_delay_ns")
+    first_delay_raw = (
+        first_path_delay_predictions * PHYSICS_TARGET_SCALES[first_delay_idx]
+        + PHYSICS_TARGET_OFFSETS[first_delay_idx]
+    )
+    first_delay_mask = physics_masks[:, first_delay_idx]
+    if bool(first_delay_mask.any()):
+        first_delay_target = physics_raw_targets[first_delay_mask, first_delay_idx]
+        first_delay_pred = first_delay_raw[first_delay_mask]
+        first_delay_errors = first_delay_pred - first_delay_target
+        print(f"first_path_delay_context_MAE={float(first_delay_errors.abs().mean()):.4f}")
+        print(f"first_path_delay_context_signed_mean={float(first_delay_errors.mean()):.4f}")
+    else:
+        print("first_path_delay_context_MAE=nan")
+        print("first_path_delay_context_signed_mean=nan")
+
+    los_sample_mask = torch.tensor(
+        [key.los_status == "los" for key in semantic_keys],
+        dtype=torch.bool,
+    )
+    los_delay_mask = los_delay_masks & los_sample_mask
+    print(f"los_delay_context_count={int(los_delay_mask.sum().item())}")
+    if not bool(los_delay_mask.any()):
+        print("los_delay_context_MAE=nan")
+        print("los_delay_context_signed_mean=nan")
+        return
+    los_delay_raw = (
+        los_delay_predictions * 3000.0
+    )
+    los_delay_target = los_delay_raw_targets[los_delay_mask]
+    los_delay_pred = los_delay_raw[los_delay_mask]
+    los_delay_errors = los_delay_pred - los_delay_target
+    print(f"los_delay_context_MAE={float(los_delay_errors.abs().mean()):.4f}")
+    print(f"los_delay_context_signed_mean={float(los_delay_errors.mean()):.4f}")
+
+
 def _print_delay_spread_diagnostics(
     base_physics_predictions: torch.Tensor,
     physics_predictions: torch.Tensor,
+    csi_delay_spread_predictions: torch.Tensor,
     enhanced_delay_spread_predictions: torch.Tensor,
+    profile_delay_spread_predictions: torch.Tensor,
+    profile_direct_delay_spread_predictions: torch.Tensor,
+    delay_spread_context_predictions: torch.Tensor | None,
+    delay_spread_bin_logits: torch.Tensor | None,
+    delay_spread_bin_positions: torch.Tensor | None,
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
 ) -> None:
     delay_spread_idx = _physics_target_index("delay_spread_ns")
     delay_spread_mask = physics_masks[:, delay_spread_idx]
     if not bool(delay_spread_mask.any()):
-        print("base_delay_spread_MAE=nan")
-        print("enhanced_delay_spread_MAE=nan")
+        print("delay_context_spread_MAE=nan")
         print("final_delay_spread_MAE=nan")
         return
 
-    base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
     final_physics_raw_predictions = _physics_raw_predictions(physics_predictions)
-    enhanced_raw_predictions = (
-        enhanced_delay_spread_predictions * PHYSICS_TARGET_SCALES[delay_spread_idx]
-        + PHYSICS_TARGET_OFFSETS[delay_spread_idx]
+    delay_context_raw_predictions = None
+    if delay_spread_context_predictions is not None:
+        delay_context_raw_predictions = (
+            delay_spread_context_predictions * PHYSICS_TARGET_SCALES[delay_spread_idx]
+            + PHYSICS_TARGET_OFFSETS[delay_spread_idx]
+        )
+
+    masked_final_raw = final_physics_raw_predictions[delay_spread_mask, delay_spread_idx]
+    masked_target_raw = physics_raw_targets[delay_spread_mask, delay_spread_idx]
+    masked_delay_context_raw = (
+        delay_context_raw_predictions[delay_spread_mask]
+        if delay_context_raw_predictions is not None
+        else None
     )
 
-    masked_base_raw = base_physics_raw_predictions[delay_spread_mask, delay_spread_idx]
-    masked_final_raw = final_physics_raw_predictions[delay_spread_mask, delay_spread_idx]
-    masked_enhanced_raw = enhanced_raw_predictions[delay_spread_mask]
-    masked_target_raw = physics_raw_targets[delay_spread_mask, delay_spread_idx]
-
-    print(f"base_delay_spread_MAE={float((masked_base_raw - masked_target_raw).abs().mean()):.4f}")
-    print(f"enhanced_delay_spread_MAE={float((masked_enhanced_raw - masked_target_raw).abs().mean()):.4f}")
+    if masked_delay_context_raw is not None:
+        print(f"delay_context_spread_MAE={float((masked_delay_context_raw - masked_target_raw).abs().mean()):.4f}")
+    else:
+        print("delay_context_spread_MAE=nan")
     print(f"final_delay_spread_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
+    if delay_spread_bin_logits is not None and delay_spread_bin_positions is not None:
+        masked_bin_logits = delay_spread_bin_logits[delay_spread_mask]
+        masked_bin_positions = delay_spread_bin_positions[delay_spread_mask]
+        _print_delay_spread_bin_head_diagnostics(
+            target_raw=masked_target_raw,
+            bin_logits=masked_bin_logits,
+            positions=masked_bin_positions,
+        )
+    _print_delay_spread_bin_diagnostics(
+        target_raw=masked_target_raw,
+        final_raw=masked_final_raw,
+    )
+
+
+def _print_delay_spread_bin_diagnostics(
+    target_raw: torch.Tensor,
+    final_raw: torch.Tensor,
+) -> None:
+    print(
+        "delay_spread_diagnostic_bin_order="
+        + ",".join(
+            f"{label}:{_format_scalar(lower)}-{_format_scalar(upper) if upper != float('inf') else 'inf'}"
+            for label, lower, upper in DELAY_SPREAD_DIAGNOSTIC_BINS
+        )
+    )
+    for bin_idx, (label, lower, upper) in enumerate(DELAY_SPREAD_DIAGNOSTIC_BINS):
+        upper_mask = (
+            target_raw <= upper
+            if bin_idx == len(DELAY_SPREAD_DIAGNOSTIC_BINS) - 1
+            else target_raw < upper
+        )
+        mask = (target_raw >= lower) & upper_mask
+        _print_single_delay_spread_bin_diagnostics(
+            prefix=f"delay_spread_bin_{label}",
+            target_raw=target_raw,
+            final_raw=final_raw,
+            mask=mask,
+        )
+
+
+def _delay_spread_bin_targets(raw_delay_spread_ns: torch.Tensor) -> torch.Tensor:
+    targets = torch.full_like(raw_delay_spread_ns, fill_value=-1, dtype=torch.long)
+    for class_idx, (_, lower, upper) in enumerate(DELAY_SPREAD_DIAGNOSTIC_BINS):
+        upper_mask = (
+            raw_delay_spread_ns <= upper
+            if class_idx == len(DELAY_SPREAD_DIAGNOSTIC_BINS) - 1
+            else raw_delay_spread_ns < upper
+        )
+        mask = torch.isfinite(raw_delay_spread_ns) & (raw_delay_spread_ns >= lower) & upper_mask
+        targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
+    return targets
+
+
+def _decode_delay_spread_bins(bin_labels: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    decoded = torch.zeros_like(positions.float())
+    for class_idx, (_, lower, upper) in enumerate(DELAY_SPREAD_BIN_DECODE_BINS):
+        mask = bin_labels == class_idx
+        value = lower + positions.float().clamp(0.0, 1.0) * (upper - lower)
+        decoded = torch.where(mask, value, decoded)
+    return decoded
+
+
+def _print_delay_spread_bin_head_diagnostics(
+    target_raw: torch.Tensor,
+    bin_logits: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    target_labels = _delay_spread_bin_targets(target_raw)
+    valid_mask = target_labels >= 0
+    if not bool(valid_mask.any()):
+        print("delay_spread_bin_head_count=0")
+        print("delay_spread_bin_head_accuracy=nan")
+        print("delay_spread_bin_decoded_MAE=nan")
+        return
+
+    predicted_labels = bin_logits.argmax(dim=1)
+    decoded_raw = _decode_delay_spread_bins(predicted_labels, positions)
+    errors = decoded_raw[valid_mask] - target_raw[valid_mask]
+    print(f"delay_spread_bin_head_count={int(valid_mask.sum().item())}")
+    print(
+        "delay_spread_bin_head_label_order="
+        + ",".join(DELAY_SPREAD_BIN_LABELS)
+    )
+    print(
+        f"delay_spread_bin_head_accuracy="
+        f"{float((predicted_labels[valid_mask] == target_labels[valid_mask]).float().mean()):.4f}"
+    )
+    print(f"delay_spread_bin_decoded_MAE={float(errors.abs().mean()):.4f}")
+    print(f"delay_spread_bin_decoded_signed_mean={float(errors.mean()):.4f}")
+    print(f"delay_spread_bin_decoded_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
+    print(
+        f"delay_spread_bin_decoded_pearson="
+        f"{_safe_pearson(decoded_raw[valid_mask], target_raw[valid_mask]):.4f}"
+    )
+    print(
+        f"delay_spread_bin_decoded_pred_range="
+        f"{float(decoded_raw[valid_mask].min()):.4f},{float(decoded_raw[valid_mask].max()):.4f}"
+    )
+    print(
+        "delay_spread_bin_head_target_histogram="
+        + ",".join(
+            f"{label}:{int((target_labels[valid_mask] == idx).sum().item())}"
+            for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS)
+        )
+    )
+    print(
+        "delay_spread_bin_head_prediction_histogram="
+        + ",".join(
+            f"{label}:{int((predicted_labels[valid_mask] == idx).sum().item())}"
+            for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS)
+        )
+    )
+    for bin_idx, (label, lower, upper) in enumerate(DELAY_SPREAD_DIAGNOSTIC_BINS):
+        upper_mask = (
+            target_raw <= upper
+            if bin_idx == len(DELAY_SPREAD_DIAGNOSTIC_BINS) - 1
+            else target_raw < upper
+        )
+        mask = valid_mask & (target_raw >= lower) & upper_mask
+        _print_single_delay_spread_bin_diagnostics(
+            prefix=f"delay_spread_bin_head_bin_{label}",
+            target_raw=target_raw,
+            final_raw=decoded_raw,
+            mask=mask,
+        )
+
+
+def _print_single_delay_spread_bin_diagnostics(
+    prefix: str,
+    target_raw: torch.Tensor,
+    final_raw: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    count = int(mask.sum().item())
+    print(f"{prefix}_count={count}")
+    if count == 0:
+        print(f"{prefix}_target_range=nan,nan")
+        print(f"{prefix}_final_MAE=nan")
+        print(f"{prefix}_final_signed_mean=nan")
+        print(f"{prefix}_final_pred_range=nan,nan")
+        return
+
+    targets = target_raw[mask]
+    final_predictions = final_raw[mask]
+    final_errors = final_predictions - targets
+    print(
+        f"{prefix}_target_range="
+        f"{float(targets.min()):.4f},{float(targets.max()):.4f}"
+    )
+    print(f"{prefix}_final_MAE={float(final_errors.abs().mean()):.4f}")
+    print(f"{prefix}_final_signed_mean={float(final_errors.mean()):.4f}")
+    print(f"{prefix}_final_RMSE={float(torch.sqrt((final_errors.square()).mean())):.4f}")
+    print(f"{prefix}_final_pearson={_safe_pearson(final_predictions, targets):.4f}")
+    print(
+        f"{prefix}_final_pred_range="
+        f"{float(final_predictions.min()):.4f},{float(final_predictions.max()):.4f}"
+    )
 
 
 def main() -> None:
@@ -1798,6 +2098,11 @@ def main() -> None:
         help="Number of samples to keep per value when --limit-samples-by-attribute is set. Defaults to checkpoint args.",
     )
     parser.add_argument(
+        "--max-delay-spread-ns",
+        type=float,
+        help="Drop samples whose delay_spread_ns is greater than or equal to this value. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
         "--attribute-classifier-fields",
         nargs="+",
         choices=semantic_key_field_choices(),
@@ -1840,6 +2145,7 @@ def main() -> None:
         limit_samples_override=args.limit_samples,
         limit_samples_by_attribute_override=args.limit_samples_by_attribute,
         limit_samples_per_attribute_value_override=args.limit_samples_per_attribute_value,
+        max_delay_spread_ns_override=args.max_delay_spread_ns,
         attribute_binary_thresholds=parse_attribute_binary_thresholds(args.attribute_binary_threshold),
         physical_caption_examples=args.physical_caption_examples,
     )

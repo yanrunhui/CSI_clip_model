@@ -25,7 +25,6 @@ from data.dataset import (
     PreprocessedSample,
 )
 from data.preprocess import preprocess_sample
-from data.semantic_key import SemanticKey
 
 PROP_MAGIC = {b"PORP", b"PROP"}
 PROP_HEADER_BYTES = 32
@@ -1036,6 +1035,7 @@ def extract_semantic_observables_from_deepmimo(
     valid = _path_mask(power_dbw, delay_s)
     n_valid_paths = int(valid.sum())
     first_path_delay = float("nan")
+    los_delay = float("nan")
     first_path_power_dbw = float("nan")
     first_path_aoa_az_deg = float("nan")
     interaction_counts = {"reflection": 0, "diffraction": 0}
@@ -1047,6 +1047,10 @@ def extract_semantic_observables_from_deepmimo(
         if np.isfinite(aoa_az_deg[first_idx]):
             first_path_aoa_az_deg = float(aoa_az_deg[first_idx])
         interaction_counts = _summed_interaction_counts(inter_code, valid)
+        los_indices = np.where(valid & (inter_code == 0))[0]
+        if bool(los_indices.size):
+            los_idx = int(los_indices[np.argmin(delay_s[los_indices])])
+            los_delay = float(delay_s[los_idx])
 
     angle_valid = valid & np.isfinite(aoa_az_deg)
     angle_aoa_az_deg = aoa_az_deg[angle_valid]
@@ -1080,37 +1084,12 @@ def extract_semantic_observables_from_deepmimo(
         "azimuth_spread_deg": azimuth_spread_deg,
         "k_factor_db": k_factor_db,
         "first_path_delay": first_path_delay,
+        "los_delay": los_delay,
         "first_path_power_dbw": first_path_power_dbw,
         "first_path_aoa_az_deg": first_path_aoa_az_deg,
         "reflection_count": interaction_counts["reflection"],
         "diffraction_count": interaction_counts["diffraction"],
     }
-
-
-def build_semantic_key_from_deepmimo(
-    scenario: str,
-    env_type: str,
-    los_value: int,
-    num_paths_value: int,
-    delay_s: np.ndarray,
-    aoa_az_deg: np.ndarray,
-    power_dbw: np.ndarray,
-    inter_code: np.ndarray,
-) -> SemanticKey:
-    observables = extract_semantic_observables_from_deepmimo(
-        scenario=scenario,
-        env_type=env_type,
-        los_value=los_value,
-        num_paths_value=num_paths_value,
-        delay_s=delay_s,
-        aoa_az_deg=aoa_az_deg,
-        power_dbw=power_dbw,
-        inter_code=inter_code,
-    )
-
-    from data.semantic_key import build_semantic_key
-
-    return build_semantic_key(observables)
 
 
 def derive_config_info(dataset) -> tuple[str, int, int]:
@@ -1253,6 +1232,7 @@ def preprocess_deepmimo_dataset(
                 azimuth_spread_deg=float(observables["azimuth_spread_deg"]),
                 k_factor_db=float(observables["k_factor_db"]),
                 first_path_delay_s=float(observables["first_path_delay"]),
+                los_delay_s=float(observables["los_delay"]),
                 first_path_power_dbw=float(observables["first_path_power_dbw"]),
                 first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
                 reflection_count=int(observables["reflection_count"]),

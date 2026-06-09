@@ -5,12 +5,19 @@ import math
 
 import torch
 
+from data.dataset import PHYSICS_TARGET_NAMES, PHYSICS_TARGET_OFFSETS, PHYSICS_TARGET_SCALES
 from data.semantic_key import (
     FIRST_POWER_DBW_BIN_LABELS,
     FIRST_POWER_DBW_BINS,
     FIRST_POWER_DBW_POSITION_BINS,
     AttributeRemap,
     semantic_key_attribute_value,
+)
+from models.model import (
+    DELAY_SPREAD_BIN_LABELS,
+    DELAY_SPREAD_POSITION_BINS,
+    DELAY_SPREAD_TAIL_LABELS,
+    DELAY_SPREAD_TAIL_THRESHOLDS_NS,
 )
 
 from .losses import (
@@ -46,6 +53,13 @@ class TrainConfig:
     strong_k_bin_weights: dict[str, float] | None = None
     direct_power_weight: float = 0.0
     delay_spread_weight: float = 0.0
+    first_path_delay_weight: float = 0.0
+    los_delay_weight: float = 0.0
+    delay_spread_teacher_weight: float = 0.1
+    delay_spread_bin_weights: dict[str, float] | None = None
+    delay_spread_bin_classifier_weight: float = 0.0
+    delay_spread_bin_position_weight: float = 0.0
+    delay_spread_tail_classifier_weight: float = 0.0
     first_path_power_bin_classifier_weight: float = 0.0
     first_path_power_bin_position_weight: float = 0.0
     first_path_power_bin_weights: dict[str, float] | None = None
@@ -73,6 +87,14 @@ class Trainer:
         ("mid", 15.0, 30.0),
         ("high", 30.0, 45.0),
         ("very_high", 45.0, 70.0),
+    )
+    DELAY_SPREAD_BIN_LABELS = DELAY_SPREAD_BIN_LABELS
+    DELAY_SPREAD_TAIL_LABELS = DELAY_SPREAD_TAIL_LABELS
+    DELAY_SPREAD_TAIL_THRESHOLDS_NS = DELAY_SPREAD_TAIL_THRESHOLDS_NS
+    DELAY_SPREAD_POSITION_BINS = DELAY_SPREAD_POSITION_BINS
+    DELAY_SPREAD_BINS = (
+        *DELAY_SPREAD_POSITION_BINS,
+        ("400_plus", 400.0, float("inf")),
     )
 
     def __init__(
@@ -170,6 +192,54 @@ class Trainer:
             raise ValueError(
                 "strong K-factor bin-position head output size mismatch: "
                 f"out_features={strong_k_position_linear.out_features}, expected 1."
+            )
+        delay_spread_labels = tuple(
+            getattr(model, "delay_spread_bin_labels", self.DELAY_SPREAD_BIN_LABELS)
+        )
+        if delay_spread_labels != self.DELAY_SPREAD_BIN_LABELS:
+            raise ValueError(
+                "delay-spread bin label order mismatch: "
+                f"model={delay_spread_labels} trainer={self.DELAY_SPREAD_BIN_LABELS}."
+            )
+        delay_spread_classifier_linear = self._last_linear(
+            getattr(model, "delay_spread_bin_classifier", None)
+        )
+        if (
+            delay_spread_classifier_linear is not None
+            and delay_spread_classifier_linear.out_features != len(self.DELAY_SPREAD_BIN_LABELS)
+        ):
+            raise ValueError(
+                "delay-spread bin classifier output size mismatch: "
+                f"out_features={delay_spread_classifier_linear.out_features} "
+                f"labels={self.DELAY_SPREAD_BIN_LABELS}."
+            )
+        delay_spread_position_linear = self._last_linear(
+            getattr(model, "delay_spread_bin_position_head", None)
+        )
+        if delay_spread_position_linear is not None and delay_spread_position_linear.out_features != 1:
+            raise ValueError(
+                "delay-spread bin-position head output size mismatch: "
+                f"out_features={delay_spread_position_linear.out_features}, expected 1."
+            )
+        delay_spread_tail_labels = tuple(
+            getattr(model, "delay_spread_tail_labels", self.DELAY_SPREAD_TAIL_LABELS)
+        )
+        if delay_spread_tail_labels != self.DELAY_SPREAD_TAIL_LABELS:
+            raise ValueError(
+                "delay-spread tail label order mismatch: "
+                f"model={delay_spread_tail_labels} trainer={self.DELAY_SPREAD_TAIL_LABELS}."
+            )
+        delay_spread_tail_linear = self._last_linear(
+            getattr(model, "delay_spread_tail_classifier", None)
+        )
+        if (
+            delay_spread_tail_linear is not None
+            and delay_spread_tail_linear.out_features != len(self.DELAY_SPREAD_TAIL_LABELS)
+        ):
+            raise ValueError(
+                "delay-spread tail classifier output size mismatch: "
+                f"out_features={delay_spread_tail_linear.out_features} "
+                f"labels={self.DELAY_SPREAD_TAIL_LABELS}."
             )
 
     def _attribute_targets(self, semantic_keys: list[object]) -> dict[str, torch.Tensor]:
@@ -348,6 +418,70 @@ class Trainer:
             mask = strong_mask & (raw_k_factor >= lower) & upper_mask
             weights = torch.where(mask, torch.full_like(weights, bin_weight), weights)
         return weights
+
+    def _delay_spread_sample_weights(
+        self,
+        raw_delay_spread_ns: torch.Tensor,
+        cfg: TrainConfig,
+    ) -> torch.Tensor:
+        weights_cfg = cfg.delay_spread_bin_weights or {}
+        weights = torch.ones_like(raw_delay_spread_ns)
+        if not weights_cfg:
+            return weights
+
+        for bin_idx, (label, lower, upper) in enumerate(self.DELAY_SPREAD_BINS):
+            bin_weight = float(weights_cfg.get(label, 1.0))
+            if bin_weight == 1.0:
+                continue
+            upper_mask = (
+                raw_delay_spread_ns <= upper
+                if bin_idx == len(self.DELAY_SPREAD_BINS) - 1
+                else raw_delay_spread_ns < upper
+            )
+            mask = (raw_delay_spread_ns >= lower) & upper_mask
+            weights = torch.where(mask, torch.full_like(weights, bin_weight), weights)
+        return weights
+
+    def _delay_spread_bin_targets(self, raw_delay_spread_ns: torch.Tensor) -> torch.Tensor:
+        targets = torch.full_like(raw_delay_spread_ns, fill_value=-1, dtype=torch.long)
+        for class_idx, (_, lower, upper) in enumerate(self.DELAY_SPREAD_BINS):
+            upper_mask = (
+                raw_delay_spread_ns <= upper
+                if class_idx == len(self.DELAY_SPREAD_BINS) - 1
+                else raw_delay_spread_ns < upper
+            )
+            mask = torch.isfinite(raw_delay_spread_ns) & (raw_delay_spread_ns >= lower) & upper_mask
+            targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
+        return targets
+
+    def _delay_spread_bin_class_weight(
+        self,
+        dtype: torch.dtype,
+        cfg: TrainConfig,
+    ) -> torch.Tensor | None:
+        if not cfg.delay_spread_bin_weights:
+            return None
+        return torch.tensor(
+            [
+                float(cfg.delay_spread_bin_weights.get(label, 1.0))
+                for label in self.DELAY_SPREAD_BIN_LABELS
+            ],
+            device=self.device,
+            dtype=dtype,
+        )
+
+    def _delay_spread_bin_position_targets(
+        self,
+        raw_delay_spread_ns: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        targets = torch.zeros_like(raw_delay_spread_ns)
+        valid_mask = torch.zeros_like(raw_delay_spread_ns, dtype=torch.bool)
+        for _, lower, upper in self.DELAY_SPREAD_POSITION_BINS:
+            mask = torch.isfinite(raw_delay_spread_ns) & (raw_delay_spread_ns >= lower) & (raw_delay_spread_ns < upper)
+            position = (raw_delay_spread_ns - lower) / max(upper - lower, 1e-6)
+            targets = torch.where(mask, position.clamp(0.0, 1.0), targets)
+            valid_mask = valid_mask | mask
+        return targets, valid_mask
 
     def _first_path_power_bin_targets(self, raw_first_path_power: torch.Tensor) -> torch.Tensor:
         targets = torch.full_like(raw_first_path_power, fill_value=-1, dtype=torch.long)
@@ -528,6 +662,21 @@ class Trainer:
         effective_delay_spread_weight = (
             0.0 if warmup_active else cfg.delay_spread_weight
         )
+        effective_first_path_delay_weight = (
+            0.0 if warmup_active else cfg.first_path_delay_weight
+        )
+        effective_los_delay_weight = (
+            0.0 if warmup_active else cfg.los_delay_weight
+        )
+        effective_delay_spread_bin_classifier_weight = (
+            0.0 if warmup_active else cfg.delay_spread_bin_classifier_weight
+        )
+        effective_delay_spread_bin_position_weight = (
+            0.0 if warmup_active else cfg.delay_spread_bin_position_weight
+        )
+        effective_delay_spread_tail_classifier_weight = (
+            0.0 if warmup_active else cfg.delay_spread_tail_classifier_weight
+        )
         self.optimizer.zero_grad(set_to_none=True)
         csi_features_raw = self.model.encode_csi(
             batch["tokens"],
@@ -567,15 +716,37 @@ class Trainer:
         strong_k_bin_prediction_histogram = None
         strong_k_bin_loss_denominator = None
         strong_k_position_mae = None
+        delay_spread_bin_target_histogram = None
+        delay_spread_bin_prediction_histogram = None
+        delay_spread_bin_loss_denominator = None
+        delay_spread_bin_position_mae = None
+        delay_spread_tail_accuracy = None
+        delay_spread_tail_recall = None
+        delay_spread_tail_false_positive = None
+        delay_spread_tail_positive_fraction = None
+        delay_spread_tail_prediction_fraction = None
         if (
             effective_aux_regression_weight > 0
             or effective_strong_k_bin_classifier_weight > 0.0
             or effective_strong_k_position_weight > 0.0
             or effective_first_path_power_bin_classifier_weight > 0.0
             or effective_first_path_power_bin_position_weight > 0.0
+            or effective_delay_spread_bin_classifier_weight > 0.0
+            or effective_delay_spread_bin_position_weight > 0.0
+            or effective_delay_spread_tail_classifier_weight > 0.0
             or cfg.direct_power_weight > 0.0
+            or effective_delay_spread_weight > 0.0
+            or effective_first_path_delay_weight > 0.0
+            or effective_los_delay_weight > 0.0
         ):
             power_context = None
+            delay_context = None
+            if hasattr(self.model, "encode_csi_delay_context"):
+                delay_context = self.model.encode_csi_delay_context(
+                    batch["tokens"],
+                    batch["token_mask"],
+                    subcarrier_spacing=batch.get("subcarrier_spacing"),
+                )
             if bool(getattr(self.model, "use_power_branch", False)):
                 power_context = self.model.encode_power_context(
                     batch["tokens"],
@@ -586,6 +757,7 @@ class Trainer:
             physics_outputs = self.model.predict_physics_components(
                 csi_features_raw,
                 power_context=power_context,
+                delay_context=delay_context,
             )
             physics_predictions = physics_outputs["final"]
 
@@ -781,6 +953,214 @@ class Trainer:
                 ).abs().mean()
         if (
             physics_outputs is not None
+            and effective_delay_spread_bin_classifier_weight > 0.0
+        ):
+            delay_spread_bin_logits = physics_outputs["delay_spread_bin_logits"]
+            delay_spread_bin_targets = self._delay_spread_bin_targets(
+                batch["physics_raw_targets"][:, 1]
+            )
+            delay_spread_bin_mask = (
+                (delay_spread_bin_targets >= 0)
+                & batch["physics_target_mask"][:, 1].bool()
+            )
+            if bool(delay_spread_bin_mask.any()):
+                valid_logits = delay_spread_bin_logits[delay_spread_bin_mask]
+                valid_targets = delay_spread_bin_targets[delay_spread_bin_mask]
+                per_sample_classifier_loss = torch.nn.functional.cross_entropy(
+                    valid_logits,
+                    valid_targets,
+                    reduction="none",
+                )
+                class_weight = self._delay_spread_bin_class_weight(valid_logits.dtype, cfg)
+                if class_weight is None:
+                    sample_weight = torch.ones_like(per_sample_classifier_loss)
+                else:
+                    sample_weight = class_weight[valid_targets]
+                delay_spread_bin_loss_denominator = sample_weight.sum()
+                losses["loss_delay_spread_bin_classifier"] = (
+                    (per_sample_classifier_loss * sample_weight).sum()
+                    / delay_spread_bin_loss_denominator.clamp(min=1.0)
+                )
+                delay_spread_bin_predictions = valid_logits.argmax(dim=1)
+                losses["accuracy_delay_spread_bin_classifier"] = (
+                    (delay_spread_bin_predictions == valid_targets).float().mean()
+                )
+                delay_spread_bin_target_histogram = self._histogram(
+                    valid_targets,
+                    len(self.DELAY_SPREAD_BIN_LABELS),
+                )
+                delay_spread_bin_prediction_histogram = self._histogram(
+                    delay_spread_bin_predictions,
+                    len(self.DELAY_SPREAD_BIN_LABELS),
+                )
+                profile_direct_delay_spread = physics_outputs.get("profile_direct_delay_spread")
+                if profile_direct_delay_spread is not None and cfg.delay_spread_teacher_weight > 0.0:
+                    delay_idx = 1
+                    scale = PHYSICS_TARGET_SCALES[delay_idx].to(
+                        device=profile_direct_delay_spread.device,
+                        dtype=profile_direct_delay_spread.dtype,
+                    )
+                    offset = PHYSICS_TARGET_OFFSETS[delay_idx].to(
+                        device=profile_direct_delay_spread.device,
+                        dtype=profile_direct_delay_spread.dtype,
+                    )
+                    teacher_raw = profile_direct_delay_spread.detach() * scale + offset
+                    teacher_targets = self._delay_spread_bin_targets(teacher_raw)
+                    teacher_mask = (
+                        (teacher_targets >= 0)
+                        & batch["physics_target_mask"][:, delay_idx].bool()
+                    )
+                    if bool(teacher_mask.any()):
+                        teacher_logits = delay_spread_bin_logits[teacher_mask]
+                        teacher_targets = teacher_targets[teacher_mask]
+                        teacher_loss = torch.nn.functional.cross_entropy(
+                            teacher_logits,
+                            teacher_targets,
+                            reduction="none",
+                        )
+                        teacher_class_weight = self._delay_spread_bin_class_weight(
+                            teacher_logits.dtype,
+                            cfg,
+                        )
+                        if teacher_class_weight is None:
+                            teacher_weight = torch.ones_like(teacher_loss)
+                        else:
+                            teacher_weight = teacher_class_weight[teacher_targets]
+                        teacher_loss = (
+                            (teacher_loss * teacher_weight).sum()
+                            / teacher_weight.sum().clamp(min=1.0)
+                        )
+                        losses["loss_delay_spread_bin_teacher"] = teacher_loss
+                        losses["loss_delay_spread_bin_classifier"] = (
+                            losses["loss_delay_spread_bin_classifier"]
+                            + float(cfg.delay_spread_teacher_weight) * teacher_loss
+                        )
+        if (
+            physics_outputs is not None
+            and effective_delay_spread_bin_position_weight > 0.0
+        ):
+            delay_spread_position_predictions = physics_outputs["delay_spread_bin_position"]
+            delay_spread_position_targets, delay_spread_position_mask = (
+                self._delay_spread_bin_position_targets(batch["physics_raw_targets"][:, 1])
+            )
+            delay_spread_position_mask = (
+                delay_spread_position_mask
+                & batch["physics_target_mask"][:, 1].bool()
+            )
+            if bool(delay_spread_position_mask.any()):
+                valid_position_predictions = delay_spread_position_predictions[
+                    delay_spread_position_mask
+                ]
+                valid_position_targets = delay_spread_position_targets[
+                    delay_spread_position_mask
+                ]
+                position_errors = torch.nn.functional.smooth_l1_loss(
+                    valid_position_predictions,
+                    valid_position_targets,
+                    reduction="none",
+                )
+                position_weights = self._delay_spread_sample_weights(
+                    batch["physics_raw_targets"][:, 1],
+                    cfg,
+                )[delay_spread_position_mask]
+                delay_spread_position_denominator = position_weights.sum()
+                losses["loss_delay_spread_bin_position"] = (
+                    (position_errors * position_weights.to(dtype=position_errors.dtype)).sum()
+                    / delay_spread_position_denominator.clamp(min=1.0).to(dtype=position_errors.dtype)
+                )
+                delay_spread_bin_position_mae = (
+                    valid_position_predictions - valid_position_targets
+                ).abs().mean()
+                profile_direct_delay_spread = physics_outputs.get("profile_direct_delay_spread")
+                if profile_direct_delay_spread is not None and cfg.delay_spread_teacher_weight > 0.0:
+                    delay_idx = 1
+                    scale = PHYSICS_TARGET_SCALES[delay_idx].to(
+                        device=profile_direct_delay_spread.device,
+                        dtype=profile_direct_delay_spread.dtype,
+                    )
+                    offset = PHYSICS_TARGET_OFFSETS[delay_idx].to(
+                        device=profile_direct_delay_spread.device,
+                        dtype=profile_direct_delay_spread.dtype,
+                    )
+                    teacher_raw = profile_direct_delay_spread.detach() * scale + offset
+                    teacher_targets, teacher_mask = self._delay_spread_bin_position_targets(
+                        teacher_raw
+                    )
+                    teacher_mask = (
+                        teacher_mask
+                        & batch["physics_target_mask"][:, delay_idx].bool()
+                    )
+                    if bool(teacher_mask.any()):
+                        teacher_errors = torch.nn.functional.smooth_l1_loss(
+                            delay_spread_position_predictions[teacher_mask],
+                            teacher_targets[teacher_mask],
+                            reduction="none",
+                        )
+                        teacher_weights = self._delay_spread_sample_weights(
+                            teacher_raw,
+                            cfg,
+                        )[teacher_mask]
+                        teacher_loss = (
+                            (teacher_errors * teacher_weights.to(dtype=teacher_errors.dtype)).sum()
+                            / teacher_weights.sum().clamp(min=1.0).to(dtype=teacher_errors.dtype)
+                        )
+                        losses["loss_delay_spread_bin_position_teacher"] = teacher_loss
+                        losses["loss_delay_spread_bin_position"] = (
+                            losses["loss_delay_spread_bin_position"]
+                            + float(cfg.delay_spread_teacher_weight) * teacher_loss
+                        )
+        if (
+            physics_outputs is not None
+            and effective_delay_spread_tail_classifier_weight > 0.0
+        ):
+            delay_idx = 1
+            tail_logits = physics_outputs["delay_spread_tail_logits"]
+            tail_mask = batch["physics_target_mask"][:, delay_idx].bool()
+            if bool(tail_mask.any()):
+                thresholds = torch.tensor(
+                    self.DELAY_SPREAD_TAIL_THRESHOLDS_NS,
+                    device=self.device,
+                    dtype=batch["physics_raw_targets"].dtype,
+                )
+                tail_targets = (
+                    batch["physics_raw_targets"][:, delay_idx].unsqueeze(1)
+                    >= thresholds.unsqueeze(0)
+                ).to(dtype=tail_logits.dtype)
+                valid_logits = tail_logits[tail_mask]
+                valid_targets = tail_targets[tail_mask]
+                positives = valid_targets.sum(dim=0)
+                negatives = valid_targets.shape[0] - positives
+                pos_weight = (negatives / positives.clamp(min=1.0)).clamp(1.0, 12.0)
+                tail_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    valid_logits,
+                    valid_targets,
+                    pos_weight=pos_weight.to(dtype=valid_logits.dtype),
+                    reduction="mean",
+                )
+                losses["loss_delay_spread_tail_classifier"] = tail_loss
+                tail_probabilities = torch.sigmoid(valid_logits)
+                tail_predictions = tail_probabilities >= 0.5
+                tail_targets_bool = valid_targets.bool()
+                delay_spread_tail_accuracy = (
+                    tail_predictions == tail_targets_bool
+                ).float().mean(dim=0)
+                delay_spread_tail_recall = torch.where(
+                    tail_targets_bool.any(dim=0),
+                    (tail_predictions & tail_targets_bool).float().sum(dim=0)
+                    / tail_targets_bool.float().sum(dim=0).clamp(min=1.0),
+                    torch.full_like(delay_spread_tail_accuracy, float("nan")),
+                )
+                negative_mask = ~tail_targets_bool
+                delay_spread_tail_false_positive = torch.where(
+                    negative_mask.any(dim=0),
+                    (tail_predictions & negative_mask).float().sum(dim=0)
+                    / negative_mask.float().sum(dim=0).clamp(min=1.0),
+                    torch.full_like(delay_spread_tail_accuracy, float("nan")),
+                )
+                delay_spread_tail_positive_fraction = valid_targets.mean(dim=0)
+                delay_spread_tail_prediction_fraction = tail_predictions.float().mean(dim=0)
+        if (
+            physics_outputs is not None
             and effective_first_path_power_bin_classifier_weight > 0.0
         ):
             first_path_power_bin_logits = physics_outputs["first_path_power_bin_logits"]
@@ -921,22 +1301,142 @@ class Trainer:
             )
         if (
             physics_outputs is not None
-            and bool(getattr(self.model, "use_power_branch", False))
             and effective_delay_spread_weight > 0.0
         ):
             delay_spread_idx = 1
+            csi_delay_spread = physics_outputs["csi_delay_spread"]
+            delay_spread_context = physics_outputs.get("delay_spread_context")
             enhanced_delay_spread = physics_outputs["enhanced_delay_spread"]
+            profile_delay_spread = physics_outputs.get("profile_delay_spread")
+            profile_direct_delay_spread = physics_outputs.get("profile_direct_delay_spread")
             delay_spread_target = batch["physics_targets"][:, delay_spread_idx]
             delay_spread_mask = batch["physics_target_mask"][:, delay_spread_idx]
-            delay_spread_errors = torch.nn.functional.smooth_l1_loss(
+            delay_spread_weights = self._delay_spread_sample_weights(
+                batch["physics_raw_targets"][:, delay_spread_idx],
+                cfg,
+            )
+            csi_delay_spread_errors = torch.nn.functional.smooth_l1_loss(
+                csi_delay_spread,
+                delay_spread_target,
+                reduction="none",
+            )
+            weighted_delay_spread_mask = (
+                delay_spread_mask.to(dtype=csi_delay_spread_errors.dtype)
+                * delay_spread_weights.to(dtype=csi_delay_spread_errors.dtype)
+            )
+            csi_delay_spread_loss = (
+                (csi_delay_spread_errors * weighted_delay_spread_mask).sum()
+                / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=csi_delay_spread_errors.dtype)
+            )
+            losses["loss_delay_spread_csi"] = csi_delay_spread_loss
+            enhanced_delay_spread_errors = torch.nn.functional.smooth_l1_loss(
                 enhanced_delay_spread,
                 delay_spread_target,
                 reduction="none",
             )
-            weighted_delay_spread_mask = delay_spread_mask.to(dtype=delay_spread_errors.dtype)
-            losses["loss_delay_spread"] = (
-                (delay_spread_errors * weighted_delay_spread_mask).sum()
-                / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=delay_spread_errors.dtype)
+            enhanced_delay_spread_loss = (
+                (enhanced_delay_spread_errors * weighted_delay_spread_mask).sum()
+                / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=enhanced_delay_spread_errors.dtype)
+            )
+            losses["loss_delay_spread_enhanced"] = enhanced_delay_spread_loss
+            losses["loss_delay_spread"] = torch.zeros((), device=self.device)
+            if delay_spread_context is not None:
+                context_delay_spread_errors = torch.nn.functional.smooth_l1_loss(
+                    delay_spread_context,
+                    delay_spread_target,
+                    reduction="none",
+                )
+                context_delay_spread_loss = (
+                    (context_delay_spread_errors * weighted_delay_spread_mask).sum()
+                    / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=context_delay_spread_errors.dtype)
+                )
+                losses["loss_delay_spread_context"] = context_delay_spread_loss
+                losses["loss_delay_spread"] = context_delay_spread_loss
+            if profile_delay_spread is not None:
+                profile_delay_spread_errors = torch.nn.functional.smooth_l1_loss(
+                    profile_delay_spread,
+                    delay_spread_target,
+                    reduction="none",
+                )
+                profile_delay_spread_loss = (
+                    (profile_delay_spread_errors * weighted_delay_spread_mask).sum()
+                    / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=profile_delay_spread_errors.dtype)
+                )
+                losses["loss_delay_spread_profile"] = profile_delay_spread_loss
+            if profile_direct_delay_spread is not None:
+                profile_direct_delay_spread_errors = torch.nn.functional.smooth_l1_loss(
+                    profile_direct_delay_spread,
+                    delay_spread_target,
+                    reduction="none",
+                )
+                profile_direct_delay_spread_loss = (
+                    (profile_direct_delay_spread_errors * weighted_delay_spread_mask).sum()
+                    / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=profile_direct_delay_spread_errors.dtype)
+                )
+                losses["loss_delay_spread_direct"] = profile_direct_delay_spread_loss
+                teacher_errors = torch.nn.functional.smooth_l1_loss(
+                    csi_delay_spread,
+                    profile_direct_delay_spread.detach(),
+                    reduction="none",
+                )
+                teacher_loss = (
+                    (teacher_errors * weighted_delay_spread_mask).sum()
+                    / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=teacher_errors.dtype)
+                )
+                losses["loss_delay_spread_teacher"] = teacher_loss
+                if delay_spread_context is not None:
+                    context_teacher_errors = torch.nn.functional.smooth_l1_loss(
+                        delay_spread_context,
+                        profile_direct_delay_spread.detach(),
+                        reduction="none",
+                    )
+                    context_teacher_loss = (
+                        (context_teacher_errors * weighted_delay_spread_mask).sum()
+                        / weighted_delay_spread_mask.sum().clamp(min=1).to(dtype=context_teacher_errors.dtype)
+                    )
+                    losses["loss_delay_spread_context_teacher"] = context_teacher_loss
+        if (
+            physics_outputs is not None
+            and effective_first_path_delay_weight > 0.0
+        ):
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            first_delay_prediction = physics_outputs["first_path_delay_context"]
+            first_delay_target = batch["physics_targets"][:, first_delay_idx]
+            first_delay_mask = batch["physics_target_mask"][:, first_delay_idx]
+            first_delay_errors = torch.nn.functional.smooth_l1_loss(
+                first_delay_prediction,
+                first_delay_target,
+                reduction="none",
+            )
+            first_delay_weight = first_delay_mask.to(dtype=first_delay_errors.dtype)
+            losses["loss_first_path_delay"] = (
+                (first_delay_errors * first_delay_weight).sum()
+                / first_delay_weight.sum().clamp(min=1).to(dtype=first_delay_errors.dtype)
+            )
+        if (
+            physics_outputs is not None
+            and effective_los_delay_weight > 0.0
+            and "los_delay_ns" in PHYSICS_TARGET_NAMES
+        ):
+            los_delay_idx = PHYSICS_TARGET_NAMES.index("los_delay_ns")
+            los_delay_prediction = physics_outputs["los_delay_context"]
+            los_delay_target = batch["physics_targets"][:, los_delay_idx]
+            los_target_mask = batch["physics_target_mask"][:, los_delay_idx]
+            los_sample_mask = torch.tensor(
+                [key.los_status == "los" for key in batch["semantic_keys"]],
+                device=self.device,
+                dtype=torch.bool,
+            )
+            los_delay_mask = los_target_mask & los_sample_mask
+            los_delay_errors = torch.nn.functional.smooth_l1_loss(
+                los_delay_prediction,
+                los_delay_target,
+                reduction="none",
+            )
+            los_delay_weight = los_delay_mask.to(dtype=los_delay_errors.dtype)
+            losses["loss_los_delay"] = (
+                (los_delay_errors * los_delay_weight).sum()
+                / los_delay_weight.sum().clamp(min=1).to(dtype=los_delay_errors.dtype)
             )
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
@@ -949,8 +1449,13 @@ class Trainer:
             effective_strong_k_position_weight * losses.get("loss_strong_k_position", torch.zeros((), device=self.device)) +
             effective_first_path_power_bin_classifier_weight * losses.get("loss_first_path_power_bin_classifier", torch.zeros((), device=self.device)) +
             effective_first_path_power_bin_position_weight * losses.get("loss_first_path_power_bin_position", torch.zeros((), device=self.device)) +
+            effective_delay_spread_bin_classifier_weight * losses.get("loss_delay_spread_bin_classifier", torch.zeros((), device=self.device)) +
+            effective_delay_spread_bin_position_weight * losses.get("loss_delay_spread_bin_position", torch.zeros((), device=self.device)) +
+            effective_delay_spread_tail_classifier_weight * losses.get("loss_delay_spread_tail_classifier", torch.zeros((), device=self.device)) +
             cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device)) +
-            effective_delay_spread_weight * losses.get("loss_delay_spread", torch.zeros((), device=self.device))
+            effective_delay_spread_weight * losses.get("loss_delay_spread", torch.zeros((), device=self.device)) +
+            effective_first_path_delay_weight * losses.get("loss_first_path_delay", torch.zeros((), device=self.device)) +
+            effective_los_delay_weight * losses.get("loss_los_delay", torch.zeros((), device=self.device))
         )
         total_loss.backward()
         grad_metrics = {
@@ -1005,6 +1510,70 @@ class Trainer:
         )
         metrics["aux_regression_weight"] = float(effective_aux_regression_weight)
         metrics["delay_spread_weight"] = float(effective_delay_spread_weight)
+        metrics["first_path_delay_weight"] = float(effective_first_path_delay_weight)
+        metrics["los_delay_weight"] = float(effective_los_delay_weight)
+        metrics["delay_spread_teacher_weight"] = float(cfg.delay_spread_teacher_weight)
+        metrics["delay_spread_bin_classifier_weight"] = float(
+            effective_delay_spread_bin_classifier_weight
+        )
+        metrics["delay_spread_bin_position_weight"] = float(
+            effective_delay_spread_bin_position_weight
+        )
+        metrics["delay_spread_tail_classifier_weight"] = float(
+            effective_delay_spread_tail_classifier_weight
+        )
+        metrics["delay_spread_bin_label_order"] = ",".join(self.DELAY_SPREAD_BIN_LABELS)
+        metrics["delay_spread_tail_label_order"] = ",".join(self.DELAY_SPREAD_TAIL_LABELS)
+        metrics["delay_spread_bin_class_weights"] = self._format_float_vector(
+            self._delay_spread_bin_class_weight(
+                torch.float32,
+                cfg,
+            )
+            if cfg.delay_spread_bin_weights
+            else torch.ones(len(self.DELAY_SPREAD_BIN_LABELS), device=self.device)
+        )
+        if delay_spread_bin_target_histogram is not None:
+            metrics["delay_spread_bin_target_histogram"] = self._format_histogram(
+                delay_spread_bin_target_histogram
+            )
+        if delay_spread_bin_prediction_histogram is not None:
+            metrics["delay_spread_bin_prediction_histogram"] = self._format_histogram(
+                delay_spread_bin_prediction_histogram
+            )
+        if delay_spread_bin_loss_denominator is not None:
+            metrics["delay_spread_bin_loss_denominator"] = float(
+                delay_spread_bin_loss_denominator.detach()
+            )
+        if delay_spread_bin_position_mae is not None:
+            metrics["delay_spread_bin_position_mae"] = float(
+                delay_spread_bin_position_mae.detach()
+            )
+        if delay_spread_tail_accuracy is not None:
+            metrics["delay_spread_tail_accuracy"] = float(
+                delay_spread_tail_accuracy.detach().nanmean()
+            )
+            metrics["delay_spread_tail_recall"] = float(
+                delay_spread_tail_recall.detach().nanmean()
+            )
+            metrics["delay_spread_tail_false_positive"] = float(
+                delay_spread_tail_false_positive.detach().nanmean()
+            )
+            metrics["delay_spread_tail_positive_fraction"] = self._format_float_vector(
+                delay_spread_tail_positive_fraction,
+            )
+            metrics["delay_spread_tail_prediction_fraction"] = self._format_float_vector(
+                delay_spread_tail_prediction_fraction,
+            )
+            for idx, label in enumerate(self.DELAY_SPREAD_TAIL_LABELS):
+                metrics[f"delay_spread_tail_{label}_accuracy"] = float(
+                    delay_spread_tail_accuracy[idx].detach()
+                )
+                metrics[f"delay_spread_tail_{label}_recall"] = float(
+                    delay_spread_tail_recall[idx].detach()
+                )
+                metrics[f"delay_spread_tail_{label}_false_positive"] = float(
+                    delay_spread_tail_false_positive[idx].detach()
+                )
         metrics["strong_k_bin_classifier_weight"] = float(
             effective_strong_k_bin_classifier_weight
         )

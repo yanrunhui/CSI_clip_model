@@ -29,7 +29,6 @@ from scripts.evaluate import (
     _decode_strong_k,
     _infer_attribute_fields,
     _infer_attribute_remap,
-    _infer_min_class_size,
     _infer_semantic_key_mode,
     _infer_token_norm_mode,
     _infer_use_power_branch,
@@ -129,8 +128,14 @@ def _build_model(
 ) -> tuple[CSIClip, CaptionTokenizer, bool, dict[str, dict[str, int]], list[SemanticKey]]:
     token_norm_mode = _infer_token_norm_mode(checkpoint, None)
     use_power_branch = _infer_use_power_branch(checkpoint, None)
+    csi_delay_input_weight = checkpoint.get("model_state", {}).get(
+        "csi_delay_spread_head.1.weight"
+    )
     use_delay_spread_head = (
         float(checkpoint.get("args", {}).get("delay_spread_weight", 0.0)) > 0.0
+        and isinstance(csi_delay_input_weight, torch.Tensor)
+        and csi_delay_input_weight.ndim == 2
+        and csi_delay_input_weight.shape[1] == 256
     )
     attribute_fields = _infer_attribute_fields(checkpoint, None)
     attribute_remap = _infer_attribute_remap(checkpoint)

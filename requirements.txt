@@ -1,7 +1,18 @@
+# Core environment for CSI train/evaluate experiments
+# Install the torch build that matches your CUDA/CPU environment.
+torch
 numpy
 scipy
-torch
 pyyaml
 
-# DeepMIMO preprocessing
-DeepMIMOv3
+# Optional utilities used by the bundled OpenCLIP training code
+torchvision
+pandas
+Pillow
+tqdm
+regex
+ftfy
+braceexpand
+webdataset
+fsspec
+timm

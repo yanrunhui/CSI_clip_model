@@ -90,6 +90,7 @@ class PreprocessedSample:
     azimuth_spread_deg: float = 0.0
     k_factor_db: float = 0.0
     first_path_delay_s: float = math.nan
+    los_delay_s: float = math.nan
     first_path_power_dbw: float = math.nan
     first_path_aoa_az_deg: float = math.nan
     reflection_count: int = 0
@@ -105,6 +106,7 @@ def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
         "azimuth_spread_deg": 0.0,
         "k_factor_db": 0.0,
         "first_path_delay_s": math.nan,
+        "los_delay_s": math.nan,
         "first_path_power_dbw": math.nan,
         "first_path_aoa_az_deg": math.nan,
         "reflection_count": 0,
@@ -290,6 +292,9 @@ def collate_fn(
     physics_raw_targets = torch.zeros(batch_size, len(PHYSICS_TARGET_NAMES), dtype=torch.float32)
     physics_targets = torch.zeros_like(physics_raw_targets)
     physics_target_mask = torch.zeros_like(physics_raw_targets, dtype=torch.bool)
+    los_delay_raw_target = torch.zeros(batch_size, dtype=torch.float32)
+    los_delay_target = torch.zeros(batch_size, dtype=torch.float32)
+    los_delay_target_mask = torch.zeros(batch_size, dtype=torch.bool)
     delay_power_map = torch.zeros(
         batch_size,
         DELAY_POWER_MAP_SHAPE[0],
@@ -318,6 +323,11 @@ def collate_fn(
         physics_raw_targets[i] = raw_targets
         physics_targets[i] = normalized_targets
         physics_target_mask[i] = target_mask
+        los_delay_ns = _finite_or_nan(sample.los_delay_s) * 1e9
+        if math.isfinite(los_delay_ns):
+            los_delay_raw_target[i] = float(los_delay_ns)
+            los_delay_target[i] = float(los_delay_ns) / 3000.0
+            los_delay_target_mask[i] = True
         delay_power_map[i] = sample.delay_power_map.to(dtype=torch.float32)
         delay_power_profile[i] = sample.delay_power_profile.to(dtype=torch.float32)
 
@@ -338,6 +348,9 @@ def collate_fn(
         "physics_targets": physics_targets,
         "physics_target_mask": physics_target_mask,
         "physics_raw_targets": physics_raw_targets,
+        "los_delay_target": los_delay_target,
+        "los_delay_target_mask": los_delay_target_mask,
+        "los_delay_raw_target": los_delay_raw_target,
         "delay_power_map": delay_power_map,
         "delay_power_profile": delay_power_profile,
         "instance_captions": [sample.instance_caption for sample in batch],

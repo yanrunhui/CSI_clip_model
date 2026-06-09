@@ -56,16 +56,6 @@ def multipositive_contrastive_loss(
     return 0.5 * (loss_csi_to_text.mean() + loss_text_to_csi.mean())
 
 
-def masked_regression_loss(
-    predictions: torch.Tensor,
-    targets: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    errors = F.smooth_l1_loss(predictions, targets, reduction="none")
-    errors = errors * mask.to(dtype=errors.dtype)
-    return errors.sum() / mask.sum().clamp(min=1).to(dtype=errors.dtype)
-
-
 def cosine_alignment_loss(
     left_features: torch.Tensor,
     right_features: torch.Tensor,

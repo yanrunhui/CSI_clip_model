@@ -14,7 +14,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data.dataset import (
-    PHYSICS_TARGET_NAMES,
     PreprocessedCSIDataset,
     collate_fn,
 )
@@ -46,22 +45,6 @@ def infer_arg(checkpoint: dict | None, name: str, override, default):
         if value is not None:
             return value
     return default
-
-
-def semantic_key_sort_key(key: SemanticKey) -> tuple[str, ...]:
-    return (
-        key.env_type,
-        key.los_status,
-        key.path_richness,
-        key.ds_bin,
-        key.as_az_bin,
-        key.k_factor_bin,
-        key.first_delay_bin,
-        key.first_power_bin,
-        key.first_angle_bin,
-        key.reflection_bin,
-        key.diffraction_bin,
-    )
 
 
 def raw_path_count_bin(n_paths: int) -> str:

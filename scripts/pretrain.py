@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import Counter
 from functools import partial
@@ -39,7 +40,12 @@ from data.semantic_key import (
 )
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
-from models.model import CSIClip, K_FACTOR_STRONG_BIN_LABELS
+from models.model import (
+    CSIClip,
+    DELAY_SPREAD_BIN_LABELS,
+    DELAY_SPREAD_TAIL_LABELS,
+    K_FACTOR_STRONG_BIN_LABELS,
+)
 from models.text_encoder import PhysicsTextEncoder
 from training.scheduler import build_lr_scheduler
 from training.trainer import TrainConfig, Trainer
@@ -77,6 +83,11 @@ DEFAULT_STRONG_K_BIN_WEIGHTS = {
     for label in K_FACTOR_STRONG_BIN_LABELS
 }
 
+DEFAULT_DELAY_SPREAD_BIN_WEIGHTS = {
+    label: 1.0
+    for label in DELAY_SPREAD_BIN_LABELS
+}
+
 
 def parse_first_path_power_bin_weights(value) -> dict[str, float]:
     if value is None:
@@ -110,6 +121,43 @@ def format_first_path_power_bin_weights(weights: dict[str, float]) -> str:
     return ",".join(
         f"{label}={float(weights[label]):.3f}"
         for label in DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS
+    )
+
+
+def parse_delay_spread_bin_weights(value) -> dict[str, float] | None:
+    if value is None:
+        return None
+    entries = [value] if isinstance(value, str) else value
+    parsed = dict(DEFAULT_DELAY_SPREAD_BIN_WEIGHTS)
+    if isinstance(entries, dict):
+        parsed.update({str(label): float(weight) for label, weight in entries.items()})
+    else:
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--delay-spread-bin-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_DELAY_SPREAD_BIN_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown delay-spread bin labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_DELAY_SPREAD_BIN_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"delay-spread bin weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_delay_spread_bin_weights(weights: dict[str, float] | None) -> str:
+    if weights is None:
+        return "none"
+    return ",".join(
+        f"{label}={float(weights.get(label, 1.0)):.3f}"
+        for label in DEFAULT_DELAY_SPREAD_BIN_WEIGHTS
     )
 
 
@@ -483,6 +531,8 @@ def build_components_from_samples(
     token_norm_mode: str = "std",
     use_power_branch: bool = False,
     use_delay_spread_head: bool = False,
+    detach_delay_spread_features: bool = False,
+    use_delay_specific_encoder: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
@@ -533,6 +583,8 @@ def build_components_from_samples(
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
         use_power_branch=use_power_branch,
         use_delay_spread_head=use_delay_spread_head,
+        detach_delay_spread_features=detach_delay_spread_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -717,12 +769,51 @@ def limit_samples_by_attribute_value_for_debug(
     return limited
 
 
+def _sample_delay_spread_ns(sample) -> float:
+    scale = 1.0
+    if hasattr(sample, "delay_spread_ns"):
+        value = getattr(sample, "delay_spread_ns")
+    elif hasattr(sample, "delay_spread_s"):
+        value = getattr(sample, "delay_spread_s")
+        scale = 1e9
+    elif hasattr(sample, "delay_spread"):
+        value = getattr(sample, "delay_spread")
+        scale = 1e9
+    else:
+        return math.nan
+    try:
+        value = float(value) * scale
+    except (TypeError, ValueError):
+        return math.nan
+    return value if math.isfinite(value) else math.nan
+
+
+def filter_samples_by_max_delay_spread(samples, max_delay_spread_ns: float | None):
+    if max_delay_spread_ns is None:
+        return samples
+    if max_delay_spread_ns <= 0.0:
+        raise ValueError("max_delay_spread_ns must be positive.")
+    filtered = []
+    for sample in samples:
+        delay_spread_ns = _sample_delay_spread_ns(sample)
+        if math.isfinite(delay_spread_ns) and delay_spread_ns < max_delay_spread_ns:
+            filtered.append(sample)
+    if not filtered:
+        raise ValueError(
+            "No samples remain after applying "
+            f"max_delay_spread_ns={max_delay_spread_ns}."
+        )
+    return filtered
+
+
 def build_demo_components(
     device: torch.device,
     semantic_key_mode: str = "full",
     token_norm_mode: str = "std",
     use_power_branch: bool = False,
     use_delay_spread_head: bool = False,
+    detach_delay_spread_features: bool = False,
+    use_delay_specific_encoder: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ):
@@ -740,6 +831,8 @@ def build_demo_components(
         token_norm_mode=token_norm_mode,
         use_power_branch=use_power_branch,
         use_delay_spread_head=use_delay_spread_head,
+        detach_delay_spread_features=detach_delay_spread_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
     )
@@ -753,6 +846,8 @@ def build_real_components(
     token_norm_mode: str = "std",
     use_power_branch: bool = False,
     use_delay_spread_head: bool = False,
+    detach_delay_spread_features: bool = False,
+    use_delay_specific_encoder: bool = False,
     min_class_size: int = 1,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
@@ -761,6 +856,7 @@ def build_real_components(
     limit_samples: int | None = None,
     limit_samples_by_attribute: str | None = None,
     limit_samples_per_attribute_value: int | None = None,
+    max_delay_spread_ns: float | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
 ):
     dataset = PreprocessedCSIDataset.from_pt(data_path)
@@ -809,6 +905,19 @@ def build_real_components(
             f"value_counts={value_count_text}"
         )
     samples = value_filtered_samples
+    delay_filtered_samples = filter_samples_by_max_delay_spread(
+        samples,
+        max_delay_spread_ns,
+    )
+    if len(delay_filtered_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in delay_filtered_samples)
+        print(
+            f"filtered samples by max_delay_spread_ns={max_delay_spread_ns}: "
+            f"samples {len(samples)} -> {len(delay_filtered_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
+    samples = delay_filtered_samples
     balanced_limited_samples = limit_samples_by_attribute_value_for_debug(
         samples,
         limit_samples_by_attribute,
@@ -856,6 +965,8 @@ def build_real_components(
         token_norm_mode=token_norm_mode,
         use_power_branch=use_power_branch,
         use_delay_spread_head=use_delay_spread_head,
+        detach_delay_spread_features=detach_delay_spread_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
         tokenizer_word2id=tokenizer_word2id,
@@ -881,6 +992,13 @@ def run_smoke_test(
     strong_k_bin_weights: dict[str, float] | None = None,
     direct_power_weight: float = 0.0,
     delay_spread_weight: float = 0.0,
+    first_path_delay_weight: float = 0.0,
+    los_delay_weight: float = 0.0,
+    delay_spread_teacher_weight: float = 0.1,
+    delay_spread_bin_weights: dict[str, float] | None = None,
+    delay_spread_bin_classifier_weight: float = 0.0,
+    delay_spread_bin_position_weight: float = 0.0,
+    delay_spread_tail_classifier_weight: float = 0.0,
     first_path_power_bin_classifier_weight: float = 0.0,
     first_path_power_bin_position_weight: float = 0.0,
     first_path_power_bin_weights: dict[str, float] | None = None,
@@ -890,6 +1008,8 @@ def run_smoke_test(
     semantic_key_mode: str = "full",
     token_norm_mode: str = "std",
     use_power_branch: bool = False,
+    detach_delay_spread_features: bool = False,
+    use_delay_specific_encoder: bool = False,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> None:
     loader, model, _, prototype_bank = build_demo_components(
@@ -898,6 +1018,8 @@ def run_smoke_test(
         token_norm_mode=token_norm_mode,
         use_power_branch=use_power_branch,
         use_delay_spread_head=delay_spread_weight > 0.0,
+        detach_delay_spread_features=detach_delay_spread_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
         attribute_fields=attribute_classifier_fields,
         attribute_remap=attribute_remap,
     )
@@ -946,6 +1068,13 @@ def run_smoke_test(
                     first_path_power_bin_position_weight=first_path_power_bin_position_weight,
                     direct_power_weight=direct_power_weight,
                     delay_spread_weight=delay_spread_weight,
+                    first_path_delay_weight=first_path_delay_weight,
+                    los_delay_weight=los_delay_weight,
+                    delay_spread_teacher_weight=delay_spread_teacher_weight,
+                    delay_spread_bin_weights=delay_spread_bin_weights,
+                    delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
+                    delay_spread_bin_position_weight=delay_spread_bin_position_weight,
+                    delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
                     first_path_power_bin_weights=first_path_power_bin_weights,
                     prototype_warmup_epochs=1,
                     multipositive_distance_threshold=multipositive_distance_threshold,
@@ -973,6 +1102,8 @@ def run_real_pretrain(
     temperature: float,
     token_norm_mode: str,
     use_power_branch: bool,
+    detach_delay_spread_features: bool,
+    use_delay_specific_encoder: bool,
     warmup_epochs: int,
     min_lr: float,
     prototype_weight: float,
@@ -997,6 +1128,13 @@ def run_real_pretrain(
     first_path_power_bin_position_weight: float,
     direct_power_weight: float,
     delay_spread_weight: float,
+    first_path_delay_weight: float,
+    los_delay_weight: float,
+    delay_spread_teacher_weight: float,
+    delay_spread_bin_weights: dict[str, float] | None,
+    delay_spread_bin_classifier_weight: float,
+    delay_spread_bin_position_weight: float,
+    delay_spread_tail_classifier_weight: float,
     first_path_power_bin_weights: dict[str, float],
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
@@ -1008,6 +1146,7 @@ def run_real_pretrain(
     limit_samples: int | None,
     limit_samples_by_attribute: str | None,
     limit_samples_per_attribute_value: int | None,
+    max_delay_spread_ns: float | None,
     freeze_csi: bool,
     freeze_text_prototypes: bool,
     output_dir: str,
@@ -1026,6 +1165,8 @@ def run_real_pretrain(
         token_norm_mode=token_norm_mode,
         use_power_branch=use_power_branch,
         use_delay_spread_head=delay_spread_weight > 0.0,
+        detach_delay_spread_features=detach_delay_spread_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
         min_class_size=min_class_size,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
@@ -1034,6 +1175,7 @@ def run_real_pretrain(
         limit_samples=limit_samples,
         limit_samples_by_attribute=limit_samples_by_attribute,
         limit_samples_per_attribute_value=limit_samples_per_attribute_value,
+        max_delay_spread_ns=max_delay_spread_ns,
         tokenizer_word2id=(
             transfer_checkpoint.get("tokenizer_word2id")
             if transfer_checkpoint is not None
@@ -1094,6 +1236,13 @@ def run_real_pretrain(
         first_path_power_bin_position_weight=first_path_power_bin_position_weight,
         direct_power_weight=direct_power_weight,
         delay_spread_weight=delay_spread_weight,
+        first_path_delay_weight=first_path_delay_weight,
+        los_delay_weight=los_delay_weight,
+        delay_spread_teacher_weight=delay_spread_teacher_weight,
+        delay_spread_bin_weights=delay_spread_bin_weights,
+        delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
+        delay_spread_bin_position_weight=delay_spread_bin_position_weight,
+        delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
         first_path_power_bin_weights=first_path_power_bin_weights,
         freeze_csi=freeze_csi,
         freeze_text_prototypes=freeze_text_prototypes,
@@ -1119,6 +1268,8 @@ def run_real_pretrain(
         f"device={device} epochs={epochs} batch_size={batch_size} "
         f"temperature={temperature} token_norm_mode={token_norm_mode} "
         f"use_power_branch={use_power_branch} "
+        f"detach_delay_spread_features={detach_delay_spread_features} "
+        f"use_delay_specific_encoder={use_delay_specific_encoder} "
         f"warmup_epochs={warmup_epochs} min_lr={min_lr}"
     )
     print(
@@ -1147,6 +1298,15 @@ def run_real_pretrain(
         f"first_path_power_bin_label_order={','.join(FIRST_POWER_DBW_BIN_LABELS)} "
         f"direct_power_weight={direct_power_weight} "
         f"delay_spread_weight={delay_spread_weight} "
+        f"first_path_delay_weight={first_path_delay_weight} "
+        f"los_delay_weight={los_delay_weight} "
+        f"delay_spread_teacher_weight={delay_spread_teacher_weight} "
+        f"delay_spread_bin_classifier_weight={delay_spread_bin_classifier_weight} "
+        f"delay_spread_bin_position_weight={delay_spread_bin_position_weight} "
+        f"delay_spread_tail_classifier_weight={delay_spread_tail_classifier_weight} "
+        f"delay_spread_bin_weights={format_delay_spread_bin_weights(delay_spread_bin_weights)} "
+        f"delay_spread_bin_label_order={','.join(DELAY_SPREAD_BIN_LABELS)} "
+        f"delay_spread_tail_label_order={','.join(DELAY_SPREAD_TAIL_LABELS)} "
         f"first_path_power_bin_weights={format_first_path_power_bin_weights(first_path_power_bin_weights)} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
@@ -1156,6 +1316,7 @@ def run_real_pretrain(
         f"limit_samples={limit_samples} "
         f"limit_samples_by_attribute={limit_samples_by_attribute} "
         f"limit_samples_per_attribute_value={limit_samples_per_attribute_value} "
+        f"max_delay_spread_ns={max_delay_spread_ns} "
         f"freeze_csi={freeze_csi} freeze_text_prototypes={freeze_text_prototypes} "
         f"trainable_parameters={count_trainable_parameters(model)}"
     )
@@ -1268,6 +1429,60 @@ def run_real_pretrain(
         mean_first_path_power_bin_loss_denominator = sum(
             m.get("first_path_power_bin_loss_denominator", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
+        mean_delay_spread_bin_classifier = sum(
+            m.get("loss_delay_spread_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_accuracy = sum(
+            m.get("accuracy_delay_spread_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_position = sum(
+            m.get("loss_delay_spread_bin_position", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_position_mae = sum(
+            m.get("delay_spread_bin_position_mae", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_loss_denominator = sum(
+            m.get("delay_spread_bin_loss_denominator", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_tail_classifier = sum(
+            m.get("loss_delay_spread_tail_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_tail_accuracy = sum(
+            m.get("delay_spread_tail_accuracy", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_tail_recall = sum(
+            m.get("delay_spread_tail_recall", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_tail_false_positive = sum(
+            m.get("delay_spread_tail_false_positive", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        last_delay_spread_tail_positive_fraction = epoch_metrics[-1].get(
+            "delay_spread_tail_positive_fraction",
+            "",
+        )
+        last_delay_spread_tail_prediction_fraction = epoch_metrics[-1].get(
+            "delay_spread_tail_prediction_fraction",
+            "",
+        )
+        last_delay_spread_bin_class_weights = epoch_metrics[-1].get("delay_spread_bin_class_weights", "")
+        delay_spread_bin_target_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "delay_spread_bin_target_histogram",
+            len(DELAY_SPREAD_BIN_LABELS),
+        )
+        delay_spread_bin_prediction_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "delay_spread_bin_prediction_histogram",
+            len(DELAY_SPREAD_BIN_LABELS),
+        )
+        delay_spread_bin_target_distribution = format_histogram_counts(
+            DELAY_SPREAD_BIN_LABELS,
+            delay_spread_bin_target_histogram,
+        )
+        delay_spread_bin_prediction_distribution = format_histogram_counts(
+            DELAY_SPREAD_BIN_LABELS,
+            delay_spread_bin_prediction_histogram,
+        )
         first_path_power_bin_target_histogram = sum_histogram_metric(
             epoch_metrics,
             "first_path_power_bin_target_histogram",
@@ -1287,6 +1502,8 @@ def run_real_pretrain(
             first_path_power_bin_prediction_histogram,
         )
         mean_direct_power = sum(m.get("loss_direct_power", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_first_path_delay = sum(m.get("loss_first_path_delay", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_los_delay = sum(m.get("loss_los_delay", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_k_factor_sample_weight = sum(
             m.get("k_factor_sample_weight_mean", 1.0) for m in epoch_metrics
         ) / len(epoch_metrics)
@@ -1320,34 +1537,14 @@ def run_real_pretrain(
             else ""
         )
         print(
-            f"epoch={epoch} steps={len(epoch_metrics)} "
-            f"loss={mean_total:.4f} contrastive={mean_contrastive:.4f} "
-            f"csi_to_text={mean_csi_to_text:.4f} csi_to_proto={mean_csi_to_prototype:.4f} "
-            f"text_to_proto={mean_text_to_prototype:.4f} "
-            f"sem_cls={mean_semantic_classifier:.4f} sem_acc={mean_semantic_accuracy:.4f} "
-            f"attr_cls={mean_attribute_classifier:.4f} attr_acc={mean_attribute_accuracy:.4f} "
-            f"proto_warmup_active={mean_prototype_warmup_active:.2f} "
-            f"{attribute_debug} "
-            f"aux_reg={mean_aux_regression:.4f} "
-            f"strong_k_cls={mean_strong_k_bin_classifier:.4f} "
-            f"strong_k_acc={mean_strong_k_bin_accuracy:.4f} "
-            f"strong_k_pos={mean_strong_k_position:.4f} "
-            f"strong_k_pos_mae={mean_strong_k_position_mae:.4f} "
-            f"strong_k_loss_den={mean_strong_k_bin_loss_denominator:.1f} "
-            f"strong_k_w={last_strong_k_bin_class_weights} "
-            f"strong_k_target={strong_k_bin_target_distribution} "
-            f"strong_k_pred={strong_k_bin_prediction_distribution} "
-            f"fp_bin_cls={mean_first_path_power_bin_classifier:.4f} "
-            f"fp_bin_acc={mean_first_path_power_bin_accuracy:.4f} "
-            f"fp_bin_pos={mean_first_path_power_bin_position:.4f} "
-            f"fp_bin_pos_mae={mean_first_path_power_bin_position_mae:.4f} "
-            f"fp_bin_loss_den={mean_first_path_power_bin_loss_denominator:.1f} "
-            f"fp_bin_target={first_path_power_bin_target_distribution} "
-            f"fp_bin_pred={first_path_power_bin_prediction_distribution} "
-            f"direct_power={mean_direct_power:.4f} "
-            f"k_factor_w={mean_k_factor_sample_weight:.3f} "
-            f"fp_power_w={mean_first_path_power_sample_weight:.3f} "
-            f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
+            f"epoch={epoch:03d}/{epochs} steps={len(epoch_metrics)} "
+            f"loss={mean_total:.4f} c2t={mean_csi_to_text:.4f} "
+            f"sem_acc={mean_semantic_accuracy:.4f} attr_acc={mean_attribute_accuracy:.4f} "
+            f"k_acc={mean_strong_k_bin_accuracy:.4f} k_pos_mae={mean_strong_k_position_mae:.4f} "
+            f"delay_acc={mean_delay_spread_bin_accuracy:.4f} "
+            f"delay_pos_mae={mean_delay_spread_bin_position_mae:.4f} "
+            f"aux={mean_aux_regression:.4f} grad_csi={mean_grad_csi_encoder:.2e} "
+            f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
         with log_path.open("a", encoding="utf-8") as f:
             f.write(
@@ -1403,7 +1600,25 @@ def run_real_pretrain(
                         "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
                         "first_path_power_bin_target_histogram": first_path_power_bin_target_histogram,
                         "first_path_power_bin_prediction_histogram": first_path_power_bin_prediction_histogram,
+                        "loss_delay_spread_bin_classifier": mean_delay_spread_bin_classifier,
+                        "accuracy_delay_spread_bin_classifier": mean_delay_spread_bin_accuracy,
+                        "loss_delay_spread_bin_position": mean_delay_spread_bin_position,
+                        "delay_spread_bin_position_mae": mean_delay_spread_bin_position_mae,
+                        "delay_spread_bin_loss_denominator": mean_delay_spread_bin_loss_denominator,
+                        "delay_spread_bin_class_weights": last_delay_spread_bin_class_weights,
+                        "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
+                        "delay_spread_bin_target_histogram": delay_spread_bin_target_histogram,
+                        "delay_spread_bin_prediction_histogram": delay_spread_bin_prediction_histogram,
+                        "loss_delay_spread_tail_classifier": mean_delay_spread_tail_classifier,
+                        "accuracy_delay_spread_tail_classifier": mean_delay_spread_tail_accuracy,
+                        "recall_delay_spread_tail_classifier": mean_delay_spread_tail_recall,
+                        "false_positive_delay_spread_tail_classifier": mean_delay_spread_tail_false_positive,
+                        "delay_spread_tail_label_order": list(DELAY_SPREAD_TAIL_LABELS),
+                        "delay_spread_tail_positive_fraction": last_delay_spread_tail_positive_fraction,
+                        "delay_spread_tail_prediction_fraction": last_delay_spread_tail_prediction_fraction,
                         "loss_direct_power": mean_direct_power,
+                        "loss_first_path_delay": mean_first_path_delay,
+                        "loss_los_delay": mean_los_delay,
                         "k_factor_sample_weight_mean": mean_k_factor_sample_weight,
                         "first_path_power_sample_weight_mean": mean_first_path_power_sample_weight,
                         "logit_scale": mean_logit_scale,
@@ -1426,6 +1641,8 @@ def run_real_pretrain(
                         },
                         "token_norm_mode": token_norm_mode,
                         "use_power_branch": use_power_branch,
+                        "detach_delay_spread_features": detach_delay_spread_features,
+                        "use_delay_specific_encoder": use_delay_specific_encoder,
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
                         "k_factor_loss_weights": k_factor_loss_weights,
@@ -1438,6 +1655,15 @@ def run_real_pretrain(
                         "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
                         "direct_power_weight": direct_power_weight,
                         "delay_spread_weight": delay_spread_weight,
+                        "first_path_delay_weight": first_path_delay_weight,
+                        "los_delay_weight": los_delay_weight,
+                        "delay_spread_teacher_weight": delay_spread_teacher_weight,
+                        "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
+                        "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
+                        "delay_spread_tail_classifier_weight": delay_spread_tail_classifier_weight,
+                        "delay_spread_bin_weights": delay_spread_bin_weights,
+                        "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
+                        "delay_spread_tail_label_order": list(DELAY_SPREAD_TAIL_LABELS),
                         "first_path_power_bin_weights": first_path_power_bin_weights,
                         "multipositive_distance_threshold": multipositive_distance_threshold,
                         "multipositive_positive_mode": multipositive_positive_mode,
@@ -1451,6 +1677,7 @@ def run_real_pretrain(
                         "limit_samples": limit_samples,
                         "limit_samples_by_attribute": limit_samples_by_attribute,
                         "limit_samples_per_attribute_value": limit_samples_per_attribute_value,
+                        "max_delay_spread_ns": max_delay_spread_ns,
                         "freeze_csi": freeze_csi,
                         "freeze_text_prototypes": freeze_text_prototypes,
                         "multipositive_positive_count_mean": mean_positive_count,
@@ -1478,6 +1705,8 @@ def run_real_pretrain(
                     "temperature": temperature,
                     "token_norm_mode": token_norm_mode,
                     "use_power_branch": use_power_branch,
+                    "detach_delay_spread_features": detach_delay_spread_features,
+                    "use_delay_specific_encoder": use_delay_specific_encoder,
                     "warmup_epochs": warmup_epochs,
                     "min_lr": min_lr,
                     "csi_to_text_weight": csi_to_text_weight,
@@ -1499,7 +1728,6 @@ def run_real_pretrain(
                         }
                         for field, mapping in attribute_remap.items()
                     },
-                    "token_norm_mode": token_norm_mode,
                     "aux_regression_weight": aux_regression_weight,
                     "aux_regression_targets": list(aux_regression_targets),
                     "k_factor_loss_weights": k_factor_loss_weights,
@@ -1512,6 +1740,13 @@ def run_real_pretrain(
                     "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
                     "direct_power_weight": direct_power_weight,
                     "delay_spread_weight": delay_spread_weight,
+                    "first_path_delay_weight": first_path_delay_weight,
+                    "los_delay_weight": los_delay_weight,
+                    "delay_spread_teacher_weight": delay_spread_teacher_weight,
+                    "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
+                    "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
+                    "delay_spread_bin_weights": delay_spread_bin_weights,
+                    "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
                     "first_path_power_bin_weights": first_path_power_bin_weights,
                     "multipositive_distance_threshold": multipositive_distance_threshold,
                     "multipositive_positive_mode": multipositive_positive_mode,
@@ -1525,6 +1760,7 @@ def run_real_pretrain(
                     "limit_samples": limit_samples,
                     "limit_samples_by_attribute": limit_samples_by_attribute,
                     "limit_samples_per_attribute_value": limit_samples_per_attribute_value,
+                    "max_delay_spread_ns": max_delay_spread_ns,
                     "freeze_csi": freeze_csi,
                     "freeze_text_prototypes": freeze_text_prototypes,
                     "phase": f"csi_clip_{text_mode}_text",
@@ -1554,6 +1790,16 @@ def main() -> None:
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--token-norm-mode", choices=["std", "rms", "none"])
     parser.add_argument("--enable-power-branch", action="store_true")
+    parser.add_argument(
+        "--detach-delay-spread-features",
+        action="store_true",
+        help="Detach CSI features before delay-spread heads so delay losses do not update the shared CSI encoder.",
+    )
+    parser.add_argument(
+        "--use-delay-specific-encoder",
+        action="store_true",
+        help="Use a separate convolutional/attention encoder for delay-spread heads.",
+    )
     parser.add_argument("--warmup-epochs", type=int)
     parser.add_argument("--min-lr", type=float)
     parser.add_argument("--csi-to-text-weight", type=float)
@@ -1660,6 +1906,44 @@ def main() -> None:
         help="Explicit supervision weight for the independent delay-spread head.",
     )
     parser.add_argument(
+        "--first-path-delay-weight",
+        type=float,
+        help="Supervision weight for first-path delay prediction from the shared delay context.",
+    )
+    parser.add_argument(
+        "--los-delay-weight",
+        type=float,
+        help="Supervision weight for LoS delay prediction from the shared delay context on LoS samples.",
+    )
+    parser.add_argument(
+        "--delay-spread-teacher-weight",
+        type=float,
+        help="Distillation weight from the profile-direct delay-spread teacher to the CSI-only delay head.",
+    )
+    parser.add_argument(
+        "--delay-spread-bin-classifier-weight",
+        type=float,
+        help="Auxiliary classification weight for CSI-only delay-spread bin prediction.",
+    )
+    parser.add_argument(
+        "--delay-spread-bin-position-weight",
+        type=float,
+        help="Auxiliary regression weight for CSI-only delay-spread position within its ns bin.",
+    )
+    parser.add_argument(
+        "--delay-spread-tail-classifier-weight",
+        type=float,
+        help="Auxiliary binary classification weight for CSI-only delay-spread >=100ns/>=200ns prediction.",
+    )
+    parser.add_argument(
+        "--delay-spread-bin-weight",
+        action="append",
+        help=(
+            "Per-bin weighting for delay-spread losses as LABEL=WEIGHT. "
+            "Labels: 0_25, 25_50, 50_100, 100_200, 200_400, 400_plus."
+        ),
+    )
+    parser.add_argument(
         "--first-path-power-bin-weight",
         action="append",
         help=(
@@ -1701,6 +1985,11 @@ def main() -> None:
         help="Number of samples to keep per value when --limit-samples-by-attribute is set.",
     )
     parser.add_argument(
+        "--max-delay-spread-ns",
+        type=float,
+        help="Drop samples whose delay_spread_ns is greater than or equal to this value.",
+    )
+    parser.add_argument(
         "--freeze-csi",
         action="store_true",
         help="Freeze the CSI encoder. Useful for attribute-head-only overfit diagnostics.",
@@ -1739,6 +2028,14 @@ def main() -> None:
     use_power_branch = bool(
         args.enable_power_branch
         or cfg_get(train_cfg, "use_power_branch", False)
+    )
+    detach_delay_spread_features = bool(
+        args.detach_delay_spread_features
+        or cfg_get(train_cfg, "detach_delay_spread_features", False)
+    )
+    use_delay_specific_encoder = bool(
+        args.use_delay_specific_encoder
+        or cfg_get(train_cfg, "use_delay_specific_encoder", False)
     )
     warmup_epochs = (
         args.warmup_epochs
@@ -1861,6 +2158,41 @@ def main() -> None:
         if args.delay_spread_weight is not None
         else float(cfg_get(train_cfg, "delay_spread_weight", 0.0))
     )
+    first_path_delay_weight = (
+        args.first_path_delay_weight
+        if args.first_path_delay_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_weight", 0.0))
+    )
+    los_delay_weight = (
+        args.los_delay_weight
+        if args.los_delay_weight is not None
+        else float(cfg_get(train_cfg, "los_delay_weight", 0.0))
+    )
+    delay_spread_teacher_weight = (
+        args.delay_spread_teacher_weight
+        if args.delay_spread_teacher_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_teacher_weight", 0.1))
+    )
+    delay_spread_bin_weights = parse_delay_spread_bin_weights(
+        args.delay_spread_bin_weight
+        if args.delay_spread_bin_weight is not None
+        else cfg_get(train_cfg, "delay_spread_bin_weights", None)
+    )
+    delay_spread_bin_classifier_weight = (
+        args.delay_spread_bin_classifier_weight
+        if args.delay_spread_bin_classifier_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_bin_classifier_weight", 0.0))
+    )
+    delay_spread_bin_position_weight = (
+        args.delay_spread_bin_position_weight
+        if args.delay_spread_bin_position_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_bin_position_weight", 0.0))
+    )
+    delay_spread_tail_classifier_weight = (
+        args.delay_spread_tail_classifier_weight
+        if args.delay_spread_tail_classifier_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_tail_classifier_weight", 0.0))
+    )
     first_path_power_bin_weights = parse_first_path_power_bin_weights(
         args.first_path_power_bin_weight
         if args.first_path_power_bin_weight is not None
@@ -1871,7 +2203,6 @@ def main() -> None:
             first_path_power_bin_classifier_weight > 0.0
             or first_path_power_bin_position_weight > 0.0
             or direct_power_weight > 0.0
-            or delay_spread_weight > 0.0
         )
         and not use_power_branch
     ):
@@ -1925,6 +2256,13 @@ def main() -> None:
     )
     if limit_samples_per_attribute_value is not None:
         limit_samples_per_attribute_value = int(limit_samples_per_attribute_value)
+    max_delay_spread_ns = (
+        args.max_delay_spread_ns
+        if args.max_delay_spread_ns is not None
+        else cfg_get(train_cfg, "max_delay_spread_ns", None)
+    )
+    if max_delay_spread_ns is not None:
+        max_delay_spread_ns = float(max_delay_spread_ns)
     freeze_csi = bool(args.freeze_csi or cfg_get(train_cfg, "freeze_csi", False))
     freeze_text_prototypes = bool(
         args.freeze_text_prototypes
@@ -1957,6 +2295,13 @@ def main() -> None:
             first_path_power_bin_position_weight=first_path_power_bin_position_weight,
             direct_power_weight=direct_power_weight,
             delay_spread_weight=delay_spread_weight,
+            first_path_delay_weight=first_path_delay_weight,
+            los_delay_weight=los_delay_weight,
+            delay_spread_teacher_weight=delay_spread_teacher_weight,
+            delay_spread_bin_weights=delay_spread_bin_weights,
+            delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
+            delay_spread_bin_position_weight=delay_spread_bin_position_weight,
+            delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
             first_path_power_bin_weights=first_path_power_bin_weights,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
@@ -1964,6 +2309,8 @@ def main() -> None:
             semantic_key_mode=semantic_key_mode,
             token_norm_mode=token_norm_mode,
             use_power_branch=use_power_branch,
+            detach_delay_spread_features=detach_delay_spread_features,
+            use_delay_specific_encoder=use_delay_specific_encoder,
         )
         return
 
@@ -1981,6 +2328,8 @@ def main() -> None:
             temperature=temperature,
             token_norm_mode=token_norm_mode,
             use_power_branch=use_power_branch,
+            detach_delay_spread_features=detach_delay_spread_features,
+            use_delay_specific_encoder=use_delay_specific_encoder,
             warmup_epochs=warmup_epochs,
             min_lr=min_lr,
             csi_to_text_weight=csi_to_text_weight,
@@ -2005,6 +2354,13 @@ def main() -> None:
             first_path_power_bin_position_weight=first_path_power_bin_position_weight,
             direct_power_weight=direct_power_weight,
             delay_spread_weight=delay_spread_weight,
+            first_path_delay_weight=first_path_delay_weight,
+            los_delay_weight=los_delay_weight,
+            delay_spread_teacher_weight=delay_spread_teacher_weight,
+            delay_spread_bin_weights=delay_spread_bin_weights,
+            delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
+            delay_spread_bin_position_weight=delay_spread_bin_position_weight,
+            delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
             first_path_power_bin_weights=first_path_power_bin_weights,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
@@ -2016,6 +2372,7 @@ def main() -> None:
             limit_samples=limit_samples,
             limit_samples_by_attribute=limit_samples_by_attribute,
             limit_samples_per_attribute_value=limit_samples_per_attribute_value,
+            max_delay_spread_ns=max_delay_spread_ns,
             freeze_csi=freeze_csi,
             freeze_text_prototypes=freeze_text_prototypes,
             output_dir=output_dir,
