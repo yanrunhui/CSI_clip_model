@@ -808,8 +808,9 @@ class CSIClip(nn.Module):
             self.delay_spread_bin_position_head(delay_head_input).squeeze(-1)
         )
         delay_spread_context = self.delay_spread_context_head(delay_head_input).squeeze(-1)
-        first_path_delay_context = self.first_path_delay_context_head(delay_head_input).squeeze(-1)
-        los_delay_context = self.los_delay_context_head(delay_head_input).squeeze(-1)
+        delay_probe_input = delay_head_input.detach()
+        first_path_delay_context = self.first_path_delay_context_head(delay_probe_input).squeeze(-1)
+        los_delay_context = self.los_delay_context_head(delay_probe_input).squeeze(-1)
         delay_spread_tail_logits = self.delay_spread_tail_classifier(delay_head_input)
         first_path_power_bin_logits = self.first_path_power_bin_classifier(
             csi_features

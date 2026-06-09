@@ -51,8 +51,8 @@ train:
   first_path_power_bin_position_weight: 0.0
   direct_power_weight: 0.0
   delay_spread_weight: 0.01
-  first_path_delay_weight: 0.2
-  los_delay_weight: 0.2
+  first_path_delay_weight: 0.05
+  los_delay_weight: 0.0
   delay_spread_teacher_weight: 0.0
   delay_spread_bin_classifier_weight: 0.03
   delay_spread_bin_position_weight: 0.008
