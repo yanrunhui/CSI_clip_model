@@ -559,6 +559,13 @@ def _source_group_id(d2los_root: Path, propbin_path: Path, rx_idx: int) -> str:
     return f"{d2los_root.name}-{map_name}-{source_name}-rx_{int(rx_idx)}"
 
 
+def _d2los_map_name(propbin_path: Path) -> str:
+    return next(
+        (parent.name for parent in propbin_path.parents if parent.name.startswith("map_")),
+        "map_unknown",
+    )
+
+
 def _uniform_file_allocations(
     propbin_files: list[Path],
     max_samples: int,
@@ -593,6 +600,63 @@ def _uniform_file_allocations(
     return allocations
 
 
+def _map_uniform_file_allocations(
+    propbin_files: list[Path],
+    max_samples: int,
+    max_rx_per_source: int | None,
+    seed: int,
+) -> dict[Path, int]:
+    if max_samples <= 0:
+        return {}
+    cap_per_file = max_rx_per_source if max_rx_per_source is not None else max_samples
+    if cap_per_file <= 0:
+        return {}
+
+    rng = np.random.default_rng(seed)
+    files_by_map: dict[str, list[Path]] = {}
+    for path in propbin_files:
+        files_by_map.setdefault(_d2los_map_name(path), []).append(path)
+    for files in files_by_map.values():
+        rng.shuffle(files)
+
+    map_names = list(files_by_map)
+    rng.shuffle(map_names)
+    file_offsets = {map_name: 0 for map_name in map_names}
+    allocations: dict[Path, int] = {}
+    remaining = max_samples
+
+    while remaining > 0 and map_names:
+        made_progress = False
+        for map_name in list(map_names):
+            if remaining <= 0:
+                break
+            files = files_by_map[map_name]
+            if not files:
+                map_names.remove(map_name)
+                continue
+
+            searched = 0
+            allocated = False
+            while searched < len(files):
+                file_idx = file_offsets[map_name] % len(files)
+                file_offsets[map_name] += 1
+                searched += 1
+                path = files[file_idx]
+                current = allocations.get(path, 0)
+                if current >= cap_per_file:
+                    continue
+                allocations[path] = current + 1
+                remaining -= 1
+                allocated = True
+                made_progress = True
+                break
+            if not allocated:
+                map_names.remove(map_name)
+        if not made_progress:
+            break
+    return allocations
+
+
 def load_d2los_dataset(
     d2los_root: Path,
     max_samples: int | None,
@@ -622,7 +686,7 @@ def load_d2los_dataset(
     )
     if not propbin_files:
         raise FileNotFoundError(f"No source_*.propbin(.gz) files found under {d2los_root}")
-    if sampling not in ("sequential", "uniform"):
+    if sampling not in ("sequential", "uniform", "map_uniform"):
         raise ValueError(f"Unsupported D2Los sampling mode: {sampling}")
 
     selected_subcarriers = np.arange(total_subcarriers, dtype=np.int64)
@@ -641,16 +705,22 @@ def load_d2los_dataset(
     group_ids: list[str] = []
     skipped_propbin_files = 0
     rng = np.random.default_rng(sample_seed)
-    file_allocations = (
-        _uniform_file_allocations(
-            propbin_files=propbin_files,
-            max_samples=max_samples,
-            max_rx_per_source=max_rx_per_source,
-            seed=sample_seed,
-        )
-        if sampling == "uniform" and max_samples is not None
-        else None
-    )
+    file_allocations = None
+    if max_samples is not None:
+        if sampling == "uniform":
+            file_allocations = _uniform_file_allocations(
+                propbin_files=propbin_files,
+                max_samples=max_samples,
+                max_rx_per_source=max_rx_per_source,
+                seed=sample_seed,
+            )
+        elif sampling == "map_uniform":
+            file_allocations = _map_uniform_file_allocations(
+                propbin_files=propbin_files,
+                max_samples=max_samples,
+                max_rx_per_source=max_rx_per_source,
+                seed=sample_seed,
+            )
     if file_allocations is not None:
         propbin_files = [path for path in propbin_files if file_allocations.get(path, 0) > 0]
 
@@ -1269,9 +1339,13 @@ def main() -> None:
     parser.add_argument(
         "--d2los-sampling",
         type=str,
-        choices=["sequential", "uniform"],
+        choices=["sequential", "uniform", "map_uniform"],
         default="sequential",
-        help="D2Los only: sequential keeps old file-order sampling; uniform spreads samples across source files.",
+        help=(
+            "D2Los only: sequential keeps old file-order sampling; uniform spreads "
+            "samples across source files; map_uniform spreads samples across maps first, "
+            "then source files."
+        ),
     )
     parser.add_argument("--d2los-sample-seed", type=int, default=0, help="D2Los uniform sampling seed.")
     parser.add_argument("--tx-shape", type=int, nargs=2, default=[8, 8], help="D2Los synthetic TX array shape.")

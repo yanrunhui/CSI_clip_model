@@ -20,6 +20,19 @@ DELAY_SPREAD_POSITION_BINS = (
     ("100_200", 100.0, 200.0),
     ("200_400", 200.0, 400.0),
 )
+FIRST_PATH_DELAY_POSITION_BINS = (
+    ("0_25", 0.0, 25.0),
+    ("25_50", 25.0, 50.0),
+    ("50_100", 50.0, 100.0),
+    ("100_200", 100.0, 200.0),
+    ("200_400", 200.0, 400.0),
+    ("400_800", 400.0, 800.0),
+    ("800_1600", 800.0, 1600.0),
+)
+FIRST_PATH_DELAY_BIN_LABELS = (
+    *(label for label, _, _ in FIRST_PATH_DELAY_POSITION_BINS),
+    "1600_plus",
+)
 
 
 class PowerFeatureEncoder(nn.Module):
@@ -392,6 +405,7 @@ class CSIClip(nn.Module):
         use_power_branch: bool = False,
         use_delay_spread_head: bool = False,
         detach_delay_spread_features: bool = False,
+        detach_first_path_delay_features: bool = True,
         use_delay_specific_encoder: bool = False,
         output_dict: bool = True,
     ):
@@ -400,6 +414,7 @@ class CSIClip(nn.Module):
         self.use_power_branch = use_power_branch
         self.use_delay_spread_head = use_delay_spread_head
         self.detach_delay_spread_features = detach_delay_spread_features
+        self.detach_first_path_delay_features = detach_first_path_delay_features
         self.use_delay_specific_encoder = use_delay_specific_encoder
         self.csi = csi_encoder
         self.text = text_encoder
@@ -407,6 +422,11 @@ class CSIClip(nn.Module):
         hidden_dim = embed_dim * 2
         self.power_feature_encoder = PowerFeatureEncoder()
         self.csi_delay_context_encoder = (
+            CSIDelaySpecificEncoder()
+            if use_delay_specific_encoder
+            else CSIDelayContextEncoder()
+        )
+        self.first_path_delay_context_encoder = (
             CSIDelaySpecificEncoder()
             if use_delay_specific_encoder
             else CSIDelayContextEncoder()
@@ -427,6 +447,7 @@ class CSIClip(nn.Module):
         self.k_factor_strong_bin_labels = K_FACTOR_STRONG_BIN_LABELS
         self.delay_spread_bin_labels = DELAY_SPREAD_BIN_LABELS
         self.delay_spread_tail_labels = DELAY_SPREAD_TAIL_LABELS
+        self.first_path_delay_bin_labels = FIRST_PATH_DELAY_BIN_LABELS
         self.physics_head = nn.Sequential(
             nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
             nn.Linear(embed_dim, hidden_dim),
@@ -488,6 +509,18 @@ class CSIClip(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         self.first_path_delay_context_head = nn.Sequential(
+            nn.LayerNorm(self.delay_head_input_dim),
+            nn.Linear(self.delay_head_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.first_path_delay_bin_classifier = nn.Sequential(
+            nn.LayerNorm(self.delay_head_input_dim),
+            nn.Linear(self.delay_head_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(self.first_path_delay_bin_labels)),
+        )
+        self.first_path_delay_bin_position_head = nn.Sequential(
             nn.LayerNorm(self.delay_head_input_dim),
             nn.Linear(self.delay_head_input_dim, hidden_dim),
             nn.GELU(),
@@ -578,6 +611,8 @@ class CSIClip(nn.Module):
             *self.delay_spread_bin_position_head.modules(),
             *self.delay_spread_context_head.modules(),
             *self.first_path_delay_context_head.modules(),
+            *self.first_path_delay_bin_classifier.modules(),
+            *self.first_path_delay_bin_position_head.modules(),
             *self.los_delay_context_head.modules(),
             *self.delay_spread_tail_classifier.modules(),
         ):
@@ -694,6 +729,18 @@ class CSIClip(nn.Module):
             subcarrier_spacing=subcarrier_spacing,
         )
 
+    def encode_first_path_delay_context(
+        self,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+        subcarrier_spacing: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.first_path_delay_context_encoder(
+            tokens,
+            token_mask,
+            subcarrier_spacing=subcarrier_spacing,
+        )
+
     def _delay_profile_statistics(
         self,
         *,
@@ -772,11 +819,13 @@ class CSIClip(nn.Module):
         csi_features: torch.Tensor,
         power_context: dict[str, torch.Tensor] | None = None,
         delay_context: torch.Tensor | None = None,
+        first_path_delay_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.predict_physics_components(
             csi_features,
             power_context=power_context,
             delay_context=delay_context,
+            first_path_delay_context=first_path_delay_context,
         )["final"]
 
     def predict_physics_components(
@@ -784,6 +833,7 @@ class CSIClip(nn.Module):
         csi_features: torch.Tensor,
         power_context: dict[str, torch.Tensor] | None = None,
         delay_context: torch.Tensor | None = None,
+        first_path_delay_context: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         base = self.physics_head(csi_features)
         if self.use_delay_spread_head:
@@ -802,15 +852,35 @@ class CSIClip(nn.Module):
                 device=csi_features.device,
                 dtype=csi_features.dtype,
             )
+        if first_path_delay_context is None:
+            first_path_delay_context = torch.zeros(
+                csi_features.shape[0],
+                self.csi_delay_context_dim,
+                device=csi_features.device,
+                dtype=csi_features.dtype,
+            )
         delay_head_input = torch.cat([delay_csi_features, delay_context], dim=-1)
+        first_path_delay_head_input = torch.cat(
+            [delay_csi_features, first_path_delay_context],
+            dim=-1,
+        )
         delay_spread_bin_logits = self.delay_spread_bin_classifier(delay_head_input)
         delay_spread_bin_position = torch.sigmoid(
             self.delay_spread_bin_position_head(delay_head_input).squeeze(-1)
         )
         delay_spread_context = self.delay_spread_context_head(delay_head_input).squeeze(-1)
-        delay_probe_input = delay_head_input.detach()
-        first_path_delay_context = self.first_path_delay_context_head(delay_probe_input).squeeze(-1)
-        los_delay_context = self.los_delay_context_head(delay_probe_input).squeeze(-1)
+        first_path_delay_input = (
+            first_path_delay_head_input.detach()
+            if self.detach_first_path_delay_features
+            else first_path_delay_head_input
+        )
+        los_delay_input = delay_head_input.detach()
+        first_path_delay_context = self.first_path_delay_context_head(first_path_delay_input).squeeze(-1)
+        first_path_delay_bin_logits = self.first_path_delay_bin_classifier(first_path_delay_input)
+        first_path_delay_bin_position = torch.sigmoid(
+            self.first_path_delay_bin_position_head(first_path_delay_input).squeeze(-1)
+        )
+        los_delay_context = self.los_delay_context_head(los_delay_input).squeeze(-1)
         delay_spread_tail_logits = self.delay_spread_tail_classifier(delay_head_input)
         first_path_power_bin_logits = self.first_path_power_bin_classifier(
             csi_features
@@ -840,6 +910,8 @@ class CSIClip(nn.Module):
                 "profile_direct_delay_spread": base[:, self.delay_spread_index],
                 "delay_spread_context": delay_spread_context,
                 "first_path_delay_context": first_path_delay_context,
+                "first_path_delay_bin_logits": first_path_delay_bin_logits,
+                "first_path_delay_bin_position": first_path_delay_bin_position,
                 "los_delay_context": los_delay_context,
                 "enhanced_delay_spread_gate": zeros,
                 "enhanced_delay_spread_delta": zeros,
@@ -912,6 +984,8 @@ class CSIClip(nn.Module):
             "profile_direct_delay_spread": profile_direct_delay_spread,
             "delay_spread_context": delay_spread_context,
             "first_path_delay_context": first_path_delay_context,
+            "first_path_delay_bin_logits": first_path_delay_bin_logits,
+            "first_path_delay_bin_position": first_path_delay_bin_position,
             "los_delay_context": los_delay_context,
             "enhanced_delay_spread_gate": delay_spread_gate,
             "enhanced_delay_spread_delta": delay_spread_delta,

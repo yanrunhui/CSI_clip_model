@@ -18,6 +18,8 @@ from models.model import (
     DELAY_SPREAD_POSITION_BINS,
     DELAY_SPREAD_TAIL_LABELS,
     DELAY_SPREAD_TAIL_THRESHOLDS_NS,
+    FIRST_PATH_DELAY_BIN_LABELS,
+    FIRST_PATH_DELAY_POSITION_BINS,
 )
 
 from .losses import (
@@ -54,7 +56,15 @@ class TrainConfig:
     direct_power_weight: float = 0.0
     delay_spread_weight: float = 0.0
     first_path_delay_weight: float = 0.0
+    first_path_delay_raw_weight: float = 0.0
+    first_path_delay_raw_beta_ns: float = 20.0
+    first_path_delay_bin_classifier_weight: float = 0.0
+    first_path_delay_bin_position_weight: float = 0.0
+    first_path_delay_bin_consistency_weight: float = 0.0
+    first_path_delay_bin_weights: dict[str, float] | None = None
     los_delay_weight: float = 0.0
+    los_delay_raw_weight: float = 0.0
+    los_delay_raw_beta_ns: float = 20.0
     delay_spread_teacher_weight: float = 0.1
     delay_spread_bin_weights: dict[str, float] | None = None
     delay_spread_bin_classifier_weight: float = 0.0
@@ -95,6 +105,12 @@ class Trainer:
     DELAY_SPREAD_BINS = (
         *DELAY_SPREAD_POSITION_BINS,
         ("400_plus", 400.0, float("inf")),
+    )
+    FIRST_PATH_DELAY_BIN_LABELS = FIRST_PATH_DELAY_BIN_LABELS
+    FIRST_PATH_DELAY_POSITION_BINS = FIRST_PATH_DELAY_POSITION_BINS
+    FIRST_PATH_DELAY_BINS = (
+        *FIRST_PATH_DELAY_POSITION_BINS,
+        ("1600_plus", 1600.0, float("inf")),
     )
 
     def __init__(
@@ -220,6 +236,38 @@ class Trainer:
             raise ValueError(
                 "delay-spread bin-position head output size mismatch: "
                 f"out_features={delay_spread_position_linear.out_features}, expected 1."
+            )
+        first_path_delay_labels = tuple(
+            getattr(model, "first_path_delay_bin_labels", self.FIRST_PATH_DELAY_BIN_LABELS)
+        )
+        if first_path_delay_labels != self.FIRST_PATH_DELAY_BIN_LABELS:
+            raise ValueError(
+                "first-path-delay bin label order mismatch: "
+                f"model={first_path_delay_labels} trainer={self.FIRST_PATH_DELAY_BIN_LABELS}."
+            )
+        first_path_delay_classifier_linear = self._last_linear(
+            getattr(model, "first_path_delay_bin_classifier", None)
+        )
+        if (
+            first_path_delay_classifier_linear is not None
+            and first_path_delay_classifier_linear.out_features
+            != len(self.FIRST_PATH_DELAY_BIN_LABELS)
+        ):
+            raise ValueError(
+                "first-path-delay bin classifier output size mismatch: "
+                f"out_features={first_path_delay_classifier_linear.out_features} "
+                f"labels={self.FIRST_PATH_DELAY_BIN_LABELS}."
+            )
+        first_path_delay_position_linear = self._last_linear(
+            getattr(model, "first_path_delay_bin_position_head", None)
+        )
+        if (
+            first_path_delay_position_linear is not None
+            and first_path_delay_position_linear.out_features != 1
+        ):
+            raise ValueError(
+                "first-path-delay bin-position head output size mismatch: "
+                f"out_features={first_path_delay_position_linear.out_features}, expected 1."
             )
         delay_spread_tail_labels = tuple(
             getattr(model, "delay_spread_tail_labels", self.DELAY_SPREAD_TAIL_LABELS)
@@ -483,6 +531,104 @@ class Trainer:
             valid_mask = valid_mask | mask
         return targets, valid_mask
 
+    def _first_path_delay_sample_weights(
+        self,
+        raw_first_path_delay_ns: torch.Tensor,
+        cfg: TrainConfig,
+    ) -> torch.Tensor:
+        weights_cfg = cfg.first_path_delay_bin_weights or {}
+        weights = torch.ones_like(raw_first_path_delay_ns)
+        if not weights_cfg:
+            return weights
+
+        for bin_idx, (label, lower, upper) in enumerate(self.FIRST_PATH_DELAY_BINS):
+            bin_weight = float(weights_cfg.get(label, 1.0))
+            if bin_weight == 1.0:
+                continue
+            upper_mask = (
+                raw_first_path_delay_ns <= upper
+                if bin_idx == len(self.FIRST_PATH_DELAY_BINS) - 1
+                else raw_first_path_delay_ns < upper
+            )
+            mask = torch.isfinite(raw_first_path_delay_ns) & (raw_first_path_delay_ns >= lower) & upper_mask
+            weights = torch.where(mask, torch.full_like(weights, bin_weight), weights)
+        return weights
+
+    def _first_path_delay_bin_targets(self, raw_first_path_delay_ns: torch.Tensor) -> torch.Tensor:
+        targets = torch.full_like(raw_first_path_delay_ns, fill_value=-1, dtype=torch.long)
+        for class_idx, (_, lower, upper) in enumerate(self.FIRST_PATH_DELAY_BINS):
+            upper_mask = (
+                raw_first_path_delay_ns <= upper
+                if class_idx == len(self.FIRST_PATH_DELAY_BINS) - 1
+                else raw_first_path_delay_ns < upper
+            )
+            mask = (
+                torch.isfinite(raw_first_path_delay_ns)
+                & (raw_first_path_delay_ns >= lower)
+                & upper_mask
+            )
+            targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
+        return targets
+
+    def _first_path_delay_bin_class_weight(
+        self,
+        dtype: torch.dtype,
+        cfg: TrainConfig,
+    ) -> torch.Tensor | None:
+        if not cfg.first_path_delay_bin_weights:
+            return None
+        return torch.tensor(
+            [
+                float(cfg.first_path_delay_bin_weights.get(label, 1.0))
+                for label in self.FIRST_PATH_DELAY_BIN_LABELS
+            ],
+            device=self.device,
+            dtype=dtype,
+        )
+
+    def _first_path_delay_bin_position_targets(
+        self,
+        raw_first_path_delay_ns: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        targets = torch.zeros_like(raw_first_path_delay_ns)
+        valid_mask = torch.zeros_like(raw_first_path_delay_ns, dtype=torch.bool)
+        for _, lower, upper in self.FIRST_PATH_DELAY_POSITION_BINS:
+            mask = (
+                torch.isfinite(raw_first_path_delay_ns)
+                & (raw_first_path_delay_ns >= lower)
+                & (raw_first_path_delay_ns < upper)
+            )
+            position = (raw_first_path_delay_ns - lower) / max(upper - lower, 1e-6)
+            targets = torch.where(mask, position.clamp(0.0, 1.0), targets)
+            valid_mask = valid_mask | mask
+        return targets, valid_mask
+
+    def _first_path_delay_bin_bounds(
+        self,
+        raw_first_path_delay_ns: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        lower_targets = torch.zeros_like(raw_first_path_delay_ns)
+        upper_targets = torch.zeros_like(raw_first_path_delay_ns)
+        finite_upper_mask = torch.zeros_like(raw_first_path_delay_ns, dtype=torch.bool)
+        valid_mask = torch.zeros_like(raw_first_path_delay_ns, dtype=torch.bool)
+        for class_idx, (_, lower, upper) in enumerate(self.FIRST_PATH_DELAY_BINS):
+            upper_mask = (
+                raw_first_path_delay_ns <= upper
+                if class_idx == len(self.FIRST_PATH_DELAY_BINS) - 1
+                else raw_first_path_delay_ns < upper
+            )
+            mask = (
+                torch.isfinite(raw_first_path_delay_ns)
+                & (raw_first_path_delay_ns >= lower)
+                & upper_mask
+            )
+            lower_targets = torch.where(mask, torch.full_like(lower_targets, lower), lower_targets)
+            if math.isfinite(upper):
+                upper_targets = torch.where(mask, torch.full_like(upper_targets, upper), upper_targets)
+                finite_upper_mask = finite_upper_mask | mask
+            valid_mask = valid_mask | mask
+        return lower_targets, upper_targets, finite_upper_mask, valid_mask
+
     def _first_path_power_bin_targets(self, raw_first_path_power: torch.Tensor) -> torch.Tensor:
         targets = torch.full_like(raw_first_path_power, fill_value=-1, dtype=torch.long)
         for class_idx, (_, lower, upper) in enumerate(self.FIRST_PATH_POWER_BINS):
@@ -665,8 +811,23 @@ class Trainer:
         effective_first_path_delay_weight = (
             0.0 if warmup_active else cfg.first_path_delay_weight
         )
+        effective_first_path_delay_raw_weight = (
+            0.0 if warmup_active else cfg.first_path_delay_raw_weight
+        )
+        effective_first_path_delay_bin_classifier_weight = (
+            0.0 if warmup_active else cfg.first_path_delay_bin_classifier_weight
+        )
+        effective_first_path_delay_bin_position_weight = (
+            0.0 if warmup_active else cfg.first_path_delay_bin_position_weight
+        )
+        effective_first_path_delay_bin_consistency_weight = (
+            0.0 if warmup_active else cfg.first_path_delay_bin_consistency_weight
+        )
         effective_los_delay_weight = (
             0.0 if warmup_active else cfg.los_delay_weight
+        )
+        effective_los_delay_raw_weight = (
+            0.0 if warmup_active else cfg.los_delay_raw_weight
         )
         effective_delay_spread_bin_classifier_weight = (
             0.0 if warmup_active else cfg.delay_spread_bin_classifier_weight
@@ -720,6 +881,14 @@ class Trainer:
         delay_spread_bin_prediction_histogram = None
         delay_spread_bin_loss_denominator = None
         delay_spread_bin_position_mae = None
+        first_path_delay_bin_target_histogram = None
+        first_path_delay_bin_prediction_histogram = None
+        first_path_delay_bin_loss_denominator = None
+        first_path_delay_bin_position_mae = None
+        first_path_delay_raw_mae_ns = None
+        first_path_delay_bin_consistency_violation_ns = None
+        first_path_delay_bin_consistency_max_violation_ns = None
+        los_delay_raw_mae_ns = None
         delay_spread_tail_accuracy = None
         delay_spread_tail_recall = None
         delay_spread_tail_false_positive = None
@@ -737,12 +906,33 @@ class Trainer:
             or cfg.direct_power_weight > 0.0
             or effective_delay_spread_weight > 0.0
             or effective_first_path_delay_weight > 0.0
+            or effective_first_path_delay_raw_weight > 0.0
+            or effective_first_path_delay_bin_classifier_weight > 0.0
+            or effective_first_path_delay_bin_position_weight > 0.0
+            or effective_first_path_delay_bin_consistency_weight > 0.0
             or effective_los_delay_weight > 0.0
+            or effective_los_delay_raw_weight > 0.0
         ):
             power_context = None
             delay_context = None
+            first_path_delay_context = None
             if hasattr(self.model, "encode_csi_delay_context"):
                 delay_context = self.model.encode_csi_delay_context(
+                    batch["tokens"],
+                    batch["token_mask"],
+                    subcarrier_spacing=batch.get("subcarrier_spacing"),
+                )
+            if (
+                (
+                    effective_first_path_delay_weight > 0.0
+                    or effective_first_path_delay_raw_weight > 0.0
+                    or effective_first_path_delay_bin_classifier_weight > 0.0
+                    or effective_first_path_delay_bin_position_weight > 0.0
+                    or effective_first_path_delay_bin_consistency_weight > 0.0
+                )
+                and hasattr(self.model, "encode_first_path_delay_context")
+            ):
+                first_path_delay_context = self.model.encode_first_path_delay_context(
                     batch["tokens"],
                     batch["token_mask"],
                     subcarrier_spacing=batch.get("subcarrier_spacing"),
@@ -758,6 +948,7 @@ class Trainer:
                 csi_features_raw,
                 power_context=power_context,
                 delay_context=delay_context,
+                first_path_delay_context=first_path_delay_context,
             )
             physics_predictions = physics_outputs["final"]
 
@@ -1415,13 +1606,185 @@ class Trainer:
             )
         if (
             physics_outputs is not None
-            and effective_los_delay_weight > 0.0
-            and "los_delay_ns" in PHYSICS_TARGET_NAMES
+            and effective_first_path_delay_raw_weight > 0.0
         ):
-            los_delay_idx = PHYSICS_TARGET_NAMES.index("los_delay_ns")
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            first_delay_prediction = physics_outputs["first_path_delay_context"]
+            target_scale = PHYSICS_TARGET_SCALES[first_delay_idx].to(
+                device=first_delay_prediction.device,
+                dtype=first_delay_prediction.dtype,
+            )
+            target_offset = PHYSICS_TARGET_OFFSETS[first_delay_idx].to(
+                device=first_delay_prediction.device,
+                dtype=first_delay_prediction.dtype,
+            )
+            raw_prediction = first_delay_prediction * target_scale + target_offset
+            raw_target = batch["physics_raw_targets"][:, first_delay_idx].to(
+                device=raw_prediction.device,
+                dtype=raw_prediction.dtype,
+            )
+            raw_mask = (
+                batch["physics_target_mask"][:, first_delay_idx].bool()
+                & torch.isfinite(raw_target)
+            )
+            if bool(raw_mask.any()):
+                raw_abs_error = (raw_prediction - raw_target).abs()
+                beta = max(float(cfg.first_path_delay_raw_beta_ns), 1e-6)
+                raw_errors = torch.where(
+                    raw_abs_error < beta,
+                    0.5 * raw_abs_error.square() / beta,
+                    raw_abs_error - 0.5 * beta,
+                )
+                raw_weights = self._first_path_delay_sample_weights(
+                    batch["physics_raw_targets"][:, first_delay_idx],
+                    cfg,
+                )[raw_mask]
+                losses["loss_first_path_delay_raw"] = (
+                    (raw_errors[raw_mask] * raw_weights.to(dtype=raw_errors.dtype)).sum()
+                    / raw_weights.sum().clamp(min=1.0).to(dtype=raw_errors.dtype)
+                )
+                first_path_delay_raw_mae_ns = raw_abs_error[raw_mask].mean()
+        if (
+            physics_outputs is not None
+            and effective_first_path_delay_bin_consistency_weight > 0.0
+        ):
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            first_delay_prediction = physics_outputs["first_path_delay_context"]
+            target_scale = PHYSICS_TARGET_SCALES[first_delay_idx].to(
+                device=first_delay_prediction.device,
+                dtype=first_delay_prediction.dtype,
+            )
+            target_offset = PHYSICS_TARGET_OFFSETS[first_delay_idx].to(
+                device=first_delay_prediction.device,
+                dtype=first_delay_prediction.dtype,
+            )
+            raw_prediction = first_delay_prediction * target_scale + target_offset
+            lower_targets, upper_targets, finite_upper_mask, consistency_mask = (
+                self._first_path_delay_bin_bounds(
+                    batch["physics_raw_targets"][:, first_delay_idx]
+                )
+            )
+            consistency_mask = (
+                consistency_mask
+                & batch["physics_target_mask"][:, first_delay_idx].bool()
+            )
+            if bool(consistency_mask.any()):
+                lower_violation = torch.relu(lower_targets - raw_prediction)
+                upper_violation = torch.where(
+                    finite_upper_mask,
+                    torch.relu(raw_prediction - upper_targets),
+                    torch.zeros_like(raw_prediction),
+                )
+                violation_ns = lower_violation + upper_violation
+                valid_violation_ns = violation_ns[consistency_mask]
+                consistency_weights = self._first_path_delay_sample_weights(
+                    batch["physics_raw_targets"][:, first_delay_idx],
+                    cfg,
+                )[consistency_mask]
+                normalized_violation = valid_violation_ns / target_scale.clamp(min=1e-6)
+                losses["loss_first_path_delay_bin_consistency"] = (
+                    (normalized_violation * consistency_weights.to(dtype=normalized_violation.dtype)).sum()
+                    / consistency_weights.sum().clamp(min=1.0).to(dtype=normalized_violation.dtype)
+                )
+                first_path_delay_bin_consistency_violation_ns = valid_violation_ns.mean()
+                first_path_delay_bin_consistency_max_violation_ns = valid_violation_ns.max()
+        if (
+            physics_outputs is not None
+            and effective_first_path_delay_bin_classifier_weight > 0.0
+        ):
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            first_path_delay_bin_logits = physics_outputs["first_path_delay_bin_logits"]
+            first_path_delay_bin_targets = self._first_path_delay_bin_targets(
+                batch["physics_raw_targets"][:, first_delay_idx]
+            )
+            first_path_delay_bin_mask = (
+                (first_path_delay_bin_targets >= 0)
+                & batch["physics_target_mask"][:, first_delay_idx].bool()
+            )
+            if bool(first_path_delay_bin_mask.any()):
+                valid_logits = first_path_delay_bin_logits[first_path_delay_bin_mask]
+                valid_targets = first_path_delay_bin_targets[first_path_delay_bin_mask]
+                per_sample_classifier_loss = torch.nn.functional.cross_entropy(
+                    valid_logits,
+                    valid_targets,
+                    reduction="none",
+                )
+                class_weight = self._first_path_delay_bin_class_weight(valid_logits.dtype, cfg)
+                if class_weight is None:
+                    sample_weight = torch.ones_like(per_sample_classifier_loss)
+                else:
+                    sample_weight = class_weight[valid_targets]
+                first_path_delay_bin_loss_denominator = sample_weight.sum()
+                losses["loss_first_path_delay_bin_classifier"] = (
+                    (per_sample_classifier_loss * sample_weight).sum()
+                    / first_path_delay_bin_loss_denominator.clamp(min=1.0)
+                )
+                first_path_delay_bin_predictions = valid_logits.argmax(dim=1)
+                losses["accuracy_first_path_delay_bin_classifier"] = (
+                    (first_path_delay_bin_predictions == valid_targets).float().mean()
+                )
+                first_path_delay_bin_target_histogram = self._histogram(
+                    valid_targets,
+                    len(self.FIRST_PATH_DELAY_BIN_LABELS),
+                )
+                first_path_delay_bin_prediction_histogram = self._histogram(
+                    first_path_delay_bin_predictions,
+                    len(self.FIRST_PATH_DELAY_BIN_LABELS),
+                )
+        if (
+            physics_outputs is not None
+            and effective_first_path_delay_bin_position_weight > 0.0
+        ):
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            first_path_delay_position_predictions = physics_outputs[
+                "first_path_delay_bin_position"
+            ]
+            first_path_delay_position_targets, first_path_delay_position_mask = (
+                self._first_path_delay_bin_position_targets(
+                    batch["physics_raw_targets"][:, first_delay_idx]
+                )
+            )
+            first_path_delay_position_mask = (
+                first_path_delay_position_mask
+                & batch["physics_target_mask"][:, first_delay_idx].bool()
+            )
+            if bool(first_path_delay_position_mask.any()):
+                valid_position_predictions = first_path_delay_position_predictions[
+                    first_path_delay_position_mask
+                ]
+                valid_position_targets = first_path_delay_position_targets[
+                    first_path_delay_position_mask
+                ]
+                position_errors = torch.nn.functional.smooth_l1_loss(
+                    valid_position_predictions,
+                    valid_position_targets,
+                    reduction="none",
+                )
+                position_weights = self._first_path_delay_sample_weights(
+                    batch["physics_raw_targets"][:, first_delay_idx],
+                    cfg,
+                )[first_path_delay_position_mask]
+                losses["loss_first_path_delay_bin_position"] = (
+                    (position_errors * position_weights.to(dtype=position_errors.dtype)).sum()
+                    / position_weights.sum().clamp(min=1.0).to(dtype=position_errors.dtype)
+                )
+                first_path_delay_bin_position_mae = (
+                    valid_position_predictions - valid_position_targets
+                ).abs().mean()
+        if (
+            physics_outputs is not None
+            and effective_los_delay_weight > 0.0
+        ):
             los_delay_prediction = physics_outputs["los_delay_context"]
-            los_delay_target = batch["physics_targets"][:, los_delay_idx]
-            los_target_mask = batch["physics_target_mask"][:, los_delay_idx]
+            los_delay_target = batch["los_delay_target"].to(
+                device=los_delay_prediction.device,
+                dtype=los_delay_prediction.dtype,
+            )
+            los_delay_raw_target = batch["los_delay_raw_target"].to(
+                device=los_delay_prediction.device,
+                dtype=los_delay_prediction.dtype,
+            )
+            los_target_mask = batch["los_delay_target_mask"].bool()
             los_sample_mask = torch.tensor(
                 [key.los_status == "los" for key in batch["semantic_keys"]],
                 device=self.device,
@@ -1438,6 +1801,45 @@ class Trainer:
                 (los_delay_errors * los_delay_weight).sum()
                 / los_delay_weight.sum().clamp(min=1).to(dtype=los_delay_errors.dtype)
             )
+            if bool(los_delay_mask.any()):
+                los_delay_raw_mae_ns = (
+                    los_delay_prediction[los_delay_mask] * 3000.0
+                    - los_delay_raw_target[los_delay_mask]
+                ).abs().mean()
+        if (
+            physics_outputs is not None
+            and effective_los_delay_raw_weight > 0.0
+        ):
+            los_delay_prediction = physics_outputs["los_delay_context"]
+            los_delay_raw_prediction = los_delay_prediction * 3000.0
+            los_delay_raw_target = batch["los_delay_raw_target"].to(
+                device=los_delay_prediction.device,
+                dtype=los_delay_prediction.dtype,
+            )
+            los_target_mask = batch["los_delay_target_mask"].bool()
+            los_sample_mask = torch.tensor(
+                [key.los_status == "los" for key in batch["semantic_keys"]],
+                device=self.device,
+                dtype=torch.bool,
+            )
+            los_delay_mask = (
+                los_target_mask
+                & los_sample_mask
+                & torch.isfinite(los_delay_raw_target)
+            )
+            if bool(los_delay_mask.any()):
+                raw_abs_error = (
+                    los_delay_raw_prediction[los_delay_mask]
+                    - los_delay_raw_target[los_delay_mask]
+                ).abs()
+                beta = max(float(cfg.los_delay_raw_beta_ns), 1e-6)
+                raw_errors = torch.where(
+                    raw_abs_error < beta,
+                    0.5 * raw_abs_error.square() / beta,
+                    raw_abs_error - 0.5 * beta,
+                )
+                losses["loss_los_delay_raw"] = raw_errors.mean()
+                los_delay_raw_mae_ns = raw_abs_error.mean()
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
             effective_prototype_weight * losses["loss_csi_to_prototype"] +
@@ -1455,7 +1857,12 @@ class Trainer:
             cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device)) +
             effective_delay_spread_weight * losses.get("loss_delay_spread", torch.zeros((), device=self.device)) +
             effective_first_path_delay_weight * losses.get("loss_first_path_delay", torch.zeros((), device=self.device)) +
-            effective_los_delay_weight * losses.get("loss_los_delay", torch.zeros((), device=self.device))
+            effective_first_path_delay_raw_weight * losses.get("loss_first_path_delay_raw", torch.zeros((), device=self.device)) +
+            effective_first_path_delay_bin_classifier_weight * losses.get("loss_first_path_delay_bin_classifier", torch.zeros((), device=self.device)) +
+            effective_first_path_delay_bin_position_weight * losses.get("loss_first_path_delay_bin_position", torch.zeros((), device=self.device)) +
+            effective_first_path_delay_bin_consistency_weight * losses.get("loss_first_path_delay_bin_consistency", torch.zeros((), device=self.device)) +
+            effective_los_delay_weight * losses.get("loss_los_delay", torch.zeros((), device=self.device)) +
+            effective_los_delay_raw_weight * losses.get("loss_los_delay_raw", torch.zeros((), device=self.device))
         )
         total_loss.backward()
         grad_metrics = {
@@ -1511,7 +1918,61 @@ class Trainer:
         metrics["aux_regression_weight"] = float(effective_aux_regression_weight)
         metrics["delay_spread_weight"] = float(effective_delay_spread_weight)
         metrics["first_path_delay_weight"] = float(effective_first_path_delay_weight)
+        metrics["first_path_delay_raw_weight"] = float(effective_first_path_delay_raw_weight)
+        metrics["first_path_delay_raw_beta_ns"] = float(cfg.first_path_delay_raw_beta_ns)
+        metrics["first_path_delay_bin_classifier_weight"] = float(
+            effective_first_path_delay_bin_classifier_weight
+        )
+        metrics["first_path_delay_bin_position_weight"] = float(
+            effective_first_path_delay_bin_position_weight
+        )
+        metrics["first_path_delay_bin_consistency_weight"] = float(
+            effective_first_path_delay_bin_consistency_weight
+        )
+        metrics["first_path_delay_bin_label_order"] = ",".join(
+            self.FIRST_PATH_DELAY_BIN_LABELS
+        )
+        metrics["first_path_delay_bin_class_weights"] = self._format_float_vector(
+            self._first_path_delay_bin_class_weight(
+                torch.float32,
+                cfg,
+            )
+            if cfg.first_path_delay_bin_weights
+            else torch.ones(len(self.FIRST_PATH_DELAY_BIN_LABELS), device=self.device)
+        )
+        if first_path_delay_bin_target_histogram is not None:
+            metrics["first_path_delay_bin_target_histogram"] = self._format_histogram(
+                first_path_delay_bin_target_histogram
+            )
+        if first_path_delay_bin_prediction_histogram is not None:
+            metrics["first_path_delay_bin_prediction_histogram"] = self._format_histogram(
+                first_path_delay_bin_prediction_histogram
+            )
+        if first_path_delay_bin_loss_denominator is not None:
+            metrics["first_path_delay_bin_loss_denominator"] = float(
+                first_path_delay_bin_loss_denominator.detach()
+            )
+        if first_path_delay_bin_position_mae is not None:
+            metrics["first_path_delay_bin_position_mae"] = float(
+                first_path_delay_bin_position_mae.detach()
+            )
+        if first_path_delay_raw_mae_ns is not None:
+            metrics["first_path_delay_raw_mae_ns"] = float(
+                first_path_delay_raw_mae_ns.detach()
+            )
+        if first_path_delay_bin_consistency_violation_ns is not None:
+            metrics["first_path_delay_bin_consistency_violation_ns"] = float(
+                first_path_delay_bin_consistency_violation_ns.detach()
+            )
+        if first_path_delay_bin_consistency_max_violation_ns is not None:
+            metrics["first_path_delay_bin_consistency_max_violation_ns"] = float(
+                first_path_delay_bin_consistency_max_violation_ns.detach()
+            )
         metrics["los_delay_weight"] = float(effective_los_delay_weight)
+        metrics["los_delay_raw_weight"] = float(effective_los_delay_raw_weight)
+        metrics["los_delay_raw_beta_ns"] = float(cfg.los_delay_raw_beta_ns)
+        if los_delay_raw_mae_ns is not None:
+            metrics["los_delay_raw_mae_ns"] = float(los_delay_raw_mae_ns.detach())
         metrics["delay_spread_teacher_weight"] = float(cfg.delay_spread_teacher_weight)
         metrics["delay_spread_bin_classifier_weight"] = float(
             effective_delay_spread_bin_classifier_weight
@@ -1641,6 +2102,14 @@ class Trainer:
                     cfg,
                 ).detach().float().mean()
             )
+            if "first_path_delay_ns" in PHYSICS_TARGET_NAMES:
+                first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+                metrics["first_path_delay_sample_weight_mean"] = float(
+                    self._first_path_delay_sample_weights(
+                        batch["physics_raw_targets"][:, first_delay_idx],
+                        cfg,
+                    ).detach().float().mean()
+                )
         metrics["prototype_warmup_active"] = float(warmup_active)
         metrics["prototype_warmup_epochs"] = float(cfg.prototype_warmup_epochs)
         metrics["min_class_size_for_multipositive"] = float(cfg.min_class_size_for_multipositive)
