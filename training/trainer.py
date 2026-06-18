@@ -63,8 +63,7 @@ class TrainConfig:
     first_path_delay_bin_consistency_weight: float = 0.0
     first_path_delay_bin_weights: dict[str, float] | None = None
     los_delay_weight: float = 0.0
-    los_delay_raw_weight: float = 0.0
-    los_delay_raw_beta_ns: float = 20.0
+    los_delay_nonnegative_weight: float = 0.0
     delay_spread_teacher_weight: float = 0.1
     delay_spread_bin_weights: dict[str, float] | None = None
     delay_spread_bin_classifier_weight: float = 0.0
@@ -826,8 +825,8 @@ class Trainer:
         effective_los_delay_weight = (
             0.0 if warmup_active else cfg.los_delay_weight
         )
-        effective_los_delay_raw_weight = (
-            0.0 if warmup_active else cfg.los_delay_raw_weight
+        effective_los_delay_nonnegative_weight = (
+            0.0 if warmup_active else cfg.los_delay_nonnegative_weight
         )
         effective_delay_spread_bin_classifier_weight = (
             0.0 if warmup_active else cfg.delay_spread_bin_classifier_weight
@@ -911,7 +910,7 @@ class Trainer:
             or effective_first_path_delay_bin_position_weight > 0.0
             or effective_first_path_delay_bin_consistency_weight > 0.0
             or effective_los_delay_weight > 0.0
-            or effective_los_delay_raw_weight > 0.0
+            or effective_los_delay_nonnegative_weight > 0.0
         ):
             power_context = None
             delay_context = None
@@ -1773,7 +1772,10 @@ class Trainer:
                 ).abs().mean()
         if (
             physics_outputs is not None
-            and effective_los_delay_weight > 0.0
+            and (
+                effective_los_delay_weight > 0.0
+                or effective_los_delay_nonnegative_weight > 0.0
+            )
         ):
             los_delay_prediction = physics_outputs["los_delay_context"]
             los_delay_target = batch["los_delay_target"].to(
@@ -1790,56 +1792,32 @@ class Trainer:
                 device=self.device,
                 dtype=torch.bool,
             )
-            los_delay_mask = los_target_mask & los_sample_mask
-            los_delay_errors = torch.nn.functional.smooth_l1_loss(
-                los_delay_prediction,
-                los_delay_target,
-                reduction="none",
-            )
-            los_delay_weight = los_delay_mask.to(dtype=los_delay_errors.dtype)
-            losses["loss_los_delay"] = (
-                (los_delay_errors * los_delay_weight).sum()
-                / los_delay_weight.sum().clamp(min=1).to(dtype=los_delay_errors.dtype)
-            )
-            if bool(los_delay_mask.any()):
-                los_delay_raw_mae_ns = (
-                    los_delay_prediction[los_delay_mask] * 3000.0
-                    - los_delay_raw_target[los_delay_mask]
-                ).abs().mean()
-        if (
-            physics_outputs is not None
-            and effective_los_delay_raw_weight > 0.0
-        ):
-            los_delay_prediction = physics_outputs["los_delay_context"]
-            los_delay_raw_prediction = los_delay_prediction * 3000.0
-            los_delay_raw_target = batch["los_delay_raw_target"].to(
-                device=los_delay_prediction.device,
-                dtype=los_delay_prediction.dtype,
-            )
-            los_target_mask = batch["los_delay_target_mask"].bool()
-            los_sample_mask = torch.tensor(
-                [key.los_status == "los" for key in batch["semantic_keys"]],
-                device=self.device,
-                dtype=torch.bool,
-            )
             los_delay_mask = (
                 los_target_mask
                 & los_sample_mask
                 & torch.isfinite(los_delay_raw_target)
             )
-            if bool(los_delay_mask.any()):
-                raw_abs_error = (
-                    los_delay_raw_prediction[los_delay_mask]
-                    - los_delay_raw_target[los_delay_mask]
-                ).abs()
-                beta = max(float(cfg.los_delay_raw_beta_ns), 1e-6)
-                raw_errors = torch.where(
-                    raw_abs_error < beta,
-                    0.5 * raw_abs_error.square() / beta,
-                    raw_abs_error - 0.5 * beta,
+            if effective_los_delay_weight > 0.0:
+                los_delay_errors = torch.nn.functional.smooth_l1_loss(
+                    los_delay_prediction,
+                    los_delay_target,
+                    reduction="none",
                 )
-                losses["loss_los_delay_raw"] = raw_errors.mean()
-                los_delay_raw_mae_ns = raw_abs_error.mean()
+                los_delay_weight = los_delay_mask.to(dtype=los_delay_errors.dtype)
+                losses["loss_los_delay"] = (
+                    (los_delay_errors * los_delay_weight).sum()
+                    / los_delay_weight.sum().clamp(min=1).to(dtype=los_delay_errors.dtype)
+                )
+            if bool(los_delay_mask.any()):
+                los_delay_raw_prediction = los_delay_prediction[los_delay_mask] * 3000.0
+                los_delay_raw_mae_ns = (
+                    los_delay_raw_prediction
+                    - los_delay_raw_target[los_delay_mask]
+                ).abs().mean()
+                if effective_los_delay_nonnegative_weight > 0.0:
+                    losses["loss_los_delay_nonnegative"] = (
+                        torch.relu(-los_delay_raw_prediction).mean() / 3000.0
+                    )
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
             effective_prototype_weight * losses["loss_csi_to_prototype"] +
@@ -1862,7 +1840,7 @@ class Trainer:
             effective_first_path_delay_bin_position_weight * losses.get("loss_first_path_delay_bin_position", torch.zeros((), device=self.device)) +
             effective_first_path_delay_bin_consistency_weight * losses.get("loss_first_path_delay_bin_consistency", torch.zeros((), device=self.device)) +
             effective_los_delay_weight * losses.get("loss_los_delay", torch.zeros((), device=self.device)) +
-            effective_los_delay_raw_weight * losses.get("loss_los_delay_raw", torch.zeros((), device=self.device))
+            effective_los_delay_nonnegative_weight * losses.get("loss_los_delay_nonnegative", torch.zeros((), device=self.device))
         )
         total_loss.backward()
         grad_metrics = {
@@ -1969,8 +1947,9 @@ class Trainer:
                 first_path_delay_bin_consistency_max_violation_ns.detach()
             )
         metrics["los_delay_weight"] = float(effective_los_delay_weight)
-        metrics["los_delay_raw_weight"] = float(effective_los_delay_raw_weight)
-        metrics["los_delay_raw_beta_ns"] = float(cfg.los_delay_raw_beta_ns)
+        metrics["los_delay_nonnegative_weight"] = float(
+            effective_los_delay_nonnegative_weight
+        )
         if los_delay_raw_mae_ns is not None:
             metrics["los_delay_raw_mae_ns"] = float(los_delay_raw_mae_ns.detach())
         metrics["delay_spread_teacher_weight"] = float(cfg.delay_spread_teacher_weight)

@@ -1883,12 +1883,28 @@ def _print_delay_family_diagnostics(
         + PHYSICS_TARGET_OFFSETS[first_delay_idx]
     )
     first_delay_mask = physics_masks[:, first_delay_idx]
+    los_sample_mask = torch.tensor(
+        [key.los_status == "los" for key in semantic_keys],
+        dtype=torch.bool,
+    )
     if bool(first_delay_mask.any()):
         first_delay_target = physics_raw_targets[first_delay_mask, first_delay_idx]
         first_delay_pred = first_delay_raw[first_delay_mask]
         first_delay_errors = first_delay_pred - first_delay_target
         print(f"first_path_delay_context_MAE={float(first_delay_errors.abs().mean()):.4f}")
         print(f"first_path_delay_context_signed_mean={float(first_delay_errors.mean()):.4f}")
+        _print_first_path_delay_group_metrics(
+            prefix="first_path_delay_context_los",
+            predictions=first_delay_raw,
+            targets=physics_raw_targets[:, first_delay_idx],
+            mask=first_delay_mask & los_sample_mask,
+        )
+        _print_first_path_delay_group_metrics(
+            prefix="first_path_delay_context_nlos",
+            predictions=first_delay_raw,
+            targets=physics_raw_targets[:, first_delay_idx],
+            mask=first_delay_mask & ~los_sample_mask,
+        )
         if first_path_delay_bin_logits is not None:
             _print_first_path_delay_bin_head_diagnostics(
                 target_raw=first_delay_target,
@@ -1897,17 +1913,35 @@ def _print_delay_family_diagnostics(
     else:
         print("first_path_delay_context_MAE=nan")
         print("first_path_delay_context_signed_mean=nan")
-
-    los_sample_mask = torch.tensor(
-        [key.los_status == "los" for key in semantic_keys],
-        dtype=torch.bool,
-    )
+        print("first_path_delay_context_los_count=0")
+        print("first_path_delay_context_los_MAE=nan")
+        print("first_path_delay_context_los_signed_mean=nan")
+        print("first_path_delay_context_nlos_count=0")
+        print("first_path_delay_context_nlos_MAE=nan")
+        print("first_path_delay_context_nlos_signed_mean=nan")
     los_delay_mask = los_delay_masks & los_sample_mask
     _print_los_delay_diagnostics(
         predictions=los_delay_predictions * 3000.0,
         targets=los_delay_raw_targets,
         mask=los_delay_mask,
     )
+
+
+def _print_first_path_delay_group_metrics(
+    prefix: str,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    count = int(mask.sum().item())
+    print(f"{prefix}_count={count}")
+    if count == 0:
+        print(f"{prefix}_MAE=nan")
+        print(f"{prefix}_signed_mean=nan")
+        return
+    errors = predictions[mask] - targets[mask]
+    print(f"{prefix}_MAE={float(errors.abs().mean()):.4f}")
+    print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
 
 
 def _first_path_delay_bin_targets(raw_first_path_delay_ns: torch.Tensor) -> torch.Tensor:
@@ -1975,31 +2009,67 @@ def _print_los_delay_diagnostics(
         print("los_delay_context_signed_mean=nan")
         print("los_delay_context_RMSE=nan")
         print("los_delay_context_pearson=nan")
+        print("los_delay_context_clamped_count=0")
+        print("los_delay_context_clamped_MAE=nan")
+        print("los_delay_context_clamped_signed_mean=nan")
+        print("los_delay_context_clamped_RMSE=nan")
+        print("los_delay_context_clamped_pearson=nan")
         return
 
     pred = predictions[mask].float()
     target = targets[mask].float()
+    _print_los_delay_metric_block(
+        prefix="los_delay_context",
+        bin_prefix="los_delay_bin",
+        predictions=pred,
+        targets=target,
+    )
+    _print_los_delay_metric_block(
+        prefix="los_delay_context_clamped",
+        bin_prefix="los_delay_clamped_bin",
+        predictions=pred.clamp_min(0.0),
+        targets=target,
+        print_count=True,
+    )
+
+
+def _print_los_delay_metric_block(
+    prefix: str,
+    bin_prefix: str,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    print_count: bool = False,
+) -> None:
+    if print_count:
+        print(f"{prefix}_count={int(predictions.numel())}")
+    pred = predictions
+    target = targets
     errors = pred - target
     abs_errors = errors.abs()
-    print(f"los_delay_context_MAE={float(abs_errors.mean()):.4f}")
-    print(f"los_delay_context_signed_mean={float(errors.mean()):.4f}")
-    print(f"los_delay_context_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
-    print(f"los_delay_context_pearson={_safe_pearson(pred, target):.4f}")
+    print(f"{prefix}_MAE={float(abs_errors.mean()):.4f}")
+    print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
+    print(f"{prefix}_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
+    print(f"{prefix}_pearson={_safe_pearson(pred, target):.4f}")
     for threshold in (20.0, 50.0, 100.0):
         print(
-            f"los_delay_context_accuracy@{_format_scalar(threshold)}ns="
+            f"{prefix}_accuracy@{_format_scalar(threshold)}ns="
             f"{float((abs_errors <= threshold).float().mean()):.4f}"
         )
     print(
-        f"los_delay_context_target_range="
+        f"{prefix}_target_range="
         f"{float(target.min()):.4f},{float(target.max()):.4f}"
     )
     print(
-        f"los_delay_context_pred_range="
+        f"{prefix}_pred_range="
         f"{float(pred.min()):.4f},{float(pred.max()):.4f}"
     )
+    order_key = (
+        "los_delay_diagnostic_bin_order"
+        if bin_prefix == "los_delay_bin"
+        else f"{bin_prefix}_order"
+    )
     print(
-        "los_delay_diagnostic_bin_order="
+        f"{order_key}="
         + ",".join(
             f"{label}:{_format_scalar(lower)}-{_format_scalar(upper) if upper != float('inf') else 'inf'}"
             for label, lower, upper in LOS_DELAY_DIAGNOSTIC_BINS
@@ -2009,7 +2079,7 @@ def _print_los_delay_diagnostics(
         upper_mask = target <= upper if bin_idx == len(LOS_DELAY_DIAGNOSTIC_BINS) - 1 else target < upper
         bin_mask = (target >= lower) & upper_mask
         _print_compact_delay_bin_metrics(
-            prefix=f"los_delay_bin_{label}",
+            prefix=f"{bin_prefix}_{label}",
             predictions=pred,
             targets=target,
             mask=bin_mask,

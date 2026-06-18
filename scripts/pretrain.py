@@ -1049,8 +1049,7 @@ def run_smoke_test(
     first_path_delay_bin_consistency_weight: float = 0.0,
     first_path_delay_bin_weights: dict[str, float] | None = None,
     los_delay_weight: float = 0.0,
-    los_delay_raw_weight: float = 0.0,
-    los_delay_raw_beta_ns: float = 20.0,
+    los_delay_nonnegative_weight: float = 0.0,
     delay_spread_teacher_weight: float = 0.1,
     delay_spread_bin_weights: dict[str, float] | None = None,
     delay_spread_bin_classifier_weight: float = 0.0,
@@ -1135,8 +1134,7 @@ def run_smoke_test(
                     first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
                     first_path_delay_bin_weights=first_path_delay_bin_weights,
                     los_delay_weight=los_delay_weight,
-                    los_delay_raw_weight=los_delay_raw_weight,
-                    los_delay_raw_beta_ns=los_delay_raw_beta_ns,
+                    los_delay_nonnegative_weight=los_delay_nonnegative_weight,
                     delay_spread_teacher_weight=delay_spread_teacher_weight,
                     delay_spread_bin_weights=delay_spread_bin_weights,
                     delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -1204,8 +1202,7 @@ def run_real_pretrain(
     first_path_delay_bin_consistency_weight: float,
     first_path_delay_bin_weights: dict[str, float] | None,
     los_delay_weight: float,
-    los_delay_raw_weight: float,
-    los_delay_raw_beta_ns: float,
+    los_delay_nonnegative_weight: float,
     delay_spread_teacher_weight: float,
     delay_spread_bin_weights: dict[str, float] | None,
     delay_spread_bin_classifier_weight: float,
@@ -1223,6 +1220,7 @@ def run_real_pretrain(
     limit_samples_by_attribute: str | None,
     limit_samples_per_attribute_value: int | None,
     max_delay_spread_ns: float | None,
+    allow_prototype_mismatch_transfer: bool,
     freeze_csi: bool,
     freeze_text_prototypes: bool,
     output_dir: str,
@@ -1260,12 +1258,20 @@ def run_real_pretrain(
         ),
     )
     if transfer_checkpoint is not None:
-        assert_checkpoint_prototype_compatibility(
-            transfer_checkpoint,
-            prototype_bank["keys"],
-            expected_shape=tuple(model.prototypes.shape) if model.prototypes is not None else None,
-            context="transfer checkpoint",
-        )
+        try:
+            assert_checkpoint_prototype_compatibility(
+                transfer_checkpoint,
+                prototype_bank["keys"],
+                expected_shape=tuple(model.prototypes.shape) if model.prototypes is not None else None,
+                context="transfer checkpoint",
+            )
+        except ValueError:
+            if not allow_prototype_mismatch_transfer:
+                raise
+            print(
+                "allowing prototype-mismatch transfer: compatible checkpoint weights "
+                "will be loaded and current prototypes will be reinitialized from text."
+            )
     if transfer_checkpoint is not None:
         load_model_state_compatible(model, transfer_checkpoint)
     if not checkpoint_has_compatible_prototypes(model, transfer_checkpoint, prototype_bank["keys"]):
@@ -1321,8 +1327,7 @@ def run_real_pretrain(
         first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
         first_path_delay_bin_weights=first_path_delay_bin_weights,
         los_delay_weight=los_delay_weight,
-        los_delay_raw_weight=los_delay_raw_weight,
-        los_delay_raw_beta_ns=los_delay_raw_beta_ns,
+        los_delay_nonnegative_weight=los_delay_nonnegative_weight,
         delay_spread_teacher_weight=delay_spread_teacher_weight,
         delay_spread_bin_weights=delay_spread_bin_weights,
         delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -1393,8 +1398,7 @@ def run_real_pretrain(
         f"first_path_delay_bin_weights={format_first_path_delay_bin_weights(first_path_delay_bin_weights)} "
         f"first_path_delay_bin_label_order={','.join(FIRST_PATH_DELAY_BIN_LABELS)} "
         f"los_delay_weight={los_delay_weight} "
-        f"los_delay_raw_weight={los_delay_raw_weight} "
-        f"los_delay_raw_beta_ns={los_delay_raw_beta_ns} "
+        f"los_delay_nonnegative_weight={los_delay_nonnegative_weight} "
         f"delay_spread_teacher_weight={delay_spread_teacher_weight} "
         f"delay_spread_bin_classifier_weight={delay_spread_bin_classifier_weight} "
         f"delay_spread_bin_position_weight={delay_spread_bin_position_weight} "
@@ -1653,9 +1657,8 @@ def run_real_pretrain(
         mean_direct_power = sum(m.get("loss_direct_power", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_first_path_delay = sum(m.get("loss_first_path_delay", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_los_delay = sum(m.get("loss_los_delay", 0.0) for m in epoch_metrics) / len(epoch_metrics)
-        mean_los_delay_raw = sum(m.get("loss_los_delay_raw", 0.0) for m in epoch_metrics) / len(epoch_metrics)
-        mean_los_delay_raw_mae_ns = sum(
-            m.get("los_delay_raw_mae_ns", 0.0) for m in epoch_metrics
+        mean_los_delay_nonnegative = sum(
+            m.get("loss_los_delay_nonnegative", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_k_factor_sample_weight = sum(
             m.get("k_factor_sample_weight_mean", 1.0) for m in epoch_metrics
@@ -1703,7 +1706,7 @@ def run_real_pretrain(
             f"first_delay_pos_mae={mean_first_path_delay_bin_position_mae:.4f} "
             f"first_delay_raw_mae={mean_first_path_delay_raw_mae_ns:.2f}ns "
             f"first_delay_bin_violate={mean_first_path_delay_bin_consistency_violation_ns:.2f}ns "
-            f"los_delay_raw_mae={mean_los_delay_raw_mae_ns:.2f}ns "
+            f"los_nonneg={mean_los_delay_nonnegative:.4f} "
             f"aux={mean_aux_regression:.4f} grad_csi={mean_grad_csi_encoder:.2e} "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
@@ -1796,8 +1799,7 @@ def run_real_pretrain(
                         "loss_direct_power": mean_direct_power,
                         "loss_first_path_delay": mean_first_path_delay,
                         "loss_los_delay": mean_los_delay,
-                        "loss_los_delay_raw": mean_los_delay_raw,
-                        "los_delay_raw_mae_ns": mean_los_delay_raw_mae_ns,
+                        "loss_los_delay_nonnegative": mean_los_delay_nonnegative,
                         "k_factor_sample_weight_mean": mean_k_factor_sample_weight,
                         "first_path_power_sample_weight_mean": mean_first_path_power_sample_weight,
                         "first_path_delay_sample_weight_mean": mean_first_path_delay_sample_weight,
@@ -1845,8 +1847,7 @@ def run_real_pretrain(
                         "first_path_delay_bin_weights": first_path_delay_bin_weights,
                         "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
                         "los_delay_weight": los_delay_weight,
-                        "los_delay_raw_weight": los_delay_raw_weight,
-                        "los_delay_raw_beta_ns": los_delay_raw_beta_ns,
+                        "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
                         "delay_spread_teacher_weight": delay_spread_teacher_weight,
                         "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
                         "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
@@ -1940,8 +1941,7 @@ def run_real_pretrain(
                     "first_path_delay_bin_weights": first_path_delay_bin_weights,
                     "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
                     "los_delay_weight": los_delay_weight,
-                    "los_delay_raw_weight": los_delay_raw_weight,
-                    "los_delay_raw_beta_ns": los_delay_raw_beta_ns,
+                    "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
                     "delay_spread_teacher_weight": delay_spread_teacher_weight,
                     "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
                     "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
@@ -1961,6 +1961,7 @@ def run_real_pretrain(
                     "limit_samples_by_attribute": limit_samples_by_attribute,
                     "limit_samples_per_attribute_value": limit_samples_per_attribute_value,
                     "max_delay_spread_ns": max_delay_spread_ns,
+                    "allow_prototype_mismatch_transfer": allow_prototype_mismatch_transfer,
                     "freeze_csi": freeze_csi,
                     "freeze_text_prototypes": freeze_text_prototypes,
                     "phase": f"csi_clip_{text_mode}_text",
@@ -1980,6 +1981,14 @@ def main() -> None:
         "--checkpoint",
         type=str,
         help="Load compatible model/tokenizer weights from a previous checkpoint before training.",
+    )
+    parser.add_argument(
+        "--allow-prototype-mismatch-transfer",
+        action="store_true",
+        help=(
+            "Allow transfer from a checkpoint with different learnable prototypes. "
+            "Compatible weights are loaded, while prototypes and incompatible heads are reinitialized."
+        ),
     )
     parser.add_argument("--config", type=str, default=str(ROOT / "configs" / "train.yaml"))
     parser.add_argument("--epochs", type=int)
@@ -2152,14 +2161,9 @@ def main() -> None:
         help="Supervision weight for LoS delay prediction from the shared delay context on LoS samples.",
     )
     parser.add_argument(
-        "--los-delay-raw-weight",
+        "--los-delay-nonnegative-weight",
         type=float,
-        help="Supervision weight for LoS delay prediction using raw ns Huber loss.",
-    )
-    parser.add_argument(
-        "--los-delay-raw-beta-ns",
-        type=float,
-        help="Huber transition beta in ns for --los-delay-raw-weight.",
+        help="Penalty weight for negative LoS delay predictions on LoS samples.",
     )
     parser.add_argument(
         "--delay-spread-teacher-weight",
@@ -2459,18 +2463,11 @@ def main() -> None:
         if args.los_delay_weight is not None
         else float(cfg_get(train_cfg, "los_delay_weight", 0.0))
     )
-    los_delay_raw_weight = (
-        args.los_delay_raw_weight
-        if args.los_delay_raw_weight is not None
-        else float(cfg_get(train_cfg, "los_delay_raw_weight", 0.0))
+    los_delay_nonnegative_weight = (
+        args.los_delay_nonnegative_weight
+        if args.los_delay_nonnegative_weight is not None
+        else float(cfg_get(train_cfg, "los_delay_nonnegative_weight", 0.0))
     )
-    los_delay_raw_beta_ns = (
-        args.los_delay_raw_beta_ns
-        if args.los_delay_raw_beta_ns is not None
-        else float(cfg_get(train_cfg, "los_delay_raw_beta_ns", 20.0))
-    )
-    if los_delay_raw_beta_ns <= 0.0:
-        raise ValueError("--los-delay-raw-beta-ns must be positive.")
     delay_spread_teacher_weight = (
         args.delay_spread_teacher_weight
         if args.delay_spread_teacher_weight is not None
@@ -2606,8 +2603,7 @@ def main() -> None:
             first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
             first_path_delay_bin_weights=first_path_delay_bin_weights,
             los_delay_weight=los_delay_weight,
-            los_delay_raw_weight=los_delay_raw_weight,
-            los_delay_raw_beta_ns=los_delay_raw_beta_ns,
+            los_delay_nonnegative_weight=los_delay_nonnegative_weight,
             delay_spread_teacher_weight=delay_spread_teacher_weight,
             delay_spread_bin_weights=delay_spread_bin_weights,
             delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -2675,8 +2671,7 @@ def main() -> None:
             first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
             first_path_delay_bin_weights=first_path_delay_bin_weights,
             los_delay_weight=los_delay_weight,
-            los_delay_raw_weight=los_delay_raw_weight,
-            los_delay_raw_beta_ns=los_delay_raw_beta_ns,
+            los_delay_nonnegative_weight=los_delay_nonnegative_weight,
             delay_spread_teacher_weight=delay_spread_teacher_weight,
             delay_spread_bin_weights=delay_spread_bin_weights,
             delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -2694,6 +2689,7 @@ def main() -> None:
             limit_samples_by_attribute=limit_samples_by_attribute,
             limit_samples_per_attribute_value=limit_samples_per_attribute_value,
             max_delay_spread_ns=max_delay_spread_ns,
+            allow_prototype_mismatch_transfer=args.allow_prototype_mismatch_transfer,
             freeze_csi=freeze_csi,
             freeze_text_prototypes=freeze_text_prototypes,
             output_dir=output_dir,

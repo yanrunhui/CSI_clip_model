@@ -351,46 +351,6 @@ class CSIDelaySpecificEncoder(nn.Module):
         return self.out_proj(torch.cat([pooled_attention, pooled_mean, pooled_max], dim=-1))
 
 
-class DelayPowerMapEncoder(nn.Module):
-    def __init__(
-        self,
-        out_dim: int = 32,
-        hidden_dim: int = 64,
-    ):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=5, padding=2),
-            nn.GELU(),
-            nn.Conv2d(8, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
-        )
-        self.proj = nn.Sequential(
-            nn.Linear(16 * 4 * 4, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(
-        self,
-        delay_power_map: torch.Tensor | None,
-        *,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if delay_power_map is None:
-            delay_power_map = torch.zeros(
-                batch_size,
-                32,
-                32,
-                device=device,
-                dtype=dtype,
-            )
-        features = self.encoder(delay_power_map.unsqueeze(1).to(dtype=dtype))
-        return self.proj(features.flatten(start_dim=1))
-
-
 class CSIClip(nn.Module):
     def __init__(
         self,
@@ -431,7 +391,6 @@ class CSIClip(nn.Module):
             if use_delay_specific_encoder
             else CSIDelayContextEncoder()
         )
-        self.delay_power_map_encoder = DelayPowerMapEncoder()
         self.csi_delay_context_dim = CSI_DELAY_CONTEXT_DIM
         self.delay_head_input_dim = embed_dim + self.csi_delay_context_dim
         self.power_context_dim = embed_dim + 32 + 32
@@ -698,9 +657,9 @@ class CSIClip(nn.Module):
             delay_power_map=delay_power_map,
             delay_power_profile=delay_power_profile,
         )
-        delay_map_context = self.delay_power_map_encoder(
-            delay_power_map,
-            batch_size=tokens.shape[0],
+        delay_map_context = torch.zeros(
+            tokens.shape[0],
+            32,
             device=tokens.device,
             dtype=tokens.dtype,
         )
@@ -874,7 +833,7 @@ class CSIClip(nn.Module):
             if self.detach_first_path_delay_features
             else first_path_delay_head_input
         )
-        los_delay_input = delay_head_input.detach()
+        los_delay_input = first_path_delay_input.detach()
         first_path_delay_context = self.first_path_delay_context_head(first_path_delay_input).squeeze(-1)
         first_path_delay_bin_logits = self.first_path_delay_bin_classifier(first_path_delay_input)
         first_path_delay_bin_position = torch.sigmoid(
