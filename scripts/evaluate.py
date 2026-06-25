@@ -75,8 +75,10 @@ DELAY_SPREAD_DIAGNOSTIC_BINS = (
 )
 
 FIRST_PATH_DELAY_DIAGNOSTIC_BINS = (
-    *FIRST_PATH_DELAY_POSITION_BINS,
-    ("1600_plus", 1600.0, float("inf")),
+    *(
+        (label, lower, float("inf") if idx == len(FIRST_PATH_DELAY_POSITION_BINS) - 1 else upper)
+        for idx, (label, lower, upper) in enumerate(FIRST_PATH_DELAY_POSITION_BINS)
+    ),
 )
 
 LOS_DELAY_DIAGNOSTIC_BINS = FIRST_PATH_DELAY_DIAGNOSTIC_BINS
@@ -332,6 +334,21 @@ def _infer_use_first_path_delay_bin_head(checkpoint: dict | None) -> bool:
             and has_compatible_bin_head
         )
     return False
+
+
+def _assert_checkpoint_first_path_delay_bin_labels(checkpoint: dict | None) -> None:
+    if checkpoint is None:
+        return
+    checkpoint_labels = checkpoint.get("args", {}).get("first_path_delay_bin_label_order")
+    if checkpoint_labels is None:
+        return
+    current_labels = tuple(FIRST_PATH_DELAY_BIN_LABELS)
+    if tuple(checkpoint_labels) != current_labels:
+        raise ValueError(
+            "Checkpoint first-path-delay bin label order does not match current code: "
+            f"checkpoint={tuple(checkpoint_labels)} current={current_labels}. "
+            "Retrain the first-path-delay bin heads after changing bin boundaries."
+        )
 
 
 def _infer_use_delay_specific_encoder(checkpoint: dict | None) -> bool:
@@ -869,6 +886,7 @@ def evaluate(
         },
     ).to(device)
     if checkpoint is not None:
+        _assert_checkpoint_first_path_delay_bin_labels(checkpoint)
         assert_checkpoint_prototype_compatibility(
             checkpoint,
             prototype_keys,
@@ -891,6 +909,8 @@ def evaluate(
     all_profile_direct_delay_spread_predictions = []
     all_delay_spread_context_predictions = []
     all_first_path_delay_context_predictions = []
+    all_first_path_delay_bin_fused_raw_predictions = []
+    all_first_path_delay_bin_soft_fused_raw_predictions = []
     all_los_delay_context_predictions = []
     all_delay_spread_bin_logits = []
     all_delay_spread_bin_positions = []
@@ -985,6 +1005,12 @@ def evaluate(
         all_first_path_delay_context_predictions.append(
             physics_outputs["first_path_delay_context"].cpu()
         )
+        all_first_path_delay_bin_fused_raw_predictions.append(
+            physics_outputs["first_path_delay_bin_fused_raw"].cpu()
+        )
+        all_first_path_delay_bin_soft_fused_raw_predictions.append(
+            physics_outputs["first_path_delay_bin_soft_fused_raw"].cpu()
+        )
         all_los_delay_context_predictions.append(
             physics_outputs["los_delay_context"].cpu()
         )
@@ -1058,6 +1084,14 @@ def evaluate(
     )
     first_path_delay_context_predictions = torch.cat(
         all_first_path_delay_context_predictions,
+        dim=0,
+    )
+    first_path_delay_bin_fused_raw_predictions = torch.cat(
+        all_first_path_delay_bin_fused_raw_predictions,
+        dim=0,
+    )
+    first_path_delay_bin_soft_fused_raw_predictions = torch.cat(
+        all_first_path_delay_bin_soft_fused_raw_predictions,
         dim=0,
     )
     los_delay_context_predictions = torch.cat(
@@ -1177,6 +1211,16 @@ def evaluate(
             ),
             first_path_delay_bin_positions=(
                 first_path_delay_bin_positions if use_first_path_delay_bin_head else None
+            ),
+            first_path_delay_bin_fused_raw=(
+                first_path_delay_bin_fused_raw_predictions
+                if use_first_path_delay_bin_head
+                else None
+            ),
+            first_path_delay_bin_soft_fused_raw=(
+                first_path_delay_bin_soft_fused_raw_predictions
+                if use_first_path_delay_bin_head
+                else None
             ),
             los_delay_predictions=los_delay_context_predictions,
             physics_raw_targets=physics_raw_targets,
@@ -1869,6 +1913,8 @@ def _print_delay_family_diagnostics(
     first_path_delay_predictions: torch.Tensor,
     first_path_delay_bin_logits: torch.Tensor | None,
     first_path_delay_bin_positions: torch.Tensor | None,
+    first_path_delay_bin_fused_raw: torch.Tensor | None,
+    first_path_delay_bin_soft_fused_raw: torch.Tensor | None,
     los_delay_predictions: torch.Tensor,
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
@@ -1905,10 +1951,60 @@ def _print_delay_family_diagnostics(
             targets=physics_raw_targets[:, first_delay_idx],
             mask=first_delay_mask & ~los_sample_mask,
         )
+        _print_first_path_delay_target_bin_diagnostics(
+            prefix="first_path_delay_context_target_bin",
+            predictions=first_delay_raw,
+            targets=physics_raw_targets[:, first_delay_idx],
+            valid_mask=first_delay_mask,
+            los_sample_mask=los_sample_mask,
+        )
         if first_path_delay_bin_logits is not None:
             _print_first_path_delay_bin_head_diagnostics(
                 target_raw=first_delay_target,
                 bin_logits=first_path_delay_bin_logits[first_delay_mask],
+            )
+        if first_path_delay_bin_fused_raw is not None:
+            fused_pred = first_path_delay_bin_fused_raw.to(dtype=first_delay_raw.dtype)
+            fused_target = physics_raw_targets[:, first_delay_idx]
+            fused_errors = fused_pred[first_delay_mask] - first_delay_target
+            print(f"first_path_delay_bin_fused_MAE={float(fused_errors.abs().mean()):.4f}")
+            print(f"first_path_delay_bin_fused_signed_mean={float(fused_errors.mean()):.4f}")
+            _print_first_path_delay_group_metrics(
+                prefix="first_path_delay_bin_fused_los",
+                predictions=fused_pred,
+                targets=fused_target,
+                mask=first_delay_mask & los_sample_mask,
+            )
+            _print_first_path_delay_group_metrics(
+                prefix="first_path_delay_bin_fused_nlos",
+                predictions=fused_pred,
+                targets=fused_target,
+                mask=first_delay_mask & ~los_sample_mask,
+            )
+        if first_path_delay_bin_soft_fused_raw is not None:
+            soft_fused_pred = first_path_delay_bin_soft_fused_raw.to(dtype=first_delay_raw.dtype)
+            fused_target = physics_raw_targets[:, first_delay_idx]
+            soft_fused_errors = soft_fused_pred[first_delay_mask] - first_delay_target
+            print(f"first_path_delay_bin_soft_fused_MAE={float(soft_fused_errors.abs().mean()):.4f}")
+            print(f"first_path_delay_bin_soft_fused_signed_mean={float(soft_fused_errors.mean()):.4f}")
+            _print_first_path_delay_group_metrics(
+                prefix="first_path_delay_bin_soft_fused_los",
+                predictions=soft_fused_pred,
+                targets=fused_target,
+                mask=first_delay_mask & los_sample_mask,
+            )
+            _print_first_path_delay_group_metrics(
+                prefix="first_path_delay_bin_soft_fused_nlos",
+                predictions=soft_fused_pred,
+                targets=fused_target,
+                mask=first_delay_mask & ~los_sample_mask,
+            )
+            _print_first_path_delay_target_bin_diagnostics(
+                prefix="first_path_delay_bin_soft_fused_target_bin",
+                predictions=soft_fused_pred,
+                targets=fused_target,
+                valid_mask=first_delay_mask,
+                los_sample_mask=los_sample_mask,
             )
     else:
         print("first_path_delay_context_MAE=nan")
@@ -1919,6 +2015,24 @@ def _print_delay_family_diagnostics(
         print("first_path_delay_context_nlos_count=0")
         print("first_path_delay_context_nlos_MAE=nan")
         print("first_path_delay_context_nlos_signed_mean=nan")
+        if first_path_delay_bin_fused_raw is not None:
+            print("first_path_delay_bin_fused_MAE=nan")
+            print("first_path_delay_bin_fused_signed_mean=nan")
+            print("first_path_delay_bin_fused_los_count=0")
+            print("first_path_delay_bin_fused_los_MAE=nan")
+            print("first_path_delay_bin_fused_los_signed_mean=nan")
+            print("first_path_delay_bin_fused_nlos_count=0")
+            print("first_path_delay_bin_fused_nlos_MAE=nan")
+            print("first_path_delay_bin_fused_nlos_signed_mean=nan")
+        if first_path_delay_bin_soft_fused_raw is not None:
+            print("first_path_delay_bin_soft_fused_MAE=nan")
+            print("first_path_delay_bin_soft_fused_signed_mean=nan")
+            print("first_path_delay_bin_soft_fused_los_count=0")
+            print("first_path_delay_bin_soft_fused_los_MAE=nan")
+            print("first_path_delay_bin_soft_fused_los_signed_mean=nan")
+            print("first_path_delay_bin_soft_fused_nlos_count=0")
+            print("first_path_delay_bin_soft_fused_nlos_MAE=nan")
+            print("first_path_delay_bin_soft_fused_nlos_signed_mean=nan")
     los_delay_mask = los_delay_masks & los_sample_mask
     _print_los_delay_diagnostics(
         predictions=los_delay_predictions * 3000.0,
@@ -1942,6 +2056,49 @@ def _print_first_path_delay_group_metrics(
     errors = predictions[mask] - targets[mask]
     print(f"{prefix}_MAE={float(errors.abs().mean()):.4f}")
     print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
+
+
+def _format_delay_bin_range(lower: float, upper: float) -> str:
+    upper_text = "inf" if upper == float("inf") else _format_scalar(upper)
+    return f"{_format_scalar(lower)}-{upper_text}"
+
+
+def _print_first_path_delay_target_bin_diagnostics(
+    prefix: str,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+    los_sample_mask: torch.Tensor,
+) -> None:
+    target_labels = _first_path_delay_bin_targets(targets)
+    bin_valid_mask = valid_mask & (target_labels >= 0)
+    print(
+        f"{prefix}_order="
+        + ",".join(
+            f"{label}:{_format_delay_bin_range(lower, upper)}"
+            for label, lower, upper in FIRST_PATH_DELAY_DIAGNOSTIC_BINS
+        )
+    )
+    for bin_idx, (label, _, _) in enumerate(FIRST_PATH_DELAY_DIAGNOSTIC_BINS):
+        bin_mask = bin_valid_mask & (target_labels == bin_idx)
+        _print_first_path_delay_group_metrics(
+            prefix=f"{prefix}_{label}",
+            predictions=predictions,
+            targets=targets,
+            mask=bin_mask,
+        )
+        _print_first_path_delay_group_metrics(
+            prefix=f"{prefix}_{label}_los",
+            predictions=predictions,
+            targets=targets,
+            mask=bin_mask & los_sample_mask,
+        )
+        _print_first_path_delay_group_metrics(
+            prefix=f"{prefix}_{label}_nlos",
+            predictions=predictions,
+            targets=targets,
+            mask=bin_mask & ~los_sample_mask,
+        )
 
 
 def _first_path_delay_bin_targets(raw_first_path_delay_ns: torch.Tensor) -> torch.Tensor:

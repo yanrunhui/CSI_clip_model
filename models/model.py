@@ -26,13 +26,57 @@ FIRST_PATH_DELAY_POSITION_BINS = (
     ("50_100", 50.0, 100.0),
     ("100_200", 100.0, 200.0),
     ("200_400", 200.0, 400.0),
-    ("400_800", 400.0, 800.0),
-    ("800_1600", 800.0, 1600.0),
+    ("400_600", 400.0, 600.0),
+    ("600_800", 600.0, 800.0),
+    ("800_1040", 800.0, 1040.0),
+    ("1040_1280", 1040.0, 1280.0),
+    ("1280_plus", 1280.0, 2560.0),
 )
-FIRST_PATH_DELAY_BIN_LABELS = (
-    *(label for label, _, _ in FIRST_PATH_DELAY_POSITION_BINS),
-    "1600_plus",
-)
+FIRST_PATH_DELAY_BIN_LABELS = tuple(label for label, _, _ in FIRST_PATH_DELAY_POSITION_BINS)
+
+
+def fuse_first_path_delay_from_bin_position(
+    bin_logits: torch.Tensor,
+    bin_position: torch.Tensor,
+) -> torch.Tensor:
+    """Convert the argmax delay bin and in-bin position into raw delay in ns."""
+    labels = tuple(label for label, _, _ in FIRST_PATH_DELAY_POSITION_BINS)
+    if bin_logits.shape[-1] != len(labels):
+        raise ValueError(
+            "first-path-delay bin logit size mismatch: "
+            f"got {bin_logits.shape[-1]}, expected {len(labels)}."
+        )
+    bounds = torch.tensor(
+        [(lower, upper) for _, lower, upper in FIRST_PATH_DELAY_POSITION_BINS],
+        device=bin_logits.device,
+        dtype=bin_logits.dtype,
+    )
+    predicted_bins = bin_logits.argmax(dim=-1)
+    lower = bounds[:, 0][predicted_bins]
+    upper = bounds[:, 1][predicted_bins]
+    return lower + bin_position.to(dtype=bin_logits.dtype).clamp(0.0, 1.0) * (upper - lower)
+
+
+def fuse_first_path_delay_soft_from_bin_position(
+    bin_logits: torch.Tensor,
+    bin_position: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiably fuse bin probabilities and in-bin position into raw delay in ns."""
+    labels = tuple(label for label, _, _ in FIRST_PATH_DELAY_POSITION_BINS)
+    if bin_logits.shape[-1] != len(labels):
+        raise ValueError(
+            "first-path-delay bin logit size mismatch: "
+            f"got {bin_logits.shape[-1]}, expected {len(labels)}."
+        )
+    bounds = torch.tensor(
+        [(lower, upper) for _, lower, upper in FIRST_PATH_DELAY_POSITION_BINS],
+        device=bin_logits.device,
+        dtype=bin_logits.dtype,
+    )
+    position = bin_position.to(dtype=bin_logits.dtype).clamp(0.0, 1.0).unsqueeze(-1)
+    candidates = bounds[:, 0] + position * (bounds[:, 1] - bounds[:, 0])
+    probabilities = torch.softmax(bin_logits, dim=-1)
+    return (probabilities * candidates).sum(dim=-1)
 
 
 class PowerFeatureEncoder(nn.Module):
@@ -397,6 +441,7 @@ class CSIClip(nn.Module):
         self.delay_profile_stats_dim = 14
         self.delay_profile_context_dim = 32 + 32 + self.delay_profile_stats_dim
         self.delay_spread_index = 1
+        self.first_path_delay_index = 4
         self.first_path_power_index = 5
         self.delay_spread_delta_limit = 0.25
         self.delay_spread_fusion_scale = 0.02
@@ -839,6 +884,14 @@ class CSIClip(nn.Module):
         first_path_delay_bin_position = torch.sigmoid(
             self.first_path_delay_bin_position_head(first_path_delay_input).squeeze(-1)
         )
+        first_path_delay_bin_fused_raw = fuse_first_path_delay_from_bin_position(
+            first_path_delay_bin_logits,
+            first_path_delay_bin_position,
+        )
+        first_path_delay_bin_soft_fused_raw = fuse_first_path_delay_soft_from_bin_position(
+            first_path_delay_bin_logits,
+            first_path_delay_bin_position,
+        )
         los_delay_context = self.los_delay_context_head(los_delay_input).squeeze(-1)
         delay_spread_tail_logits = self.delay_spread_tail_classifier(delay_head_input)
         first_path_power_bin_logits = self.first_path_power_bin_classifier(
@@ -860,6 +913,9 @@ class CSIClip(nn.Module):
             final = base.clone()
             if self.use_delay_spread_head:
                 final[:, self.delay_spread_index] = delay_spread_context
+            final[:, self.first_path_delay_index] = (
+                first_path_delay_bin_soft_fused_raw / 3000.0
+            )
             return {
                 "base": base,
                 "enhanced_first_path_power": base[:, self.first_path_power_index],
@@ -871,6 +927,8 @@ class CSIClip(nn.Module):
                 "first_path_delay_context": first_path_delay_context,
                 "first_path_delay_bin_logits": first_path_delay_bin_logits,
                 "first_path_delay_bin_position": first_path_delay_bin_position,
+                "first_path_delay_bin_fused_raw": first_path_delay_bin_fused_raw,
+                "first_path_delay_bin_soft_fused_raw": first_path_delay_bin_soft_fused_raw,
                 "los_delay_context": los_delay_context,
                 "enhanced_delay_spread_gate": zeros,
                 "enhanced_delay_spread_delta": zeros,
@@ -934,6 +992,9 @@ class CSIClip(nn.Module):
         final = base.clone()
         if self.use_delay_spread_head:
             final[:, self.delay_spread_index] = delay_spread_context
+        final[:, self.first_path_delay_index] = (
+            first_path_delay_bin_soft_fused_raw / 3000.0
+        )
         return {
             "base": base,
             "enhanced_first_path_power": enhanced_first_path_power,
@@ -945,6 +1006,8 @@ class CSIClip(nn.Module):
             "first_path_delay_context": first_path_delay_context,
             "first_path_delay_bin_logits": first_path_delay_bin_logits,
             "first_path_delay_bin_position": first_path_delay_bin_position,
+            "first_path_delay_bin_fused_raw": first_path_delay_bin_fused_raw,
+            "first_path_delay_bin_soft_fused_raw": first_path_delay_bin_soft_fused_raw,
             "los_delay_context": los_delay_context,
             "enhanced_delay_spread_gate": delay_spread_gate,
             "enhanced_delay_spread_delta": delay_spread_delta,

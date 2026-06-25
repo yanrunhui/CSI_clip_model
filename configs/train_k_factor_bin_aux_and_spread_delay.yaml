@@ -53,15 +53,23 @@ train:
   direct_power_weight: 0.0
   delay_spread_weight: 0.01
   first_path_delay_weight: 0.08
-  first_path_delay_raw_weight: 0.005
+  first_path_delay_raw_weight: 0.001
+  first_path_delay_fused_raw_weight: 0.02
   first_path_delay_raw_beta_ns: 20.0
   first_path_delay_bin_classifier_weight: 0.02
   first_path_delay_bin_position_weight: 0.0
   first_path_delay_bin_consistency_weight: 0.01
   first_path_delay_bin_weights:
     "200_400": 2.0
-    "400_800": 3.0
-    "800_1600": 3.0
+    "400_600": 3.0
+    "600_800": 3.0
+    "800_1040": 3.0
+    "1040_1280": 3.0
+  estimated_pdp_tail_bin_weight: 0.02
+  estimated_pdp_tail_labels:
+    - "1040_1280"
+  estimated_pdp_tail_gate_mode: target_or_pdp_argmax
+  first_path_delay_tail_underestimate_weight: 0.01
   los_delay_weight: 0.0
   los_delay_nonnegative_weight: 0.0
   delay_spread_teacher_weight: 0.0

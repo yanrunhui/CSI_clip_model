@@ -29,6 +29,25 @@ class InputProjection(nn.Module):
         self.out_proj = nn.Linear(d_spatial * d_freq_pool * 2, d_model)
 
     def forward(self, x: torch.Tensor, subcarrier_spacing: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                "CSI tokens must have shape (batch, beams, d_token, n_freq), "
+                f"got {tuple(x.shape)}."
+            )
+        expected_d_token = self.spatial_linear.in_features
+        if x.shape[2] != expected_d_token:
+            raise ValueError(
+                "CSI token feature dimension mismatch: "
+                f"expected d_token={expected_d_token}, got {x.shape[2]} "
+                f"for tokens shape {tuple(x.shape)}. "
+                "Use an eval .pt generated with the same preprocessing as training, "
+                "or rebuild the model with the matching d_token."
+            )
+        if subcarrier_spacing.ndim != 1 or subcarrier_spacing.shape[0] != x.shape[0]:
+            raise ValueError(
+                "subcarrier_spacing must have shape (batch,), "
+                f"got {tuple(subcarrier_spacing.shape)} for batch={x.shape[0]}."
+            )
         B, K, D, Nf = x.shape
         x = x.reshape(B * K, D, Nf).transpose(-1, -2)
         x = self.spatial_linear(x)

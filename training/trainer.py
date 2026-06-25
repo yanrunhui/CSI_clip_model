@@ -57,11 +57,16 @@ class TrainConfig:
     delay_spread_weight: float = 0.0
     first_path_delay_weight: float = 0.0
     first_path_delay_raw_weight: float = 0.0
+    first_path_delay_fused_raw_weight: float = 0.0
     first_path_delay_raw_beta_ns: float = 20.0
     first_path_delay_bin_classifier_weight: float = 0.0
     first_path_delay_bin_position_weight: float = 0.0
     first_path_delay_bin_consistency_weight: float = 0.0
     first_path_delay_bin_weights: dict[str, float] | None = None
+    estimated_pdp_tail_bin_weight: float = 0.0
+    estimated_pdp_tail_labels: tuple[str, ...] = ("1040_1280",)
+    estimated_pdp_tail_gate_mode: str = "target"
+    first_path_delay_tail_underestimate_weight: float = 0.0
     los_delay_weight: float = 0.0
     los_delay_nonnegative_weight: float = 0.0
     delay_spread_teacher_weight: float = 0.1
@@ -107,9 +112,9 @@ class Trainer:
     )
     FIRST_PATH_DELAY_BIN_LABELS = FIRST_PATH_DELAY_BIN_LABELS
     FIRST_PATH_DELAY_POSITION_BINS = FIRST_PATH_DELAY_POSITION_BINS
-    FIRST_PATH_DELAY_BINS = (
-        *FIRST_PATH_DELAY_POSITION_BINS,
-        ("1600_plus", 1600.0, float("inf")),
+    FIRST_PATH_DELAY_BINS = tuple(
+        (label, lower, float("inf") if idx == len(FIRST_PATH_DELAY_POSITION_BINS) - 1 else upper)
+        for idx, (label, lower, upper) in enumerate(FIRST_PATH_DELAY_POSITION_BINS)
     )
 
     def __init__(
@@ -585,6 +590,73 @@ class Trainer:
             dtype=dtype,
         )
 
+    def _first_path_delay_tail_indices(self, labels: tuple[str, ...]) -> torch.Tensor:
+        label_to_idx = {label: idx for idx, label in enumerate(self.FIRST_PATH_DELAY_BIN_LABELS)}
+        unknown = sorted(set(labels) - set(label_to_idx))
+        if unknown:
+            raise ValueError(
+                f"Unknown estimated-PDP first-path-delay tail labels: {unknown}. "
+                f"Choose from: {', '.join(self.FIRST_PATH_DELAY_BIN_LABELS)}."
+            )
+        return torch.tensor(
+            [label_to_idx[label] for label in labels],
+            device=self.device,
+            dtype=torch.long,
+        )
+
+    def _estimated_pdp_argmax_delay_bins(
+        self,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+        subcarrier_spacing_hz: torch.Tensor,
+    ) -> torch.Tensor:
+        if tokens.ndim != 4 or tokens.shape[2] % 2 != 0:
+            return torch.full(
+                (tokens.shape[0],),
+                fill_value=-1,
+                device=tokens.device,
+                dtype=torch.long,
+            )
+        half = tokens.shape[2] // 2
+        weights = token_mask.to(dtype=tokens.dtype).unsqueeze(-1).unsqueeze(-1)
+        complex_tokens = torch.complex(
+            (tokens[:, :, :half, :] * weights).float(),
+            (tokens[:, :, half:, :] * weights).float(),
+        )
+        delay_response = torch.fft.ifft(complex_tokens, dim=-1)
+        profile = delay_response.abs().square().sum(dim=(1, 2)).float()
+        peak_idx = profile.argmax(dim=-1).to(dtype=torch.float32)
+        n_freq = max(int(tokens.shape[-1]), 1)
+        spacing = subcarrier_spacing_hz.to(device=tokens.device, dtype=torch.float32).clamp(min=1e-6)
+        peak_delay_ns = peak_idx / (n_freq * spacing) * 1e9
+        return self._first_path_delay_bin_targets(peak_delay_ns)
+
+    def _estimated_pdp_tail_gate_mask(
+        self,
+        *,
+        true_targets: torch.Tensor,
+        pdp_targets: torch.Tensor,
+        tail_indices: torch.Tensor,
+        mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_tail = (true_targets.unsqueeze(1) == tail_indices.unsqueeze(0)).any(dim=1)
+        pdp_tail = (pdp_targets.unsqueeze(1) == tail_indices.unsqueeze(0)).any(dim=1)
+        if mode == "target":
+            gate = target_tail
+        elif mode == "pdp_argmax":
+            gate = pdp_tail
+        elif mode == "target_or_pdp_argmax":
+            gate = target_tail | pdp_tail
+        elif mode == "target_and_pdp_argmax":
+            gate = target_tail & pdp_tail
+        else:
+            raise ValueError(
+                "estimated_pdp_tail_gate_mode must be one of "
+                "target, pdp_argmax, target_or_pdp_argmax, target_and_pdp_argmax; "
+                f"got {mode!r}."
+            )
+        return gate, target_tail, pdp_tail
+
     def _first_path_delay_bin_position_targets(
         self,
         raw_first_path_delay_ns: torch.Tensor,
@@ -813,6 +885,9 @@ class Trainer:
         effective_first_path_delay_raw_weight = (
             0.0 if warmup_active else cfg.first_path_delay_raw_weight
         )
+        effective_first_path_delay_fused_raw_weight = (
+            0.0 if warmup_active else cfg.first_path_delay_fused_raw_weight
+        )
         effective_first_path_delay_bin_classifier_weight = (
             0.0 if warmup_active else cfg.first_path_delay_bin_classifier_weight
         )
@@ -821,6 +896,12 @@ class Trainer:
         )
         effective_first_path_delay_bin_consistency_weight = (
             0.0 if warmup_active else cfg.first_path_delay_bin_consistency_weight
+        )
+        effective_estimated_pdp_tail_bin_weight = (
+            0.0 if warmup_active else cfg.estimated_pdp_tail_bin_weight
+        )
+        effective_first_path_delay_tail_underestimate_weight = (
+            0.0 if warmup_active else cfg.first_path_delay_tail_underestimate_weight
         )
         effective_los_delay_weight = (
             0.0 if warmup_active else cfg.los_delay_weight
@@ -885,8 +966,18 @@ class Trainer:
         first_path_delay_bin_loss_denominator = None
         first_path_delay_bin_position_mae = None
         first_path_delay_raw_mae_ns = None
+        first_path_delay_fused_raw_mae_ns = None
         first_path_delay_bin_consistency_violation_ns = None
         first_path_delay_bin_consistency_max_violation_ns = None
+        estimated_pdp_tail_bin_loss_denominator = None
+        estimated_pdp_tail_bin_accuracy = None
+        estimated_pdp_tail_gate_fraction = None
+        estimated_pdp_tail_target_fraction = None
+        estimated_pdp_tail_argmax_fraction = None
+        first_path_delay_tail_underestimate_mae_ns = None
+        first_path_delay_tail_underestimate_mean_ns = None
+        first_path_delay_tail_underestimate_fraction = None
+        first_path_delay_tail_underestimate_count = None
         los_delay_raw_mae_ns = None
         delay_spread_tail_accuracy = None
         delay_spread_tail_recall = None
@@ -906,9 +997,12 @@ class Trainer:
             or effective_delay_spread_weight > 0.0
             or effective_first_path_delay_weight > 0.0
             or effective_first_path_delay_raw_weight > 0.0
+            or effective_first_path_delay_fused_raw_weight > 0.0
             or effective_first_path_delay_bin_classifier_weight > 0.0
             or effective_first_path_delay_bin_position_weight > 0.0
             or effective_first_path_delay_bin_consistency_weight > 0.0
+            or effective_estimated_pdp_tail_bin_weight > 0.0
+            or effective_first_path_delay_tail_underestimate_weight > 0.0
             or effective_los_delay_weight > 0.0
             or effective_los_delay_nonnegative_weight > 0.0
         ):
@@ -925,9 +1019,12 @@ class Trainer:
                 (
                     effective_first_path_delay_weight > 0.0
                     or effective_first_path_delay_raw_weight > 0.0
+                    or effective_first_path_delay_fused_raw_weight > 0.0
                     or effective_first_path_delay_bin_classifier_weight > 0.0
                     or effective_first_path_delay_bin_position_weight > 0.0
                     or effective_first_path_delay_bin_consistency_weight > 0.0
+                    or effective_estimated_pdp_tail_bin_weight > 0.0
+                    or effective_first_path_delay_tail_underestimate_weight > 0.0
                 )
                 and hasattr(self.model, "encode_first_path_delay_context")
             ):
@@ -1645,6 +1742,37 @@ class Trainer:
                 first_path_delay_raw_mae_ns = raw_abs_error[raw_mask].mean()
         if (
             physics_outputs is not None
+            and effective_first_path_delay_fused_raw_weight > 0.0
+        ):
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            raw_prediction = physics_outputs["first_path_delay_bin_soft_fused_raw"]
+            raw_target = batch["physics_raw_targets"][:, first_delay_idx].to(
+                device=raw_prediction.device,
+                dtype=raw_prediction.dtype,
+            )
+            raw_mask = (
+                batch["physics_target_mask"][:, first_delay_idx].bool()
+                & torch.isfinite(raw_target)
+            )
+            if bool(raw_mask.any()):
+                raw_abs_error = (raw_prediction - raw_target).abs()
+                beta = max(float(cfg.first_path_delay_raw_beta_ns), 1e-6)
+                raw_errors = torch.where(
+                    raw_abs_error < beta,
+                    0.5 * raw_abs_error.square() / beta,
+                    raw_abs_error - 0.5 * beta,
+                )
+                raw_weights = self._first_path_delay_sample_weights(
+                    batch["physics_raw_targets"][:, first_delay_idx],
+                    cfg,
+                )[raw_mask]
+                losses["loss_first_path_delay_fused_raw"] = (
+                    (raw_errors[raw_mask] * raw_weights.to(dtype=raw_errors.dtype)).sum()
+                    / raw_weights.sum().clamp(min=1.0).to(dtype=raw_errors.dtype)
+                )
+                first_path_delay_fused_raw_mae_ns = raw_abs_error[raw_mask].mean()
+        if (
+            physics_outputs is not None
             and effective_first_path_delay_bin_consistency_weight > 0.0
         ):
             first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
@@ -1730,6 +1858,115 @@ class Trainer:
                     first_path_delay_bin_predictions,
                     len(self.FIRST_PATH_DELAY_BIN_LABELS),
                 )
+        if (
+            physics_outputs is not None
+            and effective_estimated_pdp_tail_bin_weight > 0.0
+        ):
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            first_path_delay_bin_logits = physics_outputs["first_path_delay_bin_logits"]
+            first_path_delay_bin_targets = self._first_path_delay_bin_targets(
+                batch["physics_raw_targets"][:, first_delay_idx]
+            )
+            first_path_delay_bin_mask = (
+                (first_path_delay_bin_targets >= 0)
+                & batch["physics_target_mask"][:, first_delay_idx].bool()
+            )
+            if bool(first_path_delay_bin_mask.any()):
+                with torch.no_grad():
+                    tail_indices = self._first_path_delay_tail_indices(
+                        tuple(cfg.estimated_pdp_tail_labels)
+                    )
+                    pdp_bin_targets = self._estimated_pdp_argmax_delay_bins(
+                        batch["tokens"],
+                        batch["token_mask"],
+                        batch["subcarrier_spacing"],
+                    )
+                    tail_gate, target_tail, pdp_tail = self._estimated_pdp_tail_gate_mask(
+                        true_targets=first_path_delay_bin_targets,
+                        pdp_targets=pdp_bin_targets,
+                        tail_indices=tail_indices,
+                        mode=cfg.estimated_pdp_tail_gate_mode,
+                    )
+                    tail_gate = tail_gate & first_path_delay_bin_mask
+                    estimated_pdp_tail_gate_fraction = tail_gate.float().mean()
+                    estimated_pdp_tail_target_fraction = (
+                        target_tail & first_path_delay_bin_mask
+                    ).float().mean()
+                    estimated_pdp_tail_argmax_fraction = (
+                        pdp_tail & first_path_delay_bin_mask
+                    ).float().mean()
+                if bool(tail_gate.any()):
+                    tail_logits = first_path_delay_bin_logits[tail_gate]
+                    tail_targets = first_path_delay_bin_targets[tail_gate]
+                    tail_classifier_loss = torch.nn.functional.cross_entropy(
+                        tail_logits,
+                        tail_targets,
+                        reduction="none",
+                    )
+                    estimated_pdp_tail_bin_loss_denominator = torch.tensor(
+                        float(tail_targets.numel()),
+                        device=self.device,
+                        dtype=tail_classifier_loss.dtype,
+                    )
+                    losses["loss_estimated_pdp_tail_bin_classifier"] = (
+                        tail_classifier_loss.mean()
+                    )
+                    tail_predictions = tail_logits.argmax(dim=1)
+                    estimated_pdp_tail_bin_accuracy = (
+                        tail_predictions == tail_targets
+                    ).float().mean()
+        if (
+            physics_outputs is not None
+            and effective_first_path_delay_tail_underestimate_weight > 0.0
+        ):
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            raw_prediction = physics_outputs["first_path_delay_bin_soft_fused_raw"]
+            raw_target = batch["physics_raw_targets"][:, first_delay_idx].to(
+                device=raw_prediction.device,
+                dtype=raw_prediction.dtype,
+            )
+            first_path_delay_bin_targets = self._first_path_delay_bin_targets(
+                batch["physics_raw_targets"][:, first_delay_idx]
+            )
+            tail_indices = self._first_path_delay_tail_indices(
+                tuple(cfg.estimated_pdp_tail_labels)
+            )
+            tail_mask = (
+                (first_path_delay_bin_targets.unsqueeze(1) == tail_indices.unsqueeze(0))
+                .any(dim=1)
+                & batch["physics_target_mask"][:, first_delay_idx].bool()
+                & torch.isfinite(raw_target)
+            )
+            if bool(tail_mask.any()):
+                tail_errors = raw_prediction[tail_mask] - raw_target[tail_mask]
+                tail_underestimate = torch.relu(-tail_errors)
+                beta = max(float(cfg.first_path_delay_raw_beta_ns), 1e-6)
+                tail_underestimate_loss = torch.where(
+                    tail_underestimate < beta,
+                    0.5 * tail_underestimate.square() / beta,
+                    tail_underestimate - 0.5 * beta,
+                )
+                tail_weights = self._first_path_delay_sample_weights(
+                    batch["physics_raw_targets"][:, first_delay_idx],
+                    cfg,
+                )[tail_mask]
+                losses["loss_first_path_delay_tail_underestimate"] = (
+                    (
+                        tail_underestimate_loss
+                        * tail_weights.to(dtype=tail_underestimate_loss.dtype)
+                    ).sum()
+                    / tail_weights.sum().clamp(min=1.0).to(dtype=tail_underestimate_loss.dtype)
+                )
+                first_path_delay_tail_underestimate_count = torch.tensor(
+                    float(tail_errors.numel()),
+                    device=self.device,
+                    dtype=tail_errors.dtype,
+                )
+                first_path_delay_tail_underestimate_mae_ns = tail_errors.abs().mean()
+                first_path_delay_tail_underestimate_mean_ns = tail_underestimate.mean()
+                first_path_delay_tail_underestimate_fraction = (
+                    tail_errors < 0.0
+                ).float().mean()
         if (
             physics_outputs is not None
             and effective_first_path_delay_bin_position_weight > 0.0
@@ -1836,9 +2073,12 @@ class Trainer:
             effective_delay_spread_weight * losses.get("loss_delay_spread", torch.zeros((), device=self.device)) +
             effective_first_path_delay_weight * losses.get("loss_first_path_delay", torch.zeros((), device=self.device)) +
             effective_first_path_delay_raw_weight * losses.get("loss_first_path_delay_raw", torch.zeros((), device=self.device)) +
+            effective_first_path_delay_fused_raw_weight * losses.get("loss_first_path_delay_fused_raw", torch.zeros((), device=self.device)) +
             effective_first_path_delay_bin_classifier_weight * losses.get("loss_first_path_delay_bin_classifier", torch.zeros((), device=self.device)) +
             effective_first_path_delay_bin_position_weight * losses.get("loss_first_path_delay_bin_position", torch.zeros((), device=self.device)) +
             effective_first_path_delay_bin_consistency_weight * losses.get("loss_first_path_delay_bin_consistency", torch.zeros((), device=self.device)) +
+            effective_estimated_pdp_tail_bin_weight * losses.get("loss_estimated_pdp_tail_bin_classifier", torch.zeros((), device=self.device)) +
+            effective_first_path_delay_tail_underestimate_weight * losses.get("loss_first_path_delay_tail_underestimate", torch.zeros((), device=self.device)) +
             effective_los_delay_weight * losses.get("loss_los_delay", torch.zeros((), device=self.device)) +
             effective_los_delay_nonnegative_weight * losses.get("loss_los_delay_nonnegative", torch.zeros((), device=self.device))
         )
@@ -1897,6 +2137,9 @@ class Trainer:
         metrics["delay_spread_weight"] = float(effective_delay_spread_weight)
         metrics["first_path_delay_weight"] = float(effective_first_path_delay_weight)
         metrics["first_path_delay_raw_weight"] = float(effective_first_path_delay_raw_weight)
+        metrics["first_path_delay_fused_raw_weight"] = float(
+            effective_first_path_delay_fused_raw_weight
+        )
         metrics["first_path_delay_raw_beta_ns"] = float(cfg.first_path_delay_raw_beta_ns)
         metrics["first_path_delay_bin_classifier_weight"] = float(
             effective_first_path_delay_bin_classifier_weight
@@ -1906,6 +2149,18 @@ class Trainer:
         )
         metrics["first_path_delay_bin_consistency_weight"] = float(
             effective_first_path_delay_bin_consistency_weight
+        )
+        metrics["estimated_pdp_tail_bin_weight"] = float(
+            effective_estimated_pdp_tail_bin_weight
+        )
+        metrics["estimated_pdp_tail_labels"] = ",".join(
+            tuple(cfg.estimated_pdp_tail_labels)
+        )
+        metrics["estimated_pdp_tail_gate_mode"] = str(
+            cfg.estimated_pdp_tail_gate_mode
+        )
+        metrics["first_path_delay_tail_underestimate_weight"] = float(
+            effective_first_path_delay_tail_underestimate_weight
         )
         metrics["first_path_delay_bin_label_order"] = ",".join(
             self.FIRST_PATH_DELAY_BIN_LABELS
@@ -1938,6 +2193,10 @@ class Trainer:
             metrics["first_path_delay_raw_mae_ns"] = float(
                 first_path_delay_raw_mae_ns.detach()
             )
+        if first_path_delay_fused_raw_mae_ns is not None:
+            metrics["first_path_delay_fused_raw_mae_ns"] = float(
+                first_path_delay_fused_raw_mae_ns.detach()
+            )
         if first_path_delay_bin_consistency_violation_ns is not None:
             metrics["first_path_delay_bin_consistency_violation_ns"] = float(
                 first_path_delay_bin_consistency_violation_ns.detach()
@@ -1945,6 +2204,42 @@ class Trainer:
         if first_path_delay_bin_consistency_max_violation_ns is not None:
             metrics["first_path_delay_bin_consistency_max_violation_ns"] = float(
                 first_path_delay_bin_consistency_max_violation_ns.detach()
+            )
+        if estimated_pdp_tail_bin_loss_denominator is not None:
+            metrics["estimated_pdp_tail_bin_loss_denominator"] = float(
+                estimated_pdp_tail_bin_loss_denominator.detach()
+            )
+        if estimated_pdp_tail_bin_accuracy is not None:
+            metrics["accuracy_estimated_pdp_tail_bin_classifier"] = float(
+                estimated_pdp_tail_bin_accuracy.detach()
+            )
+        if estimated_pdp_tail_gate_fraction is not None:
+            metrics["estimated_pdp_tail_gate_fraction"] = float(
+                estimated_pdp_tail_gate_fraction.detach()
+            )
+        if estimated_pdp_tail_target_fraction is not None:
+            metrics["estimated_pdp_tail_target_fraction"] = float(
+                estimated_pdp_tail_target_fraction.detach()
+            )
+        if estimated_pdp_tail_argmax_fraction is not None:
+            metrics["estimated_pdp_tail_argmax_fraction"] = float(
+                estimated_pdp_tail_argmax_fraction.detach()
+            )
+        if first_path_delay_tail_underestimate_count is not None:
+            metrics["first_path_delay_tail_underestimate_count"] = float(
+                first_path_delay_tail_underestimate_count.detach()
+            )
+        if first_path_delay_tail_underestimate_mae_ns is not None:
+            metrics["first_path_delay_tail_underestimate_mae_ns"] = float(
+                first_path_delay_tail_underestimate_mae_ns.detach()
+            )
+        if first_path_delay_tail_underestimate_mean_ns is not None:
+            metrics["first_path_delay_tail_underestimate_mean_ns"] = float(
+                first_path_delay_tail_underestimate_mean_ns.detach()
+            )
+        if first_path_delay_tail_underestimate_fraction is not None:
+            metrics["first_path_delay_tail_underestimate_fraction"] = float(
+                first_path_delay_tail_underestimate_fraction.detach()
             )
         metrics["los_delay_weight"] = float(effective_los_delay_weight)
         metrics["los_delay_nonnegative_weight"] = float(

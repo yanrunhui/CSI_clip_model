@@ -204,6 +204,27 @@ def format_first_path_delay_bin_weights(weights: dict[str, float] | None) -> str
     )
 
 
+def parse_first_path_delay_tail_labels(value) -> tuple[str, ...]:
+    if value is None:
+        return ("1040_1280",)
+    entries = (value,) if isinstance(value, str) else tuple(value)
+    labels = tuple(
+        label.strip()
+        for entry in entries
+        for label in str(entry).split(",")
+        if label.strip()
+    )
+    if not labels:
+        raise ValueError("estimated PDP tail labels must contain at least one label.")
+    unknown = [label for label in labels if label not in FIRST_PATH_DELAY_BIN_LABELS]
+    if unknown:
+        raise ValueError(
+            f"Unknown estimated PDP tail labels: {unknown}. "
+            f"Choose from: {', '.join(FIRST_PATH_DELAY_BIN_LABELS)}"
+        )
+    return labels
+
+
 def parse_k_factor_loss_weights(value) -> dict[str, float] | None:
     if value is None:
         return None
@@ -721,13 +742,34 @@ def load_transfer_checkpoint(path: str | None, device: torch.device) -> dict | N
     return torch.load(checkpoint_path, map_location=device, weights_only=False)
 
 
+def checkpoint_first_path_delay_bin_label_mismatch(checkpoint: dict) -> bool:
+    checkpoint_labels = checkpoint.get("args", {}).get("first_path_delay_bin_label_order")
+    if checkpoint_labels is None:
+        return False
+    return tuple(checkpoint_labels) != tuple(FIRST_PATH_DELAY_BIN_LABELS)
+
+
 def load_model_state_compatible(model: torch.nn.Module, checkpoint: dict) -> None:
     state_dict = checkpoint["model_state"]
     model_state = model.state_dict()
+    skip_prefixes: tuple[str, ...] = ()
+    if checkpoint_first_path_delay_bin_label_mismatch(checkpoint):
+        skip_prefixes = (
+            "first_path_delay_bin_classifier.",
+            "first_path_delay_bin_position_head.",
+        )
+        print(
+            "checkpoint first-path-delay bin labels differ from current labels; "
+            "skipping first_path_delay_bin_classifier and first_path_delay_bin_position_head."
+        )
     compatible_state = {
         name: value
         for name, value in state_dict.items()
-        if name in model_state and model_state[name].shape == value.shape
+        if (
+            name in model_state
+            and model_state[name].shape == value.shape
+            and not name.startswith(skip_prefixes)
+        )
     }
     skipped = sorted(set(state_dict) - set(compatible_state))
     missing = sorted(set(model_state) - set(compatible_state))
@@ -1043,11 +1085,16 @@ def run_smoke_test(
     delay_spread_weight: float = 0.0,
     first_path_delay_weight: float = 0.0,
     first_path_delay_raw_weight: float = 0.0,
+    first_path_delay_fused_raw_weight: float = 0.0,
     first_path_delay_raw_beta_ns: float = 20.0,
     first_path_delay_bin_classifier_weight: float = 0.0,
     first_path_delay_bin_position_weight: float = 0.0,
     first_path_delay_bin_consistency_weight: float = 0.0,
     first_path_delay_bin_weights: dict[str, float] | None = None,
+    estimated_pdp_tail_bin_weight: float = 0.0,
+    estimated_pdp_tail_labels: tuple[str, ...] = ("1040_1280",),
+    estimated_pdp_tail_gate_mode: str = "target",
+    first_path_delay_tail_underestimate_weight: float = 0.0,
     los_delay_weight: float = 0.0,
     los_delay_nonnegative_weight: float = 0.0,
     delay_spread_teacher_weight: float = 0.1,
@@ -1128,11 +1175,16 @@ def run_smoke_test(
                     delay_spread_weight=delay_spread_weight,
                     first_path_delay_weight=first_path_delay_weight,
                     first_path_delay_raw_weight=first_path_delay_raw_weight,
+                    first_path_delay_fused_raw_weight=first_path_delay_fused_raw_weight,
                     first_path_delay_raw_beta_ns=first_path_delay_raw_beta_ns,
                     first_path_delay_bin_classifier_weight=first_path_delay_bin_classifier_weight,
                     first_path_delay_bin_position_weight=first_path_delay_bin_position_weight,
                     first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
                     first_path_delay_bin_weights=first_path_delay_bin_weights,
+                    estimated_pdp_tail_bin_weight=estimated_pdp_tail_bin_weight,
+                    estimated_pdp_tail_labels=estimated_pdp_tail_labels,
+                    estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
+                    first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
                     los_delay_weight=los_delay_weight,
                     los_delay_nonnegative_weight=los_delay_nonnegative_weight,
                     delay_spread_teacher_weight=delay_spread_teacher_weight,
@@ -1196,11 +1248,16 @@ def run_real_pretrain(
     delay_spread_weight: float,
     first_path_delay_weight: float,
     first_path_delay_raw_weight: float,
+    first_path_delay_fused_raw_weight: float,
     first_path_delay_raw_beta_ns: float,
     first_path_delay_bin_classifier_weight: float,
     first_path_delay_bin_position_weight: float,
     first_path_delay_bin_consistency_weight: float,
     first_path_delay_bin_weights: dict[str, float] | None,
+    estimated_pdp_tail_bin_weight: float,
+    estimated_pdp_tail_labels: tuple[str, ...],
+    estimated_pdp_tail_gate_mode: str,
+    first_path_delay_tail_underestimate_weight: float,
     los_delay_weight: float,
     los_delay_nonnegative_weight: float,
     delay_spread_teacher_weight: float,
@@ -1321,11 +1378,16 @@ def run_real_pretrain(
         delay_spread_weight=delay_spread_weight,
         first_path_delay_weight=first_path_delay_weight,
         first_path_delay_raw_weight=first_path_delay_raw_weight,
+        first_path_delay_fused_raw_weight=first_path_delay_fused_raw_weight,
         first_path_delay_raw_beta_ns=first_path_delay_raw_beta_ns,
         first_path_delay_bin_classifier_weight=first_path_delay_bin_classifier_weight,
         first_path_delay_bin_position_weight=first_path_delay_bin_position_weight,
         first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
         first_path_delay_bin_weights=first_path_delay_bin_weights,
+        estimated_pdp_tail_bin_weight=estimated_pdp_tail_bin_weight,
+        estimated_pdp_tail_labels=estimated_pdp_tail_labels,
+        estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
+        first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
         los_delay_weight=los_delay_weight,
         los_delay_nonnegative_weight=los_delay_nonnegative_weight,
         delay_spread_teacher_weight=delay_spread_teacher_weight,
@@ -1391,11 +1453,16 @@ def run_real_pretrain(
         f"delay_spread_weight={delay_spread_weight} "
         f"first_path_delay_weight={first_path_delay_weight} "
         f"first_path_delay_raw_weight={first_path_delay_raw_weight} "
+        f"first_path_delay_fused_raw_weight={first_path_delay_fused_raw_weight} "
         f"first_path_delay_raw_beta_ns={first_path_delay_raw_beta_ns} "
         f"first_path_delay_bin_classifier_weight={first_path_delay_bin_classifier_weight} "
         f"first_path_delay_bin_position_weight={first_path_delay_bin_position_weight} "
         f"first_path_delay_bin_consistency_weight={first_path_delay_bin_consistency_weight} "
         f"first_path_delay_bin_weights={format_first_path_delay_bin_weights(first_path_delay_bin_weights)} "
+        f"estimated_pdp_tail_bin_weight={estimated_pdp_tail_bin_weight} "
+        f"estimated_pdp_tail_labels={','.join(estimated_pdp_tail_labels)} "
+        f"estimated_pdp_tail_gate_mode={estimated_pdp_tail_gate_mode} "
+        f"first_path_delay_tail_underestimate_weight={first_path_delay_tail_underestimate_weight} "
         f"first_path_delay_bin_label_order={','.join(FIRST_PATH_DELAY_BIN_LABELS)} "
         f"los_delay_weight={los_delay_weight} "
         f"los_delay_nonnegative_weight={los_delay_nonnegative_weight} "
@@ -1606,6 +1673,37 @@ def run_real_pretrain(
         mean_first_path_delay_bin_accuracy = sum(
             m.get("accuracy_first_path_delay_bin_classifier", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_bin_classifier = sum(
+            m.get("loss_estimated_pdp_tail_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_bin_accuracy = sum(
+            m.get("accuracy_estimated_pdp_tail_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_gate_fraction = sum(
+            m.get("estimated_pdp_tail_gate_fraction", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_target_fraction = sum(
+            m.get("estimated_pdp_tail_target_fraction", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_argmax_fraction = sum(
+            m.get("estimated_pdp_tail_argmax_fraction", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_tail_underestimate = sum(
+            m.get("loss_first_path_delay_tail_underestimate", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_tail_underestimate_mae_ns = sum(
+            m.get("first_path_delay_tail_underestimate_mae_ns", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_tail_underestimate_mean_ns = sum(
+            m.get("first_path_delay_tail_underestimate_mean_ns", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_tail_underestimate_fraction = sum(
+            m.get("first_path_delay_tail_underestimate_fraction", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
         mean_first_path_delay_bin_position = sum(
             m.get("loss_first_path_delay_bin_position", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
@@ -1618,8 +1716,14 @@ def run_real_pretrain(
         mean_first_path_delay_raw = sum(
             m.get("loss_first_path_delay_raw", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
+        mean_first_path_delay_fused_raw = sum(
+            m.get("loss_first_path_delay_fused_raw", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
         mean_first_path_delay_raw_mae_ns = sum(
             m.get("first_path_delay_raw_mae_ns", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_fused_raw_mae_ns = sum(
+            m.get("first_path_delay_fused_raw_mae_ns", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_first_path_delay_bin_consistency_violation_ns = sum(
             m.get("first_path_delay_bin_consistency_violation_ns", 0.0)
@@ -1703,8 +1807,12 @@ def run_real_pretrain(
             f"delay_acc={mean_delay_spread_bin_accuracy:.4f} "
             f"delay_pos_mae={mean_delay_spread_bin_position_mae:.4f} "
             f"first_delay_acc={mean_first_path_delay_bin_accuracy:.4f} "
+            f"pdp_tail_acc={mean_estimated_pdp_tail_bin_accuracy:.4f} "
+            f"pdp_tail_gate={mean_estimated_pdp_tail_gate_fraction:.4f} "
+            f"tail_under={mean_first_path_delay_tail_underestimate_mean_ns:.2f}ns "
             f"first_delay_pos_mae={mean_first_path_delay_bin_position_mae:.4f} "
             f"first_delay_raw_mae={mean_first_path_delay_raw_mae_ns:.2f}ns "
+            f"first_delay_fused_mae={mean_first_path_delay_fused_raw_mae_ns:.2f}ns "
             f"first_delay_bin_violate={mean_first_path_delay_bin_consistency_violation_ns:.2f}ns "
             f"los_nonneg={mean_los_delay_nonnegative:.4f} "
             f"aux={mean_aux_regression:.4f} grad_csi={mean_grad_csi_encoder:.2e} "
@@ -1766,10 +1874,21 @@ def run_real_pretrain(
                         "first_path_power_bin_prediction_histogram": first_path_power_bin_prediction_histogram,
                         "loss_first_path_delay_bin_classifier": mean_first_path_delay_bin_classifier,
                         "accuracy_first_path_delay_bin_classifier": mean_first_path_delay_bin_accuracy,
+                        "loss_estimated_pdp_tail_bin_classifier": mean_estimated_pdp_tail_bin_classifier,
+                        "accuracy_estimated_pdp_tail_bin_classifier": mean_estimated_pdp_tail_bin_accuracy,
+                        "estimated_pdp_tail_gate_fraction": mean_estimated_pdp_tail_gate_fraction,
+                        "estimated_pdp_tail_target_fraction": mean_estimated_pdp_tail_target_fraction,
+                        "estimated_pdp_tail_argmax_fraction": mean_estimated_pdp_tail_argmax_fraction,
+                        "loss_first_path_delay_tail_underestimate": mean_first_path_delay_tail_underestimate,
+                        "first_path_delay_tail_underestimate_mae_ns": mean_first_path_delay_tail_underestimate_mae_ns,
+                        "first_path_delay_tail_underestimate_mean_ns": mean_first_path_delay_tail_underestimate_mean_ns,
+                        "first_path_delay_tail_underestimate_fraction": mean_first_path_delay_tail_underestimate_fraction,
                         "loss_first_path_delay_bin_position": mean_first_path_delay_bin_position,
                         "first_path_delay_bin_position_mae": mean_first_path_delay_bin_position_mae,
                         "loss_first_path_delay_raw": mean_first_path_delay_raw,
+                        "loss_first_path_delay_fused_raw": mean_first_path_delay_fused_raw,
                         "first_path_delay_raw_mae_ns": mean_first_path_delay_raw_mae_ns,
+                        "first_path_delay_fused_raw_mae_ns": mean_first_path_delay_fused_raw_mae_ns,
                         "loss_first_path_delay_bin_consistency": mean_first_path_delay_bin_consistency,
                         "first_path_delay_bin_consistency_violation_ns": mean_first_path_delay_bin_consistency_violation_ns,
                         "first_path_delay_bin_consistency_max_violation_ns": max_first_path_delay_bin_consistency_violation_ns,
@@ -1840,11 +1959,16 @@ def run_real_pretrain(
                         "delay_spread_weight": delay_spread_weight,
                         "first_path_delay_weight": first_path_delay_weight,
                         "first_path_delay_raw_weight": first_path_delay_raw_weight,
+                        "first_path_delay_fused_raw_weight": first_path_delay_fused_raw_weight,
                         "first_path_delay_raw_beta_ns": first_path_delay_raw_beta_ns,
                         "first_path_delay_bin_classifier_weight": first_path_delay_bin_classifier_weight,
                         "first_path_delay_bin_position_weight": first_path_delay_bin_position_weight,
                         "first_path_delay_bin_consistency_weight": first_path_delay_bin_consistency_weight,
                         "first_path_delay_bin_weights": first_path_delay_bin_weights,
+                        "estimated_pdp_tail_bin_weight": estimated_pdp_tail_bin_weight,
+                        "estimated_pdp_tail_labels": list(estimated_pdp_tail_labels),
+                        "estimated_pdp_tail_gate_mode": estimated_pdp_tail_gate_mode,
+                        "first_path_delay_tail_underestimate_weight": first_path_delay_tail_underestimate_weight,
                         "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
                         "los_delay_weight": los_delay_weight,
                         "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
@@ -1934,11 +2058,16 @@ def run_real_pretrain(
                     "delay_spread_weight": delay_spread_weight,
                     "first_path_delay_weight": first_path_delay_weight,
                     "first_path_delay_raw_weight": first_path_delay_raw_weight,
+                    "first_path_delay_fused_raw_weight": first_path_delay_fused_raw_weight,
                     "first_path_delay_raw_beta_ns": first_path_delay_raw_beta_ns,
                     "first_path_delay_bin_classifier_weight": first_path_delay_bin_classifier_weight,
                     "first_path_delay_bin_position_weight": first_path_delay_bin_position_weight,
                     "first_path_delay_bin_consistency_weight": first_path_delay_bin_consistency_weight,
                     "first_path_delay_bin_weights": first_path_delay_bin_weights,
+                    "estimated_pdp_tail_bin_weight": estimated_pdp_tail_bin_weight,
+                    "estimated_pdp_tail_labels": list(estimated_pdp_tail_labels),
+                    "estimated_pdp_tail_gate_mode": estimated_pdp_tail_gate_mode,
+                    "first_path_delay_tail_underestimate_weight": first_path_delay_tail_underestimate_weight,
                     "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
                     "los_delay_weight": los_delay_weight,
                     "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
@@ -2133,6 +2262,13 @@ def main() -> None:
         help="Supervision weight for first-path delay prediction using raw ns Huber loss.",
     )
     parser.add_argument(
+        "--first-path-delay-fused-raw-weight",
+        type=float,
+        help=(
+            "Supervision weight for bin+position fused first-path delay using raw ns Huber loss."
+        ),
+    )
+    parser.add_argument(
         "--first-path-delay-raw-beta-ns",
         type=float,
         help="Huber transition beta in ns for --first-path-delay-raw-weight.",
@@ -2206,7 +2342,45 @@ def main() -> None:
         action="append",
         help=(
             "Per-bin weighting for first-path-delay bin losses as LABEL=WEIGHT. "
-            "Labels: 0_25, 25_50, 50_100, 100_200, 200_400, 400_800, 800_1600, 1600_plus."
+            "Labels: 0_25, 25_50, 50_100, 100_200, 200_400, "
+            "400_600, 600_800, 800_1040, 1040_1280, 1280_plus."
+        ),
+    )
+    parser.add_argument(
+        "--estimated-pdp-tail-bin-weight",
+        type=float,
+        help=(
+            "Small auxiliary CE weight on first-path-delay bin logits, enabled "
+            "only for configured tail samples/PDP-tail-gated samples."
+        ),
+    )
+    parser.add_argument(
+        "--estimated-pdp-tail-label",
+        action="append",
+        help=(
+            "First-path-delay bin label treated as long-delay tail for the "
+            "estimated-PDP auxiliary loss. Can be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--estimated-pdp-tail-gate-mode",
+        choices=(
+            "target",
+            "pdp_argmax",
+            "target_or_pdp_argmax",
+            "target_and_pdp_argmax",
+        ),
+        help=(
+            "Sample gate for estimated-PDP tail auxiliary loss. target uses "
+            "true tail labels; pdp_argmax uses the estimated-PDP peak-delay bin."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-delay-tail-underestimate-weight",
+        type=float,
+        help=(
+            "One-sided raw-ns loss weight for configured first-path-delay tail "
+            "bins. Only underestimates are penalized."
         ),
     )
     parser.add_argument("--multipositive-distance-threshold", type=float)
@@ -2431,6 +2605,11 @@ def main() -> None:
         if args.first_path_delay_raw_weight is not None
         else float(cfg_get(train_cfg, "first_path_delay_raw_weight", 0.0))
     )
+    first_path_delay_fused_raw_weight = (
+        args.first_path_delay_fused_raw_weight
+        if args.first_path_delay_fused_raw_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_fused_raw_weight", 0.0))
+    )
     first_path_delay_raw_beta_ns = (
         args.first_path_delay_raw_beta_ns
         if args.first_path_delay_raw_beta_ns is not None
@@ -2458,6 +2637,42 @@ def main() -> None:
         if args.first_path_delay_bin_weight is not None
         else cfg_get(train_cfg, "first_path_delay_bin_weights", None)
     )
+    estimated_pdp_tail_bin_weight = (
+        args.estimated_pdp_tail_bin_weight
+        if args.estimated_pdp_tail_bin_weight is not None
+        else float(cfg_get(train_cfg, "estimated_pdp_tail_bin_weight", 0.0))
+    )
+    if estimated_pdp_tail_bin_weight < 0.0:
+        raise ValueError("--estimated-pdp-tail-bin-weight must be non-negative.")
+    estimated_pdp_tail_labels = parse_first_path_delay_tail_labels(
+        args.estimated_pdp_tail_label
+        if args.estimated_pdp_tail_label is not None
+        else cfg_get(train_cfg, "estimated_pdp_tail_labels", ("1040_1280",))
+    )
+    estimated_pdp_tail_gate_mode = (
+        args.estimated_pdp_tail_gate_mode
+        if args.estimated_pdp_tail_gate_mode is not None
+        else str(cfg_get(train_cfg, "estimated_pdp_tail_gate_mode", "target"))
+    )
+    if estimated_pdp_tail_gate_mode not in {
+        "target",
+        "pdp_argmax",
+        "target_or_pdp_argmax",
+        "target_and_pdp_argmax",
+    }:
+        raise ValueError(
+            "estimated_pdp_tail_gate_mode must be one of target, pdp_argmax, "
+            "target_or_pdp_argmax, target_and_pdp_argmax."
+        )
+    first_path_delay_tail_underestimate_weight = (
+        args.first_path_delay_tail_underestimate_weight
+        if args.first_path_delay_tail_underestimate_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_tail_underestimate_weight", 0.0))
+    )
+    if first_path_delay_tail_underestimate_weight < 0.0:
+        raise ValueError(
+            "--first-path-delay-tail-underestimate-weight must be non-negative."
+        )
     los_delay_weight = (
         args.los_delay_weight
         if args.los_delay_weight is not None
@@ -2597,12 +2812,17 @@ def main() -> None:
             delay_spread_weight=delay_spread_weight,
             first_path_delay_weight=first_path_delay_weight,
             first_path_delay_raw_weight=first_path_delay_raw_weight,
+            first_path_delay_fused_raw_weight=first_path_delay_fused_raw_weight,
             first_path_delay_raw_beta_ns=first_path_delay_raw_beta_ns,
             first_path_delay_bin_classifier_weight=first_path_delay_bin_classifier_weight,
             first_path_delay_bin_position_weight=first_path_delay_bin_position_weight,
             first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
             first_path_delay_bin_weights=first_path_delay_bin_weights,
-            los_delay_weight=los_delay_weight,
+            estimated_pdp_tail_bin_weight=estimated_pdp_tail_bin_weight,
+            estimated_pdp_tail_labels=estimated_pdp_tail_labels,
+            estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
+            first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
+                los_delay_weight=los_delay_weight,
             los_delay_nonnegative_weight=los_delay_nonnegative_weight,
             delay_spread_teacher_weight=delay_spread_teacher_weight,
             delay_spread_bin_weights=delay_spread_bin_weights,
@@ -2665,12 +2885,17 @@ def main() -> None:
             delay_spread_weight=delay_spread_weight,
             first_path_delay_weight=first_path_delay_weight,
             first_path_delay_raw_weight=first_path_delay_raw_weight,
+            first_path_delay_fused_raw_weight=first_path_delay_fused_raw_weight,
             first_path_delay_raw_beta_ns=first_path_delay_raw_beta_ns,
             first_path_delay_bin_classifier_weight=first_path_delay_bin_classifier_weight,
             first_path_delay_bin_position_weight=first_path_delay_bin_position_weight,
             first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
             first_path_delay_bin_weights=first_path_delay_bin_weights,
-            los_delay_weight=los_delay_weight,
+            estimated_pdp_tail_bin_weight=estimated_pdp_tail_bin_weight,
+            estimated_pdp_tail_labels=estimated_pdp_tail_labels,
+            estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
+            first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
+                los_delay_weight=los_delay_weight,
             los_delay_nonnegative_weight=los_delay_nonnegative_weight,
             delay_spread_teacher_weight=delay_spread_teacher_weight,
             delay_spread_bin_weights=delay_spread_bin_weights,
