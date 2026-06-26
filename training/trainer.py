@@ -69,6 +69,7 @@ class TrainConfig:
     first_path_delay_tail_underestimate_weight: float = 0.0
     los_delay_weight: float = 0.0
     los_delay_nonnegative_weight: float = 0.0
+    los_angle_weight: float = 0.0
     delay_spread_teacher_weight: float = 0.1
     delay_spread_bin_weights: dict[str, float] | None = None
     delay_spread_bin_classifier_weight: float = 0.0
@@ -909,6 +910,9 @@ class Trainer:
         effective_los_delay_nonnegative_weight = (
             0.0 if warmup_active else cfg.los_delay_nonnegative_weight
         )
+        effective_los_angle_weight = (
+            0.0 if warmup_active else cfg.los_angle_weight
+        )
         effective_delay_spread_bin_classifier_weight = (
             0.0 if warmup_active else cfg.delay_spread_bin_classifier_weight
         )
@@ -979,6 +983,8 @@ class Trainer:
         first_path_delay_tail_underestimate_fraction = None
         first_path_delay_tail_underestimate_count = None
         los_delay_raw_mae_ns = None
+        los_angle_mae_deg = None
+        los_angle_count = None
         delay_spread_tail_accuracy = None
         delay_spread_tail_recall = None
         delay_spread_tail_false_positive = None
@@ -1005,6 +1011,7 @@ class Trainer:
             or effective_first_path_delay_tail_underestimate_weight > 0.0
             or effective_los_delay_weight > 0.0
             or effective_los_delay_nonnegative_weight > 0.0
+            or effective_los_angle_weight > 0.0
         ):
             power_context = None
             delay_context = None
@@ -1025,6 +1032,7 @@ class Trainer:
                     or effective_first_path_delay_bin_consistency_weight > 0.0
                     or effective_estimated_pdp_tail_bin_weight > 0.0
                     or effective_first_path_delay_tail_underestimate_weight > 0.0
+                    or effective_los_angle_weight > 0.0
                 )
                 and hasattr(self.model, "encode_first_path_delay_context")
             ):
@@ -2055,6 +2063,47 @@ class Trainer:
                     losses["loss_los_delay_nonnegative"] = (
                         torch.relu(-los_delay_raw_prediction).mean() / 3000.0
                     )
+        if (
+            physics_outputs is not None
+            and effective_los_angle_weight > 0.0
+        ):
+            los_angle_prediction = physics_outputs["los_angle_sincos"]
+            los_angle_target = batch["los_angle_target"].to(
+                device=los_angle_prediction.device,
+                dtype=los_angle_prediction.dtype,
+            )
+            los_angle_target_mask = batch["los_angle_target_mask"].bool()
+            los_sample_mask = torch.tensor(
+                [key.los_status == "los" for key in batch["semantic_keys"]],
+                device=self.device,
+                dtype=torch.bool,
+            )
+            los_angle_mask = (
+                los_angle_target_mask
+                & los_sample_mask
+                & torch.isfinite(los_angle_target).all(dim=1)
+            )
+            if bool(los_angle_mask.any()):
+                valid_predictions = torch.nn.functional.normalize(
+                    los_angle_prediction[los_angle_mask],
+                    dim=-1,
+                    eps=1e-6,
+                )
+                valid_targets = torch.nn.functional.normalize(
+                    los_angle_target[los_angle_mask],
+                    dim=-1,
+                    eps=1e-6,
+                )
+                cosine = (valid_predictions * valid_targets).sum(dim=-1).clamp(-1.0, 1.0)
+                losses["loss_los_angle"] = (1.0 - cosine).mean()
+                predicted_angle = torch.atan2(valid_predictions[:, 0], valid_predictions[:, 1])
+                target_angle = torch.atan2(valid_targets[:, 0], valid_targets[:, 1])
+                angle_error = torch.atan2(
+                    torch.sin(predicted_angle - target_angle),
+                    torch.cos(predicted_angle - target_angle),
+                ).abs()
+                los_angle_mae_deg = angle_error.mean() * (180.0 / math.pi)
+                los_angle_count = los_angle_mask.sum()
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
             effective_prototype_weight * losses["loss_csi_to_prototype"] +
@@ -2080,7 +2129,8 @@ class Trainer:
             effective_estimated_pdp_tail_bin_weight * losses.get("loss_estimated_pdp_tail_bin_classifier", torch.zeros((), device=self.device)) +
             effective_first_path_delay_tail_underestimate_weight * losses.get("loss_first_path_delay_tail_underestimate", torch.zeros((), device=self.device)) +
             effective_los_delay_weight * losses.get("loss_los_delay", torch.zeros((), device=self.device)) +
-            effective_los_delay_nonnegative_weight * losses.get("loss_los_delay_nonnegative", torch.zeros((), device=self.device))
+            effective_los_delay_nonnegative_weight * losses.get("loss_los_delay_nonnegative", torch.zeros((), device=self.device)) +
+            effective_los_angle_weight * losses.get("loss_los_angle", torch.zeros((), device=self.device))
         )
         total_loss.backward()
         grad_metrics = {
@@ -2247,6 +2297,11 @@ class Trainer:
         )
         if los_delay_raw_mae_ns is not None:
             metrics["los_delay_raw_mae_ns"] = float(los_delay_raw_mae_ns.detach())
+        metrics["los_angle_weight"] = float(effective_los_angle_weight)
+        if los_angle_mae_deg is not None:
+            metrics["los_angle_mae_deg"] = float(los_angle_mae_deg.detach())
+        if los_angle_count is not None:
+            metrics["los_angle_count"] = float(los_angle_count.detach())
         metrics["delay_spread_teacher_weight"] = float(cfg.delay_spread_teacher_weight)
         metrics["delay_spread_bin_classifier_weight"] = float(
             effective_delay_spread_bin_classifier_weight

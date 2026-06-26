@@ -91,6 +91,7 @@ class PreprocessedSample:
     k_factor_db: float = 0.0
     first_path_delay_s: float = math.nan
     los_delay_s: float = math.nan
+    los_aoa_az_deg: float = math.nan
     first_path_power_dbw: float = math.nan
     first_path_aoa_az_deg: float = math.nan
     reflection_count: int = 0
@@ -107,6 +108,7 @@ def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
         "k_factor_db": 0.0,
         "first_path_delay_s": math.nan,
         "los_delay_s": math.nan,
+        "los_aoa_az_deg": math.nan,
         "first_path_power_dbw": math.nan,
         "first_path_aoa_az_deg": math.nan,
         "reflection_count": 0,
@@ -295,6 +297,8 @@ def collate_fn(
     los_delay_raw_target = torch.zeros(batch_size, dtype=torch.float32)
     los_delay_target = torch.zeros(batch_size, dtype=torch.float32)
     los_delay_target_mask = torch.zeros(batch_size, dtype=torch.bool)
+    los_angle_target = torch.zeros(batch_size, 2, dtype=torch.float32)
+    los_angle_target_mask = torch.zeros(batch_size, dtype=torch.bool)
     delay_power_map = torch.zeros(
         batch_size,
         DELAY_POWER_MAP_SHAPE[0],
@@ -328,6 +332,12 @@ def collate_fn(
             los_delay_raw_target[i] = float(los_delay_ns)
             los_delay_target[i] = float(los_delay_ns) / 3000.0
             los_delay_target_mask[i] = True
+        los_aoa_az_deg = _finite_or_nan(getattr(sample, "los_aoa_az_deg", math.nan))
+        if math.isfinite(los_aoa_az_deg):
+            los_aoa_az_rad = math.radians(los_aoa_az_deg)
+            los_angle_target[i, 0] = math.sin(los_aoa_az_rad)
+            los_angle_target[i, 1] = math.cos(los_aoa_az_rad)
+            los_angle_target_mask[i] = True
         delay_power_map[i] = sample.delay_power_map.to(dtype=torch.float32)
         delay_power_profile[i] = sample.delay_power_profile.to(dtype=torch.float32)
 
@@ -351,6 +361,8 @@ def collate_fn(
         "los_delay_target": los_delay_target,
         "los_delay_target_mask": los_delay_target_mask,
         "los_delay_raw_target": los_delay_raw_target,
+        "los_angle_target": los_angle_target,
+        "los_angle_target_mask": los_angle_target_mask,
         "delay_power_map": delay_power_map,
         "delay_power_profile": delay_power_profile,
         "instance_captions": [sample.instance_caption for sample in batch],

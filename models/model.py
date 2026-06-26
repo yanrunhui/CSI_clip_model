@@ -536,6 +536,12 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.los_angle_head = nn.Sequential(
+            nn.LayerNorm(self.delay_head_input_dim),
+            nn.Linear(self.delay_head_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+        )
         self.delay_spread_tail_classifier = nn.Sequential(
             nn.LayerNorm(self.delay_head_input_dim),
             nn.Linear(self.delay_head_input_dim, hidden_dim),
@@ -618,6 +624,7 @@ class CSIClip(nn.Module):
             *self.first_path_delay_bin_classifier.modules(),
             *self.first_path_delay_bin_position_head.modules(),
             *self.los_delay_context_head.modules(),
+            *self.los_angle_head.modules(),
             *self.delay_spread_tail_classifier.modules(),
         ):
             if isinstance(module, nn.Linear):
@@ -893,6 +900,7 @@ class CSIClip(nn.Module):
             first_path_delay_bin_position,
         )
         los_delay_context = self.los_delay_context_head(los_delay_input).squeeze(-1)
+        los_angle_sincos = self.los_angle_head(first_path_delay_input)
         delay_spread_tail_logits = self.delay_spread_tail_classifier(delay_head_input)
         first_path_power_bin_logits = self.first_path_power_bin_classifier(
             csi_features
@@ -930,6 +938,7 @@ class CSIClip(nn.Module):
                 "first_path_delay_bin_fused_raw": first_path_delay_bin_fused_raw,
                 "first_path_delay_bin_soft_fused_raw": first_path_delay_bin_soft_fused_raw,
                 "los_delay_context": los_delay_context,
+                "los_angle_sincos": los_angle_sincos,
                 "enhanced_delay_spread_gate": zeros,
                 "enhanced_delay_spread_delta": zeros,
                 "enhanced_gate": zeros,
@@ -1009,6 +1018,7 @@ class CSIClip(nn.Module):
             "first_path_delay_bin_fused_raw": first_path_delay_bin_fused_raw,
             "first_path_delay_bin_soft_fused_raw": first_path_delay_bin_soft_fused_raw,
             "los_delay_context": los_delay_context,
+            "los_angle_sincos": los_angle_sincos,
             "enhanced_delay_spread_gate": delay_spread_gate,
             "enhanced_delay_spread_delta": delay_spread_delta,
             "enhanced_gate": enhanced_gate,

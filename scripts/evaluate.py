@@ -912,6 +912,7 @@ def evaluate(
     all_first_path_delay_bin_fused_raw_predictions = []
     all_first_path_delay_bin_soft_fused_raw_predictions = []
     all_los_delay_context_predictions = []
+    all_los_angle_predictions = []
     all_delay_spread_bin_logits = []
     all_delay_spread_bin_positions = []
     all_first_path_delay_bin_logits = []
@@ -923,6 +924,8 @@ def evaluate(
     all_physics_masks = []
     all_los_delay_raw_targets = []
     all_los_delay_masks = []
+    all_los_angle_targets = []
+    all_los_angle_masks = []
     all_labels = []
     all_text_labels = []
     all_semantic_keys = []
@@ -1014,6 +1017,9 @@ def evaluate(
         all_los_delay_context_predictions.append(
             physics_outputs["los_delay_context"].cpu()
         )
+        all_los_angle_predictions.append(
+            physics_outputs["los_angle_sincos"].cpu()
+        )
         all_delay_spread_bin_logits.append(
             physics_outputs["delay_spread_bin_logits"].cpu()
         )
@@ -1034,6 +1040,8 @@ def evaluate(
         all_physics_masks.append(batch["physics_target_mask"].cpu())
         all_los_delay_raw_targets.append(batch["los_delay_raw_target"].cpu())
         all_los_delay_masks.append(batch["los_delay_target_mask"].cpu())
+        all_los_angle_targets.append(batch["los_angle_target"].cpu())
+        all_los_angle_masks.append(batch["los_angle_target_mask"].cpu())
         all_semantic_keys.extend(batch["semantic_keys"])
         if text_mode in ("instance", "multipositive"):
             instance_text_features = model.encode_text(
@@ -1098,6 +1106,7 @@ def evaluate(
         all_los_delay_context_predictions,
         dim=0,
     )
+    los_angle_predictions = torch.cat(all_los_angle_predictions, dim=0)
     delay_spread_bin_logits = torch.cat(all_delay_spread_bin_logits, dim=0)
     delay_spread_bin_positions = torch.cat(all_delay_spread_bin_positions, dim=0)
     first_path_delay_bin_logits = torch.cat(all_first_path_delay_bin_logits, dim=0)
@@ -1109,6 +1118,8 @@ def evaluate(
     physics_masks = torch.cat(all_physics_masks, dim=0)
     los_delay_raw_targets = torch.cat(all_los_delay_raw_targets, dim=0)
     los_delay_masks = torch.cat(all_los_delay_masks, dim=0)
+    los_angle_targets = torch.cat(all_los_angle_targets, dim=0)
+    los_angle_masks = torch.cat(all_los_angle_masks, dim=0)
     labels = torch.tensor(all_labels, dtype=torch.long)
     logit_scale = float(model.logit_scale.exp().detach().cpu().item())
     prototype_logits = logit_scale * csi_features @ prototype_features.T
@@ -1223,10 +1234,13 @@ def evaluate(
                 else None
             ),
             los_delay_predictions=los_delay_context_predictions,
+            los_angle_predictions=los_angle_predictions,
             physics_raw_targets=physics_raw_targets,
             physics_masks=physics_masks,
             los_delay_raw_targets=los_delay_raw_targets,
             los_delay_masks=los_delay_masks,
+            los_angle_targets=los_angle_targets,
+            los_angle_masks=los_angle_masks,
             semantic_keys=all_semantic_keys,
         )
     _print_delay_spread_diagnostics(
@@ -1916,10 +1930,13 @@ def _print_delay_family_diagnostics(
     first_path_delay_bin_fused_raw: torch.Tensor | None,
     first_path_delay_bin_soft_fused_raw: torch.Tensor | None,
     los_delay_predictions: torch.Tensor,
+    los_angle_predictions: torch.Tensor,
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
     los_delay_raw_targets: torch.Tensor,
     los_delay_masks: torch.Tensor,
+    los_angle_targets: torch.Tensor,
+    los_angle_masks: torch.Tensor,
     semantic_keys: list[SemanticKey],
 ) -> None:
     del first_path_delay_bin_positions
@@ -2039,6 +2056,40 @@ def _print_delay_family_diagnostics(
         targets=los_delay_raw_targets,
         mask=los_delay_mask,
     )
+    los_angle_mask = (
+        los_angle_masks
+        & los_sample_mask
+        & torch.isfinite(los_angle_targets).all(dim=1)
+    )
+    _print_los_angle_diagnostics(
+        predictions=los_angle_predictions,
+        targets=los_angle_targets,
+        mask=los_angle_mask,
+    )
+
+
+def _print_los_angle_diagnostics(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    count = int(mask.sum().item())
+    print(f"los_angle_count={count}")
+    if count == 0:
+        print("los_angle_MAE=nan")
+        print("los_angle_loss=nan")
+        return
+    valid_predictions = F.normalize(predictions[mask], dim=-1, eps=1e-6)
+    valid_targets = F.normalize(targets[mask], dim=-1, eps=1e-6)
+    cosine = (valid_predictions * valid_targets).sum(dim=-1).clamp(-1.0, 1.0)
+    predicted_angle = torch.atan2(valid_predictions[:, 0], valid_predictions[:, 1])
+    target_angle = torch.atan2(valid_targets[:, 0], valid_targets[:, 1])
+    angle_error = torch.atan2(
+        torch.sin(predicted_angle - target_angle),
+        torch.cos(predicted_angle - target_angle),
+    ).abs()
+    print(f"los_angle_MAE={float(angle_error.mean() * (180.0 / math.pi)):.4f}")
+    print(f"los_angle_loss={float((1.0 - cosine).mean()):.4f}")
 
 
 def _print_first_path_delay_group_metrics(

@@ -1106,6 +1106,7 @@ def extract_semantic_observables_from_deepmimo(
     n_valid_paths = int(valid.sum())
     first_path_delay = float("nan")
     los_delay = float("nan")
+    los_aoa_az_deg = float("nan")
     first_path_power_dbw = float("nan")
     first_path_aoa_az_deg = float("nan")
     interaction_counts = {"reflection": 0, "diffraction": 0}
@@ -1121,6 +1122,8 @@ def extract_semantic_observables_from_deepmimo(
         if bool(los_indices.size):
             los_idx = int(los_indices[np.argmin(delay_s[los_indices])])
             los_delay = float(delay_s[los_idx])
+            if np.isfinite(aoa_az_deg[los_idx]):
+                los_aoa_az_deg = float(aoa_az_deg[los_idx])
 
     angle_valid = valid & np.isfinite(aoa_az_deg)
     angle_aoa_az_deg = aoa_az_deg[angle_valid]
@@ -1155,6 +1158,7 @@ def extract_semantic_observables_from_deepmimo(
         "k_factor_db": k_factor_db,
         "first_path_delay": first_path_delay,
         "los_delay": los_delay,
+        "los_aoa_az_deg": los_aoa_az_deg,
         "first_path_power_dbw": first_path_power_dbw,
         "first_path_aoa_az_deg": first_path_aoa_az_deg,
         "reflection_count": interaction_counts["reflection"],
@@ -1303,6 +1307,7 @@ def preprocess_deepmimo_dataset(
                 k_factor_db=float(observables["k_factor_db"]),
                 first_path_delay_s=float(observables["first_path_delay"]),
                 los_delay_s=float(observables["los_delay"]),
+                los_aoa_az_deg=float(observables["los_aoa_az_deg"]),
                 first_path_power_dbw=float(observables["first_path_power_dbw"]),
                 first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
                 reflection_count=int(observables["reflection_count"]),

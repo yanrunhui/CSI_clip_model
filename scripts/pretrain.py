@@ -1097,6 +1097,7 @@ def run_smoke_test(
     first_path_delay_tail_underestimate_weight: float = 0.0,
     los_delay_weight: float = 0.0,
     los_delay_nonnegative_weight: float = 0.0,
+    los_angle_weight: float = 0.0,
     delay_spread_teacher_weight: float = 0.1,
     delay_spread_bin_weights: dict[str, float] | None = None,
     delay_spread_bin_classifier_weight: float = 0.0,
@@ -1187,6 +1188,7 @@ def run_smoke_test(
                     first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
                     los_delay_weight=los_delay_weight,
                     los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+                    los_angle_weight=los_angle_weight,
                     delay_spread_teacher_weight=delay_spread_teacher_weight,
                     delay_spread_bin_weights=delay_spread_bin_weights,
                     delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -1260,6 +1262,7 @@ def run_real_pretrain(
     first_path_delay_tail_underestimate_weight: float,
     los_delay_weight: float,
     los_delay_nonnegative_weight: float,
+    los_angle_weight: float,
     delay_spread_teacher_weight: float,
     delay_spread_bin_weights: dict[str, float] | None,
     delay_spread_bin_classifier_weight: float,
@@ -1390,6 +1393,7 @@ def run_real_pretrain(
         first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
         los_delay_weight=los_delay_weight,
         los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+        los_angle_weight=los_angle_weight,
         delay_spread_teacher_weight=delay_spread_teacher_weight,
         delay_spread_bin_weights=delay_spread_bin_weights,
         delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -1466,6 +1470,7 @@ def run_real_pretrain(
         f"first_path_delay_bin_label_order={','.join(FIRST_PATH_DELAY_BIN_LABELS)} "
         f"los_delay_weight={los_delay_weight} "
         f"los_delay_nonnegative_weight={los_delay_nonnegative_weight} "
+        f"los_angle_weight={los_angle_weight} "
         f"delay_spread_teacher_weight={delay_spread_teacher_weight} "
         f"delay_spread_bin_classifier_weight={delay_spread_bin_classifier_weight} "
         f"delay_spread_bin_position_weight={delay_spread_bin_position_weight} "
@@ -1764,6 +1769,17 @@ def run_real_pretrain(
         mean_los_delay_nonnegative = sum(
             m.get("loss_los_delay_nonnegative", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
+        mean_los_angle = sum(m.get("loss_los_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        los_angle_mae_values = [
+            m["los_angle_mae_deg"]
+            for m in epoch_metrics
+            if "los_angle_mae_deg" in m
+        ]
+        mean_los_angle_mae_deg = (
+            sum(los_angle_mae_values) / len(los_angle_mae_values)
+            if los_angle_mae_values
+            else 0.0
+        )
         mean_k_factor_sample_weight = sum(
             m.get("k_factor_sample_weight_mean", 1.0) for m in epoch_metrics
         ) / len(epoch_metrics)
@@ -1815,6 +1831,7 @@ def run_real_pretrain(
             f"first_delay_fused_mae={mean_first_path_delay_fused_raw_mae_ns:.2f}ns "
             f"first_delay_bin_violate={mean_first_path_delay_bin_consistency_violation_ns:.2f}ns "
             f"los_nonneg={mean_los_delay_nonnegative:.4f} "
+            f"los_angle_mae={mean_los_angle_mae_deg:.2f}deg "
             f"aux={mean_aux_regression:.4f} grad_csi={mean_grad_csi_encoder:.2e} "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
@@ -1919,6 +1936,8 @@ def run_real_pretrain(
                         "loss_first_path_delay": mean_first_path_delay,
                         "loss_los_delay": mean_los_delay,
                         "loss_los_delay_nonnegative": mean_los_delay_nonnegative,
+                        "loss_los_angle": mean_los_angle,
+                        "los_angle_mae_deg": mean_los_angle_mae_deg,
                         "k_factor_sample_weight_mean": mean_k_factor_sample_weight,
                         "first_path_power_sample_weight_mean": mean_first_path_power_sample_weight,
                         "first_path_delay_sample_weight_mean": mean_first_path_delay_sample_weight,
@@ -1972,6 +1991,7 @@ def run_real_pretrain(
                         "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
                         "los_delay_weight": los_delay_weight,
                         "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
+                        "los_angle_weight": los_angle_weight,
                         "delay_spread_teacher_weight": delay_spread_teacher_weight,
                         "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
                         "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
@@ -2071,6 +2091,7 @@ def run_real_pretrain(
                     "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
                     "los_delay_weight": los_delay_weight,
                     "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
+                    "los_angle_weight": los_angle_weight,
                     "delay_spread_teacher_weight": delay_spread_teacher_weight,
                     "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
                     "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
@@ -2300,6 +2321,11 @@ def main() -> None:
         "--los-delay-nonnegative-weight",
         type=float,
         help="Penalty weight for negative LoS delay predictions on LoS samples.",
+    )
+    parser.add_argument(
+        "--los-angle-weight",
+        type=float,
+        help="Supervision weight for LoS azimuth angle sin/cos prediction on LoS samples.",
     )
     parser.add_argument(
         "--delay-spread-teacher-weight",
@@ -2683,6 +2709,13 @@ def main() -> None:
         if args.los_delay_nonnegative_weight is not None
         else float(cfg_get(train_cfg, "los_delay_nonnegative_weight", 0.0))
     )
+    los_angle_weight = (
+        args.los_angle_weight
+        if args.los_angle_weight is not None
+        else float(cfg_get(train_cfg, "los_angle_weight", 0.0))
+    )
+    if los_angle_weight < 0.0:
+        raise ValueError("--los-angle-weight must be non-negative.")
     delay_spread_teacher_weight = (
         args.delay_spread_teacher_weight
         if args.delay_spread_teacher_weight is not None
@@ -2822,8 +2855,9 @@ def main() -> None:
             estimated_pdp_tail_labels=estimated_pdp_tail_labels,
             estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
             first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
-                los_delay_weight=los_delay_weight,
+            los_delay_weight=los_delay_weight,
             los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+            los_angle_weight=los_angle_weight,
             delay_spread_teacher_weight=delay_spread_teacher_weight,
             delay_spread_bin_weights=delay_spread_bin_weights,
             delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -2895,8 +2929,9 @@ def main() -> None:
             estimated_pdp_tail_labels=estimated_pdp_tail_labels,
             estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
             first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
-                los_delay_weight=los_delay_weight,
+            los_delay_weight=los_delay_weight,
             los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+            los_angle_weight=los_angle_weight,
             delay_spread_teacher_weight=delay_spread_teacher_weight,
             delay_spread_bin_weights=delay_spread_bin_weights,
             delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,

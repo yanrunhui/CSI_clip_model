@@ -72,6 +72,7 @@ train:
   first_path_delay_tail_underestimate_weight: 0.01
   los_delay_weight: 0.0
   los_delay_nonnegative_weight: 0.0
+  los_angle_weight: 0.02
   delay_spread_teacher_weight: 0.0
   delay_spread_bin_classifier_weight: 0.03
   delay_spread_bin_position_weight: 0.008
