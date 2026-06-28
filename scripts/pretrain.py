@@ -598,6 +598,7 @@ def build_components_from_samples(
     detach_delay_spread_features: bool = False,
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
+    use_los_angle_context_encoder: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
@@ -651,6 +652,8 @@ def build_components_from_samples(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
+        los_angle_context_token_norm_mode=token_norm_mode,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -902,6 +905,7 @@ def build_demo_components(
     detach_delay_spread_features: bool = False,
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
+    use_los_angle_context_encoder: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ):
@@ -922,6 +926,7 @@ def build_demo_components(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
     )
@@ -938,6 +943,7 @@ def build_real_components(
     detach_delay_spread_features: bool = False,
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
+    use_los_angle_context_encoder: bool = False,
     min_class_size: int = 1,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
@@ -1058,6 +1064,7 @@ def build_real_components(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
         tokenizer_word2id=tokenizer_word2id,
@@ -1098,6 +1105,8 @@ def run_smoke_test(
     los_delay_weight: float = 0.0,
     los_delay_nonnegative_weight: float = 0.0,
     los_angle_weight: float = 0.0,
+    first_path_angle_weight: float = 0.0,
+    first_path_angle_nlos_weight: float = 0.0,
     delay_spread_teacher_weight: float = 0.1,
     delay_spread_bin_weights: dict[str, float] | None = None,
     delay_spread_bin_classifier_weight: float = 0.0,
@@ -1115,6 +1124,7 @@ def run_smoke_test(
     detach_delay_spread_features: bool = False,
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
+    use_los_angle_context_encoder: bool = False,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> None:
     loader, model, _, prototype_bank = build_demo_components(
@@ -1126,6 +1136,7 @@ def run_smoke_test(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
         attribute_fields=attribute_classifier_fields,
         attribute_remap=attribute_remap,
     )
@@ -1189,6 +1200,8 @@ def run_smoke_test(
                     los_delay_weight=los_delay_weight,
                     los_delay_nonnegative_weight=los_delay_nonnegative_weight,
                     los_angle_weight=los_angle_weight,
+                    first_path_angle_weight=first_path_angle_weight,
+                    first_path_angle_nlos_weight=first_path_angle_nlos_weight,
                     delay_spread_teacher_weight=delay_spread_teacher_weight,
                     delay_spread_bin_weights=delay_spread_bin_weights,
                     delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -1224,6 +1237,7 @@ def run_real_pretrain(
     detach_delay_spread_features: bool,
     detach_first_path_delay_features: bool,
     use_delay_specific_encoder: bool,
+    use_los_angle_context_encoder: bool,
     warmup_epochs: int,
     min_lr: float,
     prototype_weight: float,
@@ -1263,6 +1277,8 @@ def run_real_pretrain(
     los_delay_weight: float,
     los_delay_nonnegative_weight: float,
     los_angle_weight: float,
+    first_path_angle_weight: float,
+    first_path_angle_nlos_weight: float,
     delay_spread_teacher_weight: float,
     delay_spread_bin_weights: dict[str, float] | None,
     delay_spread_bin_classifier_weight: float,
@@ -1302,6 +1318,7 @@ def run_real_pretrain(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
         min_class_size=min_class_size,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
@@ -1394,6 +1411,8 @@ def run_real_pretrain(
         los_delay_weight=los_delay_weight,
         los_delay_nonnegative_weight=los_delay_nonnegative_weight,
         los_angle_weight=los_angle_weight,
+        first_path_angle_weight=first_path_angle_weight,
+        first_path_angle_nlos_weight=first_path_angle_nlos_weight,
         delay_spread_teacher_weight=delay_spread_teacher_weight,
         delay_spread_bin_weights=delay_spread_bin_weights,
         delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -1427,6 +1446,7 @@ def run_real_pretrain(
         f"detach_delay_spread_features={detach_delay_spread_features} "
         f"detach_first_path_delay_features={detach_first_path_delay_features} "
         f"use_delay_specific_encoder={use_delay_specific_encoder} "
+        f"use_los_angle_context_encoder={use_los_angle_context_encoder} "
         f"warmup_epochs={warmup_epochs} min_lr={min_lr}"
     )
     print(
@@ -1471,6 +1491,8 @@ def run_real_pretrain(
         f"los_delay_weight={los_delay_weight} "
         f"los_delay_nonnegative_weight={los_delay_nonnegative_weight} "
         f"los_angle_weight={los_angle_weight} "
+        f"first_path_angle_weight={first_path_angle_weight} "
+        f"first_path_angle_nlos_weight={first_path_angle_nlos_weight} "
         f"delay_spread_teacher_weight={delay_spread_teacher_weight} "
         f"delay_spread_bin_classifier_weight={delay_spread_bin_classifier_weight} "
         f"delay_spread_bin_position_weight={delay_spread_bin_position_weight} "
@@ -1770,6 +1792,10 @@ def run_real_pretrain(
             m.get("loss_los_delay_nonnegative", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_los_angle = sum(m.get("loss_los_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_first_path_angle = sum(m.get("loss_first_path_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_first_path_angle_nlos = sum(
+            m.get("loss_first_path_angle_nlos", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
         los_angle_mae_values = [
             m["los_angle_mae_deg"]
             for m in epoch_metrics
@@ -1778,6 +1804,26 @@ def run_real_pretrain(
         mean_los_angle_mae_deg = (
             sum(los_angle_mae_values) / len(los_angle_mae_values)
             if los_angle_mae_values
+            else 0.0
+        )
+        first_path_angle_mae_values = [
+            m["first_path_angle_mae_deg"]
+            for m in epoch_metrics
+            if "first_path_angle_mae_deg" in m
+        ]
+        mean_first_path_angle_mae_deg = (
+            sum(first_path_angle_mae_values) / len(first_path_angle_mae_values)
+            if first_path_angle_mae_values
+            else 0.0
+        )
+        first_path_angle_nlos_mae_values = [
+            m["first_path_angle_nlos_mae_deg"]
+            for m in epoch_metrics
+            if "first_path_angle_nlos_mae_deg" in m
+        ]
+        mean_first_path_angle_nlos_mae_deg = (
+            sum(first_path_angle_nlos_mae_values) / len(first_path_angle_nlos_mae_values)
+            if first_path_angle_nlos_mae_values
             else 0.0
         )
         mean_k_factor_sample_weight = sum(
@@ -1832,6 +1878,8 @@ def run_real_pretrain(
             f"first_delay_bin_violate={mean_first_path_delay_bin_consistency_violation_ns:.2f}ns "
             f"los_nonneg={mean_los_delay_nonnegative:.4f} "
             f"los_angle_mae={mean_los_angle_mae_deg:.2f}deg "
+            f"first_angle_mae={mean_first_path_angle_mae_deg:.2f}deg "
+            f"first_angle_nlos_mae={mean_first_path_angle_nlos_mae_deg:.2f}deg "
             f"aux={mean_aux_regression:.4f} grad_csi={mean_grad_csi_encoder:.2e} "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
@@ -1938,6 +1986,10 @@ def run_real_pretrain(
                         "loss_los_delay_nonnegative": mean_los_delay_nonnegative,
                         "loss_los_angle": mean_los_angle,
                         "los_angle_mae_deg": mean_los_angle_mae_deg,
+                        "loss_first_path_angle": mean_first_path_angle,
+                        "first_path_angle_mae_deg": mean_first_path_angle_mae_deg,
+                        "loss_first_path_angle_nlos": mean_first_path_angle_nlos,
+                        "first_path_angle_nlos_mae_deg": mean_first_path_angle_nlos_mae_deg,
                         "k_factor_sample_weight_mean": mean_k_factor_sample_weight,
                         "first_path_power_sample_weight_mean": mean_first_path_power_sample_weight,
                         "first_path_delay_sample_weight_mean": mean_first_path_delay_sample_weight,
@@ -1964,6 +2016,7 @@ def run_real_pretrain(
                         "detach_delay_spread_features": detach_delay_spread_features,
                         "detach_first_path_delay_features": detach_first_path_delay_features,
                         "use_delay_specific_encoder": use_delay_specific_encoder,
+                        "use_los_angle_context_encoder": use_los_angle_context_encoder,
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
                         "k_factor_loss_weights": k_factor_loss_weights,
@@ -1992,6 +2045,8 @@ def run_real_pretrain(
                         "los_delay_weight": los_delay_weight,
                         "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
                         "los_angle_weight": los_angle_weight,
+                        "first_path_angle_weight": first_path_angle_weight,
+                        "first_path_angle_nlos_weight": first_path_angle_nlos_weight,
                         "delay_spread_teacher_weight": delay_spread_teacher_weight,
                         "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
                         "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
@@ -2043,6 +2098,7 @@ def run_real_pretrain(
                     "detach_delay_spread_features": detach_delay_spread_features,
                     "detach_first_path_delay_features": detach_first_path_delay_features,
                     "use_delay_specific_encoder": use_delay_specific_encoder,
+                    "use_los_angle_context_encoder": use_los_angle_context_encoder,
                     "warmup_epochs": warmup_epochs,
                     "min_lr": min_lr,
                     "csi_to_text_weight": csi_to_text_weight,
@@ -2092,6 +2148,8 @@ def run_real_pretrain(
                     "los_delay_weight": los_delay_weight,
                     "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
                     "los_angle_weight": los_angle_weight,
+                    "first_path_angle_weight": first_path_angle_weight,
+                    "first_path_angle_nlos_weight": first_path_angle_nlos_weight,
                     "delay_spread_teacher_weight": delay_spread_teacher_weight,
                     "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
                     "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
@@ -2166,6 +2224,11 @@ def main() -> None:
         "--use-delay-specific-encoder",
         action="store_true",
         help="Use a separate convolutional/attention encoder for delay-spread heads.",
+    )
+    parser.add_argument(
+        "--use-los-angle-context-encoder",
+        action="store_true",
+        help="Use a beam-aware CSI encoder branch dedicated to the LoS angle head.",
     )
     parser.add_argument("--warmup-epochs", type=int)
     parser.add_argument("--min-lr", type=float)
@@ -2326,6 +2389,16 @@ def main() -> None:
         "--los-angle-weight",
         type=float,
         help="Supervision weight for LoS azimuth angle sin/cos prediction on LoS samples.",
+    )
+    parser.add_argument(
+        "--first-path-angle-weight",
+        type=float,
+        help="Supervision weight for first-path azimuth angle sin/cos prediction.",
+    )
+    parser.add_argument(
+        "--first-path-angle-nlos-weight",
+        type=float,
+        help="Extra supervision weight for first-path azimuth angle on NLoS samples.",
     )
     parser.add_argument(
         "--delay-spread-teacher-weight",
@@ -2499,6 +2572,10 @@ def main() -> None:
     use_delay_specific_encoder = bool(
         args.use_delay_specific_encoder
         or cfg_get(train_cfg, "use_delay_specific_encoder", False)
+    )
+    use_los_angle_context_encoder = bool(
+        args.use_los_angle_context_encoder
+        or cfg_get(train_cfg, "use_los_angle_context_encoder", False)
     )
     warmup_epochs = (
         args.warmup_epochs
@@ -2716,6 +2793,20 @@ def main() -> None:
     )
     if los_angle_weight < 0.0:
         raise ValueError("--los-angle-weight must be non-negative.")
+    first_path_angle_weight = (
+        args.first_path_angle_weight
+        if args.first_path_angle_weight is not None
+        else float(cfg_get(train_cfg, "first_path_angle_weight", 0.0))
+    )
+    if first_path_angle_weight < 0.0:
+        raise ValueError("--first-path-angle-weight must be non-negative.")
+    first_path_angle_nlos_weight = (
+        args.first_path_angle_nlos_weight
+        if args.first_path_angle_nlos_weight is not None
+        else float(cfg_get(train_cfg, "first_path_angle_nlos_weight", 0.0))
+    )
+    if first_path_angle_nlos_weight < 0.0:
+        raise ValueError("--first-path-angle-nlos-weight must be non-negative.")
     delay_spread_teacher_weight = (
         args.delay_spread_teacher_weight
         if args.delay_spread_teacher_weight is not None
@@ -2858,6 +2949,8 @@ def main() -> None:
             los_delay_weight=los_delay_weight,
             los_delay_nonnegative_weight=los_delay_nonnegative_weight,
             los_angle_weight=los_angle_weight,
+            first_path_angle_weight=first_path_angle_weight,
+            first_path_angle_nlos_weight=first_path_angle_nlos_weight,
             delay_spread_teacher_weight=delay_spread_teacher_weight,
             delay_spread_bin_weights=delay_spread_bin_weights,
             delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
@@ -2873,6 +2966,7 @@ def main() -> None:
             detach_delay_spread_features=detach_delay_spread_features,
             detach_first_path_delay_features=detach_first_path_delay_features,
             use_delay_specific_encoder=use_delay_specific_encoder,
+            use_los_angle_context_encoder=use_los_angle_context_encoder,
         )
         return
 
@@ -2893,6 +2987,7 @@ def main() -> None:
             detach_delay_spread_features=detach_delay_spread_features,
             detach_first_path_delay_features=detach_first_path_delay_features,
             use_delay_specific_encoder=use_delay_specific_encoder,
+            use_los_angle_context_encoder=use_los_angle_context_encoder,
             warmup_epochs=warmup_epochs,
             min_lr=min_lr,
             csi_to_text_weight=csi_to_text_weight,
@@ -2932,6 +3027,8 @@ def main() -> None:
             los_delay_weight=los_delay_weight,
             los_delay_nonnegative_weight=los_delay_nonnegative_weight,
             los_angle_weight=los_angle_weight,
+            first_path_angle_weight=first_path_angle_weight,
+            first_path_angle_nlos_weight=first_path_angle_nlos_weight,
             delay_spread_teacher_weight=delay_spread_teacher_weight,
             delay_spread_bin_weights=delay_spread_bin_weights,
             delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,

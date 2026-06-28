@@ -70,6 +70,8 @@ class TrainConfig:
     los_delay_weight: float = 0.0
     los_delay_nonnegative_weight: float = 0.0
     los_angle_weight: float = 0.0
+    first_path_angle_weight: float = 0.0
+    first_path_angle_nlos_weight: float = 0.0
     delay_spread_teacher_weight: float = 0.1
     delay_spread_bin_weights: dict[str, float] | None = None
     delay_spread_bin_classifier_weight: float = 0.0
@@ -913,6 +915,12 @@ class Trainer:
         effective_los_angle_weight = (
             0.0 if warmup_active else cfg.los_angle_weight
         )
+        effective_first_path_angle_weight = (
+            0.0 if warmup_active else cfg.first_path_angle_weight
+        )
+        effective_first_path_angle_nlos_weight = (
+            0.0 if warmup_active else cfg.first_path_angle_nlos_weight
+        )
         effective_delay_spread_bin_classifier_weight = (
             0.0 if warmup_active else cfg.delay_spread_bin_classifier_weight
         )
@@ -985,6 +993,10 @@ class Trainer:
         los_delay_raw_mae_ns = None
         los_angle_mae_deg = None
         los_angle_count = None
+        first_path_angle_mae_deg = None
+        first_path_angle_count = None
+        first_path_angle_nlos_mae_deg = None
+        first_path_angle_nlos_count = None
         delay_spread_tail_accuracy = None
         delay_spread_tail_recall = None
         delay_spread_tail_false_positive = None
@@ -1012,10 +1024,13 @@ class Trainer:
             or effective_los_delay_weight > 0.0
             or effective_los_delay_nonnegative_weight > 0.0
             or effective_los_angle_weight > 0.0
+            or effective_first_path_angle_weight > 0.0
+            or effective_first_path_angle_nlos_weight > 0.0
         ):
             power_context = None
             delay_context = None
             first_path_delay_context = None
+            los_angle_context = None
             if hasattr(self.model, "encode_csi_delay_context"):
                 delay_context = self.model.encode_csi_delay_context(
                     batch["tokens"],
@@ -1033,13 +1048,34 @@ class Trainer:
                     or effective_estimated_pdp_tail_bin_weight > 0.0
                     or effective_first_path_delay_tail_underestimate_weight > 0.0
                     or effective_los_angle_weight > 0.0
+                    or effective_first_path_angle_weight > 0.0
+                    or effective_first_path_angle_nlos_weight > 0.0
                 )
                 and hasattr(self.model, "encode_first_path_delay_context")
             ):
                 first_path_delay_context = self.model.encode_first_path_delay_context(
                     batch["tokens"],
                     batch["token_mask"],
+                    beam_positions=batch.get("beam_positions"),
+                    freq_bin=batch.get("freq_bin"),
+                    bw_bin=batch.get("bw_bin"),
                     subcarrier_spacing=batch.get("subcarrier_spacing"),
+                )
+            if (
+                (
+                    effective_los_angle_weight > 0.0
+                    or effective_first_path_angle_weight > 0.0
+                    or effective_first_path_angle_nlos_weight > 0.0
+                )
+                and hasattr(self.model, "encode_los_angle_context")
+            ):
+                los_angle_context = self.model.encode_los_angle_context(
+                    batch["tokens"],
+                    batch["beam_positions"],
+                    batch["token_mask"],
+                    batch["freq_bin"],
+                    batch["bw_bin"],
+                    batch["subcarrier_spacing"],
                 )
             if bool(getattr(self.model, "use_power_branch", False)):
                 power_context = self.model.encode_power_context(
@@ -1053,6 +1089,7 @@ class Trainer:
                 power_context=power_context,
                 delay_context=delay_context,
                 first_path_delay_context=first_path_delay_context,
+                los_angle_context=los_angle_context,
             )
             physics_predictions = physics_outputs["final"]
 
@@ -2104,6 +2141,87 @@ class Trainer:
                 ).abs()
                 los_angle_mae_deg = angle_error.mean() * (180.0 / math.pi)
                 los_angle_count = los_angle_mask.sum()
+        if (
+            physics_outputs is not None
+            and (
+                effective_first_path_angle_weight > 0.0
+                or effective_first_path_angle_nlos_weight > 0.0
+            )
+        ):
+            first_path_angle_prediction = physics_outputs["first_path_angle_sincos"]
+            sin_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_sin")
+            cos_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_cos")
+            first_path_angle_target = batch["physics_targets"][:, [sin_idx, cos_idx]].to(
+                device=first_path_angle_prediction.device,
+                dtype=first_path_angle_prediction.dtype,
+            )
+            first_path_angle_mask = (
+                batch["physics_target_mask"][:, sin_idx].bool()
+                & batch["physics_target_mask"][:, cos_idx].bool()
+                & torch.isfinite(first_path_angle_target).all(dim=1)
+            )
+            if bool(first_path_angle_mask.any()):
+                valid_predictions = torch.nn.functional.normalize(
+                    first_path_angle_prediction[first_path_angle_mask],
+                    dim=-1,
+                    eps=1e-6,
+                )
+                valid_targets = torch.nn.functional.normalize(
+                    first_path_angle_target[first_path_angle_mask],
+                    dim=-1,
+                    eps=1e-6,
+                )
+                cosine = (valid_predictions * valid_targets).sum(dim=-1).clamp(-1.0, 1.0)
+                if effective_first_path_angle_weight > 0.0:
+                    losses["loss_first_path_angle"] = (1.0 - cosine).mean()
+                predicted_angle = torch.atan2(valid_predictions[:, 0], valid_predictions[:, 1])
+                target_angle = torch.atan2(valid_targets[:, 0], valid_targets[:, 1])
+                angle_error = torch.atan2(
+                    torch.sin(predicted_angle - target_angle),
+                    torch.cos(predicted_angle - target_angle),
+                ).abs()
+                first_path_angle_mae_deg = angle_error.mean() * (180.0 / math.pi)
+                first_path_angle_count = first_path_angle_mask.sum()
+                nlos_sample_mask = torch.tensor(
+                    [key.los_status != "los" for key in batch["semantic_keys"]],
+                    device=first_path_angle_mask.device,
+                    dtype=torch.bool,
+                )
+                first_path_angle_nlos_mask = first_path_angle_mask & nlos_sample_mask
+                if bool(first_path_angle_nlos_mask.any()):
+                    valid_nlos_predictions = torch.nn.functional.normalize(
+                        first_path_angle_prediction[first_path_angle_nlos_mask],
+                        dim=-1,
+                        eps=1e-6,
+                    )
+                    valid_nlos_targets = torch.nn.functional.normalize(
+                        first_path_angle_target[first_path_angle_nlos_mask],
+                        dim=-1,
+                        eps=1e-6,
+                    )
+                    nlos_cosine = (
+                        valid_nlos_predictions * valid_nlos_targets
+                    ).sum(dim=-1).clamp(-1.0, 1.0)
+                    if effective_first_path_angle_nlos_weight > 0.0:
+                        losses["loss_first_path_angle_nlos"] = (
+                            1.0 - nlos_cosine
+                        ).mean()
+                    predicted_nlos_angle = torch.atan2(
+                        valid_nlos_predictions[:, 0],
+                        valid_nlos_predictions[:, 1],
+                    )
+                    target_nlos_angle = torch.atan2(
+                        valid_nlos_targets[:, 0],
+                        valid_nlos_targets[:, 1],
+                    )
+                    nlos_angle_error = torch.atan2(
+                        torch.sin(predicted_nlos_angle - target_nlos_angle),
+                        torch.cos(predicted_nlos_angle - target_nlos_angle),
+                    ).abs()
+                    first_path_angle_nlos_mae_deg = (
+                        nlos_angle_error.mean() * (180.0 / math.pi)
+                    )
+                    first_path_angle_nlos_count = first_path_angle_nlos_mask.sum()
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
             effective_prototype_weight * losses["loss_csi_to_prototype"] +
@@ -2130,7 +2248,9 @@ class Trainer:
             effective_first_path_delay_tail_underestimate_weight * losses.get("loss_first_path_delay_tail_underestimate", torch.zeros((), device=self.device)) +
             effective_los_delay_weight * losses.get("loss_los_delay", torch.zeros((), device=self.device)) +
             effective_los_delay_nonnegative_weight * losses.get("loss_los_delay_nonnegative", torch.zeros((), device=self.device)) +
-            effective_los_angle_weight * losses.get("loss_los_angle", torch.zeros((), device=self.device))
+            effective_los_angle_weight * losses.get("loss_los_angle", torch.zeros((), device=self.device)) +
+            effective_first_path_angle_weight * losses.get("loss_first_path_angle", torch.zeros((), device=self.device)) +
+            effective_first_path_angle_nlos_weight * losses.get("loss_first_path_angle_nlos", torch.zeros((), device=self.device))
         )
         total_loss.backward()
         grad_metrics = {
@@ -2302,6 +2422,26 @@ class Trainer:
             metrics["los_angle_mae_deg"] = float(los_angle_mae_deg.detach())
         if los_angle_count is not None:
             metrics["los_angle_count"] = float(los_angle_count.detach())
+        metrics["first_path_angle_weight"] = float(effective_first_path_angle_weight)
+        metrics["first_path_angle_nlos_weight"] = float(
+            effective_first_path_angle_nlos_weight
+        )
+        if first_path_angle_mae_deg is not None:
+            metrics["first_path_angle_mae_deg"] = float(
+                first_path_angle_mae_deg.detach()
+            )
+        if first_path_angle_count is not None:
+            metrics["first_path_angle_count"] = float(
+                first_path_angle_count.detach()
+            )
+        if first_path_angle_nlos_mae_deg is not None:
+            metrics["first_path_angle_nlos_mae_deg"] = float(
+                first_path_angle_nlos_mae_deg.detach()
+            )
+        if first_path_angle_nlos_count is not None:
+            metrics["first_path_angle_nlos_count"] = float(
+                first_path_angle_nlos_count.detach()
+            )
         metrics["delay_spread_teacher_weight"] = float(cfg.delay_spread_teacher_weight)
         metrics["delay_spread_bin_classifier_weight"] = float(
             effective_delay_spread_bin_classifier_weight
