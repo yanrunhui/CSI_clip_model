@@ -13,6 +13,7 @@ train:
   detach_first_path_delay_features: false
   use_delay_specific_encoder: true
   use_los_angle_context_encoder: true
+  use_first_path_angle_context_encoder: true
   warmup_epochs: 5
   min_lr: 1.0e-5
 

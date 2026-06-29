@@ -599,6 +599,7 @@ def build_components_from_samples(
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
     use_los_angle_context_encoder: bool = False,
+    use_first_path_angle_context_encoder: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
@@ -653,6 +654,7 @@ def build_components_from_samples(
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         los_angle_context_token_norm_mode=token_norm_mode,
         attribute_num_classes={
             field: len(label_map)
@@ -906,6 +908,7 @@ def build_demo_components(
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
     use_los_angle_context_encoder: bool = False,
+    use_first_path_angle_context_encoder: bool = False,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ):
@@ -927,6 +930,7 @@ def build_demo_components(
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
     )
@@ -944,6 +948,7 @@ def build_real_components(
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
     use_los_angle_context_encoder: bool = False,
+    use_first_path_angle_context_encoder: bool = False,
     min_class_size: int = 1,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
@@ -1065,6 +1070,7 @@ def build_real_components(
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
         tokenizer_word2id=tokenizer_word2id,
@@ -1125,6 +1131,7 @@ def run_smoke_test(
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
     use_los_angle_context_encoder: bool = False,
+    use_first_path_angle_context_encoder: bool = False,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> None:
     loader, model, _, prototype_bank = build_demo_components(
@@ -1137,6 +1144,7 @@ def run_smoke_test(
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         attribute_fields=attribute_classifier_fields,
         attribute_remap=attribute_remap,
     )
@@ -1238,6 +1246,7 @@ def run_real_pretrain(
     detach_first_path_delay_features: bool,
     use_delay_specific_encoder: bool,
     use_los_angle_context_encoder: bool,
+    use_first_path_angle_context_encoder: bool,
     warmup_epochs: int,
     min_lr: float,
     prototype_weight: float,
@@ -1319,6 +1328,7 @@ def run_real_pretrain(
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         min_class_size=min_class_size,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
@@ -1447,6 +1457,7 @@ def run_real_pretrain(
         f"detach_first_path_delay_features={detach_first_path_delay_features} "
         f"use_delay_specific_encoder={use_delay_specific_encoder} "
         f"use_los_angle_context_encoder={use_los_angle_context_encoder} "
+        f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder} "
         f"warmup_epochs={warmup_epochs} min_lr={min_lr}"
     )
     print(
@@ -2017,6 +2028,7 @@ def run_real_pretrain(
                         "detach_first_path_delay_features": detach_first_path_delay_features,
                         "use_delay_specific_encoder": use_delay_specific_encoder,
                         "use_los_angle_context_encoder": use_los_angle_context_encoder,
+                        "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
                         "k_factor_loss_weights": k_factor_loss_weights,
@@ -2099,6 +2111,7 @@ def run_real_pretrain(
                     "detach_first_path_delay_features": detach_first_path_delay_features,
                     "use_delay_specific_encoder": use_delay_specific_encoder,
                     "use_los_angle_context_encoder": use_los_angle_context_encoder,
+                    "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
                     "warmup_epochs": warmup_epochs,
                     "min_lr": min_lr,
                     "csi_to_text_weight": csi_to_text_weight,
@@ -2229,6 +2242,11 @@ def main() -> None:
         "--use-los-angle-context-encoder",
         action="store_true",
         help="Use a beam-aware CSI encoder branch dedicated to the LoS angle head.",
+    )
+    parser.add_argument(
+        "--use-first-path-angle-context-encoder",
+        action="store_true",
+        help="Use a first-path selector context branch dedicated to first-path angle prediction.",
     )
     parser.add_argument("--warmup-epochs", type=int)
     parser.add_argument("--min-lr", type=float)
@@ -2576,6 +2594,10 @@ def main() -> None:
     use_los_angle_context_encoder = bool(
         args.use_los_angle_context_encoder
         or cfg_get(train_cfg, "use_los_angle_context_encoder", False)
+    )
+    use_first_path_angle_context_encoder = bool(
+        args.use_first_path_angle_context_encoder
+        or cfg_get(train_cfg, "use_first_path_angle_context_encoder", False)
     )
     warmup_epochs = (
         args.warmup_epochs
@@ -2967,6 +2989,7 @@ def main() -> None:
             detach_first_path_delay_features=detach_first_path_delay_features,
             use_delay_specific_encoder=use_delay_specific_encoder,
             use_los_angle_context_encoder=use_los_angle_context_encoder,
+            use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         )
         return
 
@@ -2988,6 +3011,7 @@ def main() -> None:
             detach_first_path_delay_features=detach_first_path_delay_features,
             use_delay_specific_encoder=use_delay_specific_encoder,
             use_los_angle_context_encoder=use_los_angle_context_encoder,
+            use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
             warmup_epochs=warmup_epochs,
             min_lr=min_lr,
             csi_to_text_weight=csi_to_text_weight,

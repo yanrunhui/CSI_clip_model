@@ -372,6 +372,16 @@ def _infer_use_los_angle_context_encoder(checkpoint: dict | None) -> bool:
     return any(key.startswith("los_angle_context_encoder.") for key in model_state)
 
 
+def _infer_use_first_path_angle_context_encoder(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    args = checkpoint.get("args", {})
+    if "use_first_path_angle_context_encoder" in args:
+        return bool(args.get("use_first_path_angle_context_encoder", False))
+    model_state = checkpoint.get("model_state", {})
+    return any(key.startswith("first_path_angle_context_encoder.") for key in model_state)
+
+
 def _checkpoint_has_delay_family_heads(checkpoint: dict | None) -> bool:
     if checkpoint is None:
         return False
@@ -735,6 +745,9 @@ def evaluate(
     use_first_path_delay_bin_head = _infer_use_first_path_delay_bin_head(checkpoint)
     use_delay_specific_encoder = _infer_use_delay_specific_encoder(checkpoint)
     use_los_angle_context_encoder = _infer_use_los_angle_context_encoder(checkpoint)
+    use_first_path_angle_context_encoder = (
+        _infer_use_first_path_angle_context_encoder(checkpoint)
+    )
     delay_family_heads_enabled = _checkpoint_has_delay_family_heads(checkpoint)
     attribute_fields = _infer_attribute_fields(checkpoint, attribute_fields_override)
     attribute_remap = _infer_attribute_remap(checkpoint)
@@ -889,6 +902,7 @@ def evaluate(
         use_delay_spread_head=use_delay_spread_head,
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         los_angle_context_token_norm_mode=token_norm_mode,
         attribute_num_classes={
             field: len(label_map)
@@ -971,6 +985,7 @@ def evaluate(
         delay_context = None
         first_path_delay_context = None
         los_angle_context = None
+        first_path_angle_context = None
         if hasattr(model, "encode_csi_delay_context"):
             delay_context = model.encode_csi_delay_context(
                 batch["tokens"],
@@ -995,6 +1010,13 @@ def evaluate(
                 batch["bw_bin"],
                 batch["subcarrier_spacing"],
             )
+        if hasattr(model, "encode_first_path_angle_context"):
+            first_path_angle_context = model.encode_first_path_angle_context(
+                batch["tokens"],
+                batch["beam_positions"],
+                batch["token_mask"],
+                subcarrier_spacing=batch.get("subcarrier_spacing"),
+            )
         if use_power_branch:
             power_context = model.encode_power_context(
                 batch["tokens"],
@@ -1008,6 +1030,7 @@ def evaluate(
             delay_context=delay_context,
             first_path_delay_context=first_path_delay_context,
             los_angle_context=los_angle_context,
+            first_path_angle_context=first_path_angle_context,
         )
         physics_predictions = physics_outputs["final"]
         all_base_physics_predictions.append(physics_outputs["base"].cpu())
@@ -1190,6 +1213,7 @@ def evaluate(
     print(f"use_delay_spread_head={use_delay_spread_head}")
     print(f"use_delay_specific_encoder={use_delay_specific_encoder}")
     print(f"use_los_angle_context_encoder={use_los_angle_context_encoder}")
+    print(f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder}")
     print(f"use_delay_family_heads={delay_family_heads_enabled}")
     print(f"use_delay_spread_bin_head={use_delay_spread_bin_head}")
     print(f"use_first_path_delay_bin_head={use_first_path_delay_bin_head}")
@@ -1244,6 +1268,9 @@ def evaluate(
         enhanced_first_path_power_predictions=enhanced_first_path_power_predictions,
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
+        prototype_logits=prototype_logits,
+        prototype_keys=prototype_keys,
     )
     if delay_family_heads_enabled:
         _print_delay_family_diagnostics(
@@ -2060,6 +2087,9 @@ def _print_first_path_power_diagnostics(
     enhanced_first_path_power_predictions: torch.Tensor,
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+    prototype_logits: torch.Tensor,
+    prototype_keys: list[SemanticKey],
 ) -> None:
     first_path_power_idx = _physics_target_index("first_path_power_dbw")
     first_path_power_mask = physics_masks[:, first_path_power_idx]
@@ -2067,6 +2097,16 @@ def _print_first_path_power_diagnostics(
         print("base_first_power_MAE=nan")
         print("enhanced_first_power_MAE=nan")
         print("final_first_power_MAE=nan")
+        print("los_base_first_power_MAE=nan")
+        print("los_enhanced_first_power_MAE=nan")
+        print("los_final_first_power_MAE=nan")
+        print("nlos_base_first_power_MAE=nan")
+        print("nlos_enhanced_first_power_MAE=nan")
+        print("nlos_final_first_power_MAE=nan")
+        print("oracle_los_base_nlos_enhanced_first_power_MAE=nan")
+        print("oracle_los_enhanced_nlos_base_first_power_MAE=nan")
+        print("predicted_los_status_first_power_accuracy=nan")
+        print("predicted_los_base_nlos_enhanced_first_power_MAE=nan")
         return
 
     base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
@@ -2084,6 +2124,68 @@ def _print_first_path_power_diagnostics(
     print(f"base_first_power_MAE={float((masked_base_raw - masked_target_raw).abs().mean()):.4f}")
     print(f"enhanced_first_power_MAE={float((masked_enhanced_raw - masked_target_raw).abs().mean()):.4f}")
     print(f"final_first_power_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
+
+    def print_group_mae(prefix: str, group_mask: torch.Tensor) -> None:
+        mask = first_path_power_mask & group_mask
+        if not bool(mask.any()):
+            print(f"{prefix}_base_first_power_MAE=nan")
+            print(f"{prefix}_enhanced_first_power_MAE=nan")
+            print(f"{prefix}_final_first_power_MAE=nan")
+            return
+        group_base_raw = base_physics_raw_predictions[mask, first_path_power_idx]
+        group_enhanced_raw = enhanced_raw_predictions[mask]
+        group_final_raw = final_physics_raw_predictions[mask, first_path_power_idx]
+        group_target_raw = physics_raw_targets[mask, first_path_power_idx]
+        print(
+            f"{prefix}_base_first_power_MAE="
+            f"{float((group_base_raw - group_target_raw).abs().mean()):.4f}"
+        )
+        print(
+            f"{prefix}_enhanced_first_power_MAE="
+            f"{float((group_enhanced_raw - group_target_raw).abs().mean()):.4f}"
+        )
+        print(
+            f"{prefix}_final_first_power_MAE="
+            f"{float((group_final_raw - group_target_raw).abs().mean()):.4f}"
+        )
+
+    los_mask = torch.tensor(
+        [key.los_status == "los" for key in semantic_keys],
+        dtype=torch.bool,
+        device=first_path_power_mask.device,
+    )
+    print_group_mae("los", los_mask)
+    print_group_mae("nlos", ~los_mask)
+
+    def print_fused_mae(prefix: str, use_base_mask: torch.Tensor) -> None:
+        masked_use_base = use_base_mask[first_path_power_mask]
+        fused_raw = torch.where(masked_use_base, masked_base_raw, masked_enhanced_raw)
+        print(
+            f"{prefix}_first_power_MAE="
+            f"{float((fused_raw - masked_target_raw).abs().mean()):.4f}"
+        )
+
+    print_fused_mae("oracle_los_base_nlos_enhanced", los_mask)
+    print_fused_mae("oracle_los_enhanced_nlos_base", ~los_mask)
+
+    predicted_labels = prototype_logits.argmax(dim=1)
+    predicted_los_mask = torch.tensor(
+        [
+            prototype_keys[int(label)].los_status == "los"
+            for label in predicted_labels.tolist()
+        ],
+        dtype=torch.bool,
+        device=first_path_power_mask.device,
+    )
+    predicted_los_accuracy = (
+        predicted_los_mask[first_path_power_mask]
+        == los_mask[first_path_power_mask]
+    ).float().mean()
+    print(
+        "predicted_los_status_first_power_accuracy="
+        f"{float(predicted_los_accuracy):.4f}"
+    )
+    print_fused_mae("predicted_los_base_nlos_enhanced", predicted_los_mask)
 
 
 def _print_delay_family_diagnostics(

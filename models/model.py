@@ -269,6 +269,148 @@ class CSIAngleContextEncoder(nn.Module):
         return self.head(features)
 
 
+class CSIFirstPathAngleContextEncoder(nn.Module):
+    def __init__(
+        self,
+        out_dim: int = CSI_DELAY_CONTEXT_DIM,
+        hidden_dim: int = 128,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.beam_feature_proj = nn.Sequential(
+            nn.LayerNorm(18),
+            nn.Linear(18, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.selector = nn.Linear(hidden_dim, 1)
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 3),
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        beam_positions: torch.Tensor,
+        token_mask: torch.Tensor,
+        subcarrier_spacing: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        token_weights = token_mask.to(dtype=tokens.dtype)
+        raw = tokens * token_weights.unsqueeze(-1).unsqueeze(-1)
+        raw_power = raw.square()
+
+        if tokens.shape[2] % 2 == 0 and tokens.shape[2] > 0:
+            half = tokens.shape[2] // 2
+            complex_tokens = torch.complex(
+                raw[:, :, :half, :],
+                raw[:, :, half : half * 2, :],
+            )
+            delay_tokens = torch.fft.ifft(complex_tokens, dim=-1)
+            delay_power = delay_tokens.abs().square().mean(dim=2)
+        else:
+            delay_power = raw_power.mean(dim=2)
+        delay_power = delay_power * token_weights.unsqueeze(-1)
+
+        power_sum = delay_power.sum(dim=-1).clamp(min=self.eps)
+        delay_distribution = delay_power / power_sum.unsqueeze(-1)
+        delay_idx = torch.arange(
+            delay_distribution.shape[-1],
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        delay_den = max(delay_distribution.shape[-1] - 1, 1)
+        delay_center = (delay_distribution * delay_idx).sum(dim=-1) / delay_den
+        delay_spread = torch.sqrt(
+            (
+                delay_distribution
+                * (delay_idx - delay_center.unsqueeze(-1) * delay_den).square()
+            ).sum(dim=-1).clamp(min=0.0)
+        ) / delay_den
+        delay_entropy = -(
+            delay_distribution * (delay_distribution + self.eps).log()
+        ).sum(dim=-1) / math.log(max(delay_distribution.shape[-1], 2))
+
+        peak_power, peak_idx = delay_power.max(dim=-1)
+        peak_position = peak_idx.to(dtype=tokens.dtype) / delay_den
+        thirds = torch.chunk(delay_distribution, 3, dim=-1)
+        early = thirds[0]
+        early_mass = early.sum(dim=-1)
+        mid_mass = thirds[1].sum(dim=-1) if len(thirds) > 1 else torch.zeros_like(early_mass)
+        late_mass = thirds[2].sum(dim=-1) if len(thirds) > 2 else torch.zeros_like(early_mass)
+        top3_count = min(3, delay_distribution.shape[-1])
+        top3_mass = torch.topk(delay_distribution, k=top3_count, dim=-1).values.sum(dim=-1)
+        early_peak_mass = early.amax(dim=-1)
+        early_peak_ratio = early_peak_mass / delay_distribution.amax(dim=-1).clamp(min=self.eps)
+
+        if beam_positions.ndim == 3 and beam_positions.shape[-1] >= 2:
+            beam_xy = beam_positions[..., :2].to(device=tokens.device, dtype=tokens.dtype)
+        else:
+            beam_xy = torch.zeros(
+                tokens.shape[0],
+                tokens.shape[1],
+                2,
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+        beam_radius = torch.linalg.vector_norm(beam_xy, dim=-1)
+        beam_angle = torch.atan2(beam_xy[..., 1], beam_xy[..., 0])
+        beam_sin = torch.sin(beam_angle)
+        beam_cos = torch.cos(beam_angle)
+
+        if subcarrier_spacing is None:
+            spacing = torch.zeros(tokens.shape[0], device=tokens.device, dtype=tokens.dtype)
+        else:
+            spacing = (
+                subcarrier_spacing.to(device=tokens.device, dtype=tokens.dtype)
+                / 480e3
+            ).clamp(0.0, 1.0)
+        spacing = spacing.unsqueeze(-1).expand(-1, tokens.shape[1])
+
+        beam_stats = torch.stack(
+            [
+                torch.log1p(power_sum),
+                torch.log1p(peak_power.clamp(min=0.0)),
+                peak_position,
+                delay_center,
+                delay_spread,
+                delay_entropy,
+                early_mass,
+                mid_mass,
+                late_mass,
+                top3_mass,
+                early_peak_mass,
+                early_peak_ratio.clamp(max=1.0),
+                beam_xy[..., 0],
+                beam_xy[..., 1],
+                beam_radius,
+                beam_sin,
+                beam_cos,
+                spacing,
+            ],
+            dim=-1,
+        )
+        beam_stats = torch.nan_to_num(beam_stats, nan=0.0, posinf=0.0, neginf=0.0)
+        beam_features = self.beam_feature_proj(beam_stats)
+
+        valid_mask = token_mask.bool()
+        scores = self.selector(beam_features).squeeze(-1)
+        scores = scores.masked_fill(~valid_mask, torch.finfo(scores.dtype).min)
+        attention = torch.softmax(scores, dim=1).unsqueeze(-1)
+        attention = torch.where(valid_mask.unsqueeze(-1), attention, torch.zeros_like(attention))
+        pooled_attention = (beam_features * attention).sum(dim=1)
+
+        valid_count = valid_mask.sum(dim=1, keepdim=True).to(dtype=tokens.dtype).clamp(min=1.0)
+        pooled_mean = (beam_features * valid_mask.unsqueeze(-1).to(dtype=tokens.dtype)).sum(dim=1) / valid_count
+        pooled_max = beam_features.masked_fill(~valid_mask.unsqueeze(-1), torch.finfo(beam_features.dtype).min).amax(dim=1)
+        pooled_max = torch.where(torch.isfinite(pooled_max), pooled_max, torch.zeros_like(pooled_max))
+        return self.out_proj(torch.cat([pooled_attention, pooled_mean, pooled_max], dim=-1))
+
+
 class CSIDelayContextEncoder(nn.Module):
     def __init__(
         self,
@@ -495,6 +637,7 @@ class CSIClip(nn.Module):
         detach_first_path_delay_features: bool = True,
         use_delay_specific_encoder: bool = False,
         use_los_angle_context_encoder: bool = False,
+        use_first_path_angle_context_encoder: bool = False,
         los_angle_context_token_norm_mode: str = "std",
         use_pdp_latent_aux: bool = False,
         pdp_latent_dim: int = 16,
@@ -512,6 +655,7 @@ class CSIClip(nn.Module):
         self.detach_first_path_delay_features = detach_first_path_delay_features
         self.use_delay_specific_encoder = use_delay_specific_encoder
         self.use_los_angle_context_encoder = use_los_angle_context_encoder
+        self.use_first_path_angle_context_encoder = use_first_path_angle_context_encoder
         self.use_pdp_latent_aux = use_pdp_latent_aux
         self.freeze_pdp_latent_aux = freeze_pdp_latent_aux
         self.pdp_latent_aux_scale = float(pdp_latent_aux_scale)
@@ -533,6 +677,11 @@ class CSIClip(nn.Module):
         self.los_angle_context_encoder = (
             CSIAngleContextEncoder(token_norm_mode=los_angle_context_token_norm_mode)
             if use_los_angle_context_encoder
+            else None
+        )
+        self.first_path_angle_context_encoder = (
+            CSIFirstPathAngleContextEncoder()
+            if use_first_path_angle_context_encoder
             else None
         )
         self.csi_delay_context_dim = CSI_DELAY_CONTEXT_DIM
@@ -675,6 +824,12 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 2),
         )
+        self.first_path_angle_selector_fusion_head = nn.Sequential(
+            nn.LayerNorm(self.delay_head_input_dim * 2 + self.csi_delay_context_dim),
+            nn.Linear(self.delay_head_input_dim * 2 + self.csi_delay_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+        )
         self.delay_spread_tail_classifier = nn.Sequential(
             nn.LayerNorm(self.delay_head_input_dim),
             nn.Linear(self.delay_head_input_dim, hidden_dim),
@@ -775,6 +930,7 @@ class CSIClip(nn.Module):
             *self.los_angle_head.modules(),
             *self.first_path_angle_head.modules(),
             *self.first_path_angle_fusion_head.modules(),
+            *self.first_path_angle_selector_fusion_head.modules(),
             *self.delay_spread_tail_classifier.modules(),
         ):
             if isinstance(module, nn.Linear):
@@ -958,6 +1114,22 @@ class CSIClip(nn.Module):
             subcarrier_spacing,
         )
 
+    def encode_first_path_angle_context(
+        self,
+        tokens: torch.Tensor,
+        beam_positions: torch.Tensor,
+        token_mask: torch.Tensor,
+        subcarrier_spacing: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        if self.first_path_angle_context_encoder is None:
+            return None
+        return self.first_path_angle_context_encoder(
+            tokens,
+            beam_positions,
+            token_mask,
+            subcarrier_spacing=subcarrier_spacing,
+        )
+
     def _delay_profile_statistics(
         self,
         *,
@@ -1038,6 +1210,7 @@ class CSIClip(nn.Module):
         delay_context: torch.Tensor | None = None,
         first_path_delay_context: torch.Tensor | None = None,
         los_angle_context: torch.Tensor | None = None,
+        first_path_angle_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.predict_physics_components(
             csi_features,
@@ -1045,6 +1218,7 @@ class CSIClip(nn.Module):
             delay_context=delay_context,
             first_path_delay_context=first_path_delay_context,
             los_angle_context=los_angle_context,
+            first_path_angle_context=first_path_angle_context,
         )["final"]
 
     def predict_physics_components(
@@ -1054,6 +1228,7 @@ class CSIClip(nn.Module):
         delay_context: torch.Tensor | None = None,
         first_path_delay_context: torch.Tensor | None = None,
         los_angle_context: torch.Tensor | None = None,
+        first_path_angle_context: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         base = self.physics_head(csi_features)
         if self.use_delay_spread_head:
@@ -1114,7 +1289,12 @@ class CSIClip(nn.Module):
             los_angle_input = torch.cat([delay_csi_features, los_angle_context], dim=-1)
         los_angle_sincos = self.los_angle_head(los_angle_input)
         first_path_angle_input = torch.cat([first_path_delay_input, los_angle_input], dim=-1)
-        first_path_angle_sincos = self.first_path_angle_fusion_head(first_path_angle_input)
+        if first_path_angle_context is None:
+            first_path_angle_sincos = self.first_path_angle_fusion_head(first_path_angle_input)
+        else:
+            first_path_angle_sincos = self.first_path_angle_selector_fusion_head(
+                torch.cat([first_path_angle_input, first_path_angle_context], dim=-1)
+            )
         delay_spread_tail_logits = self.delay_spread_tail_classifier(delay_head_input)
         first_path_power_bin_logits = self.first_path_power_bin_classifier(
             csi_features
@@ -1218,6 +1398,7 @@ class CSIClip(nn.Module):
         final = base.clone()
         if self.use_delay_spread_head:
             final[:, self.delay_spread_index] = delay_spread_context
+        final[:, self.first_path_power_index] = enhanced_first_path_power
         final[:, self.first_path_delay_index] = (
             first_path_delay_bin_soft_fused_raw / 3000.0
         )

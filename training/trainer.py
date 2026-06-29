@@ -1031,6 +1031,7 @@ class Trainer:
             delay_context = None
             first_path_delay_context = None
             los_angle_context = None
+            first_path_angle_context = None
             if hasattr(self.model, "encode_csi_delay_context"):
                 delay_context = self.model.encode_csi_delay_context(
                     batch["tokens"],
@@ -1077,6 +1078,19 @@ class Trainer:
                     batch["bw_bin"],
                     batch["subcarrier_spacing"],
                 )
+            if (
+                (
+                    effective_first_path_angle_weight > 0.0
+                    or effective_first_path_angle_nlos_weight > 0.0
+                )
+                and hasattr(self.model, "encode_first_path_angle_context")
+            ):
+                first_path_angle_context = self.model.encode_first_path_angle_context(
+                    batch["tokens"],
+                    batch["beam_positions"],
+                    batch["token_mask"],
+                    subcarrier_spacing=batch.get("subcarrier_spacing"),
+                )
             if bool(getattr(self.model, "use_power_branch", False)):
                 power_context = self.model.encode_power_context(
                     batch["tokens"],
@@ -1090,6 +1104,7 @@ class Trainer:
                 delay_context=delay_context,
                 first_path_delay_context=first_path_delay_context,
                 los_angle_context=los_angle_context,
+                first_path_angle_context=first_path_angle_context,
             )
             physics_predictions = physics_outputs["final"]
 
