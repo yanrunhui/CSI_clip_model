@@ -80,6 +80,7 @@ class TrainConfig:
     first_path_power_bin_classifier_weight: float = 0.0
     first_path_power_bin_position_weight: float = 0.0
     first_path_power_bin_weights: dict[str, float] | None = None
+    first_path_power_gate_mode: str = "none"
     freeze_csi: bool = False
     freeze_text_prototypes: bool = False
     prototype_warmup_epochs: int = 0
@@ -854,6 +855,37 @@ class Trainer:
                 moved[key] = value
         return moved
 
+    def _predicted_los_mask_from_prototypes(
+        self,
+        csi_features: torch.Tensor,
+        prototype_features: torch.Tensor,
+        logit_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        prototype_logits = logit_scale * csi_features @ prototype_features.T
+        predicted_labels = prototype_logits.argmax(dim=1)
+        return torch.tensor(
+            [
+                getattr(self.prototype_keys_by_index[int(label)], "los_status", None) == "los"
+                for label in predicted_labels.detach().cpu().tolist()
+            ],
+            device=self.device,
+            dtype=torch.bool,
+        )
+
+    def _apply_first_path_power_gate(
+        self,
+        physics_outputs: dict[str, torch.Tensor],
+        predicted_los_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        final = physics_outputs["final"].clone()
+        first_path_power_idx = 5
+        final[:, first_path_power_idx] = torch.where(
+            predicted_los_mask,
+            physics_outputs["base"][:, first_path_power_idx],
+            physics_outputs["enhanced_first_path_power"],
+        )
+        return final
+
     def train_step(self, batch: dict, epoch: int, cfg: TrainConfig) -> dict[str, float]:
         batch = self._move_batch(batch)
         self.model.train()
@@ -1107,6 +1139,22 @@ class Trainer:
                 first_path_angle_context=first_path_angle_context,
             )
             physics_predictions = physics_outputs["final"]
+            if cfg.first_path_power_gate_mode == "predicted_los":
+                predicted_los_mask = self._predicted_los_mask_from_prototypes(
+                    csi_features,
+                    prototype_features,
+                    logit_scale,
+                )
+                physics_predictions = self._apply_first_path_power_gate(
+                    physics_outputs,
+                    predicted_los_mask,
+                )
+                physics_outputs["final"] = physics_predictions
+            elif cfg.first_path_power_gate_mode != "none":
+                raise ValueError(
+                    "Unsupported first_path_power_gate_mode="
+                    f"{cfg.first_path_power_gate_mode!r}. Choose from: none, predicted_los."
+                )
 
         if cfg.text_mode == "prototype":
             losses = self.loss(
@@ -1625,11 +1673,15 @@ class Trainer:
             and cfg.direct_power_weight > 0.0
         ):
             first_path_power_idx = 5
-            enhanced_first_path_power = physics_outputs["enhanced_first_path_power"]
+            direct_power_prediction = (
+                physics_predictions[:, first_path_power_idx]
+                if cfg.first_path_power_gate_mode == "predicted_los"
+                else physics_outputs["enhanced_first_path_power"]
+            )
             direct_power_target = batch["physics_targets"][:, first_path_power_idx]
             direct_power_mask = batch["physics_target_mask"][:, first_path_power_idx]
             direct_power_errors = torch.nn.functional.smooth_l1_loss(
-                enhanced_first_path_power,
+                direct_power_prediction,
                 direct_power_target,
                 reduction="none",
             )

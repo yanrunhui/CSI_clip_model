@@ -223,6 +223,14 @@ def _infer_use_power_branch(checkpoint: dict | None, override: bool | None) -> b
     return False
 
 
+def _infer_first_path_power_gate_mode(checkpoint: dict | None, override: str | None) -> str:
+    if override is not None:
+        return override
+    if checkpoint is not None:
+        return str(checkpoint.get("args", {}).get("first_path_power_gate_mode", "none"))
+    return "none"
+
+
 def _infer_use_delay_spread_head(checkpoint: dict | None) -> bool:
     if checkpoint is not None:
         csi_delay_input_weight = checkpoint.get("model_state", {}).get(
@@ -724,6 +732,7 @@ def evaluate(
     semantic_key_mode_override: str | None = None,
     token_norm_mode_override: str | None = None,
     use_power_branch_override: bool | None = None,
+    first_path_power_gate_mode_override: str | None = None,
     attribute_fields_override: tuple[str, ...] | None = None,
     filter_attribute_values_override: dict[str, tuple[str, ...]] | None = None,
     limit_samples_override: int | None = None,
@@ -740,6 +749,14 @@ def evaluate(
     semantic_key_mode = _infer_semantic_key_mode(checkpoint, semantic_key_mode_override)
     token_norm_mode = _infer_token_norm_mode(checkpoint, token_norm_mode_override)
     use_power_branch = _infer_use_power_branch(checkpoint, use_power_branch_override)
+    first_path_power_gate_mode = _infer_first_path_power_gate_mode(
+        checkpoint,
+        first_path_power_gate_mode_override,
+    )
+    if first_path_power_gate_mode not in {"none", "predicted_los"}:
+        raise ValueError(
+            "first_path_power_gate_mode must be one of: none, predicted_los."
+        )
     use_delay_spread_head = _infer_use_delay_spread_head(checkpoint)
     use_delay_spread_bin_head = _infer_use_delay_spread_bin_head(checkpoint)
     use_first_path_delay_bin_head = _infer_use_first_path_delay_bin_head(checkpoint)
@@ -1170,6 +1187,22 @@ def evaluate(
     labels = torch.tensor(all_labels, dtype=torch.long)
     logit_scale = float(model.logit_scale.exp().detach().cpu().item())
     prototype_logits = logit_scale * csi_features @ prototype_features.T
+    if first_path_power_gate_mode == "predicted_los":
+        first_path_power_idx = _physics_target_index("first_path_power_dbw")
+        predicted_labels = prototype_logits.argmax(dim=1)
+        predicted_los_mask = torch.tensor(
+            [
+                prototype_keys[int(label)].los_status == "los"
+                for label in predicted_labels.tolist()
+            ],
+            dtype=torch.bool,
+        )
+        physics_predictions = physics_predictions.clone()
+        physics_predictions[:, first_path_power_idx] = torch.where(
+            predicted_los_mask,
+            base_physics_predictions[:, first_path_power_idx],
+            enhanced_first_path_power_predictions,
+        )
 
     if text_mode == "prototype":
         text_features = prototype_text_features
@@ -1210,6 +1243,7 @@ def evaluate(
     print(f"semantic_key_mode={semantic_key_mode}")
     print(f"token_norm_mode={token_norm_mode}")
     print(f"use_power_branch={use_power_branch}")
+    print(f"first_path_power_gate_mode={first_path_power_gate_mode}")
     print(f"use_delay_spread_head={use_delay_spread_head}")
     print(f"use_delay_specific_encoder={use_delay_specific_encoder}")
     print(f"use_los_angle_context_encoder={use_los_angle_context_encoder}")
@@ -2513,6 +2547,11 @@ def main() -> None:
         help="Disable the power branch regardless of checkpoint args.",
     )
     parser.add_argument(
+        "--first-path-power-gate-mode",
+        choices=("none", "predicted_los"),
+        help="Override first-path-power final fusion mode. Defaults to checkpoint args.",
+    )
+    parser.add_argument(
         "--min-class-size",
         type=int,
         help="Drop semantic classes with fewer than this many samples before evaluation. Defaults to checkpoint args.",
@@ -2579,6 +2618,7 @@ def main() -> None:
         use_power_branch_override=(
             True if args.enable_power_branch else False if args.disable_power_branch else None
         ),
+        first_path_power_gate_mode_override=args.first_path_power_gate_mode,
         attribute_fields_override=tuple(args.attribute_classifier_fields) if args.attribute_classifier_fields else None,
         filter_attribute_values_override=(
             parse_attribute_value_filters(args.filter_attribute_values)

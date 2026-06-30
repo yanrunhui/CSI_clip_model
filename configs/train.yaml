@@ -1,0 +1,116 @@
+train:
+  data_path: artifacts/d2los_30k_los_nlos_balanced_los_angle_train.pt
+  eval_data_path: artifacts/d2los_30k_los_nlos_balanced_los_angle_test.pt
+  output_dir: artifacts/pretrain_d2los_30k_los_nlos_balanced_los_angle
+  save_every: 20
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  epochs: 100
+  temperature: 0.07
+  token_norm_mode: std
+  use_power_branch: true
+  first_path_power_mode: absolute
+  first_path_power_gate_mode: predicted_los
+  first_path_power_delta_limit: 3.0
+  detach_delay_spread_features: true
+  detach_first_path_delay_features: false
+  detach_first_path_power_features: true
+  use_delay_specific_encoder: true
+  use_los_angle_context_encoder: true
+  use_first_path_angle_context_encoder: true
+  warmup_epochs: 5
+  min_lr: 1.0e-5
+
+  csi_to_text_weight: 1.0
+  prototype_weight: 1.0
+  text_prototype_weight: 1.0
+  text_mode: prototype
+  prototype_warmup_epochs: 0
+  freeze_text_prototypes: true
+
+  semantic_classifier_weight: 0.5
+  semantic_classifier_class_weight: none
+  semantic_classifier_logit_adjustment: 0.0
+
+  attribute_classifier_weight: 0.1
+  attribute_classifier_fields:
+    - k_factor_bin
+  attribute_classifier_class_weight: balanced
+  attribute_classifier_logit_adjustment: 0.0
+
+  semantic_key_mode: coarse_k
+
+  aux_regression_weight: 0.005
+  k_factor_loss_weights:
+    weak: 1.0
+    strong_low: 1.0
+    strong_mid: 0.8
+    strong_high: 1.1
+    strong_very_high: 1.4
+  strong_k_bin_classifier_weight: 0.5
+  strong_k_position_weight: 0.1
+  strong_k_bin_weights:
+    low: 1.1
+    mid: 0.7
+    high: 1.5
+    very_high: 1.2
+  first_path_power_bin_classifier_weight: 0.05
+  first_path_power_bin_position_weight: 0.1
+  first_path_power_bin_weights:
+    very_weak: 1.0
+    weak: 1.0
+    moderate: 1.0
+    strong: 1.0
+  direct_power_weight: 0.5
+  delay_spread_weight: 0.01
+  first_path_delay_weight: 0.08
+  first_path_delay_raw_weight: 0.001
+  first_path_delay_fused_raw_weight: 0.02
+  first_path_delay_raw_beta_ns: 20.0
+  first_path_delay_bin_classifier_weight: 0.02
+  first_path_delay_bin_position_weight: 0.008
+  first_path_delay_bin_consistency_weight: 0.01
+  first_path_delay_bin_weights:
+    "0_25": 1.0
+    "25_50": 1.0
+    "50_100": 1.2
+    "100_200": 1.5
+    "200_400": 2.0
+    "400_600": 3.0
+    "600_800": 3.0
+    "800_1040": 3.0
+    "1040_1280": 3.0
+    "1280_plus": 3.0
+  estimated_pdp_tail_bin_weight: 0.02
+  estimated_pdp_tail_labels:
+    - "1040_1280"
+    - "1280_plus"
+  estimated_pdp_tail_gate_mode: target_or_pdp_argmax
+  first_path_delay_tail_underestimate_weight: 0.01
+  los_delay_weight: 0.02
+  los_delay_nonnegative_weight: 0.005
+  los_angle_weight: 0.05
+  first_path_angle_weight: 0.02
+  first_path_angle_nlos_weight: 0.01
+  delay_spread_teacher_weight: 0.0
+  delay_spread_bin_classifier_weight: 0.03
+  delay_spread_bin_position_weight: 0.008
+  delay_spread_tail_classifier_weight: 0.0
+  max_delay_spread_ns: 400.0
+  delay_spread_bin_weights:
+    "0_25": 1.0
+    "25_50": 1.0
+    "50_100": 1.2
+    "100_200": 2.0
+    "200_400": 4.0
+    "400_plus": 1.0
+  aux_regression_targets:
+    - first_path_power_dbw
+    - k_factor_db
+    - azimuth_spread_deg
+
+  multipositive_distance_threshold: 0.25
+  multipositive_positive_mode: semantic_and_physics
+  min_class_size: 5
+  min_class_size_for_multipositive: 2
