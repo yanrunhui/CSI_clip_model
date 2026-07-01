@@ -39,6 +39,7 @@ from models.model import (
     CSIClip,
     CSI_DELAY_CONTEXT_DIM,
     DELAY_SPREAD_BIN_LABELS,
+    DELAY_SPREAD_POSITION_BINS,
     FIRST_PATH_DELAY_BIN_LABELS,
     FIRST_PATH_DELAY_POSITION_BINS,
 )
@@ -231,6 +232,20 @@ def _infer_first_path_power_gate_mode(checkpoint: dict | None, override: str | N
     return "none"
 
 
+def _infer_first_path_power_mode(checkpoint: dict | None) -> str:
+    if checkpoint is not None:
+        return str(checkpoint.get("args", {}).get("first_path_power_mode", "residual"))
+    return "residual"
+
+
+def _infer_first_path_power_use_internal_gate(checkpoint: dict | None) -> bool:
+    if checkpoint is not None:
+        return bool(
+            checkpoint.get("args", {}).get("first_path_power_use_internal_gate", True)
+        )
+    return True
+
+
 def _infer_use_delay_spread_head(checkpoint: dict | None) -> bool:
     if checkpoint is not None:
         csi_delay_input_weight = checkpoint.get("model_state", {}).get(
@@ -256,7 +271,10 @@ def _infer_use_delay_spread_head(checkpoint: dict | None) -> bool:
             and context_delay_input_weight.shape[1] == 256 + CSI_DELAY_CONTEXT_DIM
         )
         return (
-            float(checkpoint.get("args", {}).get("delay_spread_weight", 0.0)) > 0.0
+            (
+                float(checkpoint.get("args", {}).get("delay_spread_weight", 0.0)) > 0.0
+                or float(checkpoint.get("args", {}).get("delay_spread_raw_weight", 0.0)) > 0.0
+            )
             and has_compatible_csi_delay_head
             and has_compatible_context_delay_head
         )
@@ -753,10 +771,18 @@ def evaluate(
         checkpoint,
         first_path_power_gate_mode_override,
     )
-    if first_path_power_gate_mode not in {"none", "predicted_los"}:
+    if first_path_power_gate_mode not in {"none", "base", "predicted_los"}:
         raise ValueError(
-            "first_path_power_gate_mode must be one of: none, predicted_los."
+            "first_path_power_gate_mode must be one of: none, base, predicted_los."
         )
+    first_path_power_mode = _infer_first_path_power_mode(checkpoint)
+    if first_path_power_mode not in {"residual", "absolute"}:
+        raise ValueError(
+            "first_path_power_mode must be one of: residual, absolute."
+        )
+    first_path_power_use_internal_gate = _infer_first_path_power_use_internal_gate(
+        checkpoint
+    )
     use_delay_spread_head = _infer_use_delay_spread_head(checkpoint)
     use_delay_spread_bin_head = _infer_use_delay_spread_bin_head(checkpoint)
     use_first_path_delay_bin_head = _infer_use_first_path_delay_bin_head(checkpoint)
@@ -916,6 +942,8 @@ def evaluate(
         embed_dim=256,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
         use_power_branch=use_power_branch,
+        first_path_power_mode=first_path_power_mode,
+        first_path_power_use_internal_gate=first_path_power_use_internal_gate,
         use_delay_spread_head=use_delay_spread_head,
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
@@ -1187,8 +1215,13 @@ def evaluate(
     labels = torch.tensor(all_labels, dtype=torch.long)
     logit_scale = float(model.logit_scale.exp().detach().cpu().item())
     prototype_logits = logit_scale * csi_features @ prototype_features.T
-    if first_path_power_gate_mode == "predicted_los":
-        first_path_power_idx = _physics_target_index("first_path_power_dbw")
+    first_path_power_idx = _physics_target_index("first_path_power_dbw")
+    if first_path_power_gate_mode == "base":
+        physics_predictions = physics_predictions.clone()
+        physics_predictions[:, first_path_power_idx] = base_physics_predictions[
+            :, first_path_power_idx
+        ]
+    elif first_path_power_gate_mode == "predicted_los":
         predicted_labels = prototype_logits.argmax(dim=1)
         predicted_los_mask = torch.tensor(
             [
@@ -1244,6 +1277,8 @@ def evaluate(
     print(f"token_norm_mode={token_norm_mode}")
     print(f"use_power_branch={use_power_branch}")
     print(f"first_path_power_gate_mode={first_path_power_gate_mode}")
+    print(f"first_path_power_mode={first_path_power_mode}")
+    print(f"first_path_power_use_internal_gate={first_path_power_use_internal_gate}")
     print(f"use_delay_spread_head={use_delay_spread_head}")
     print(f"use_delay_specific_encoder={use_delay_specific_encoder}")
     print(f"use_los_angle_context_encoder={use_los_angle_context_encoder}")
@@ -2432,7 +2467,6 @@ def _print_delay_spread_diagnostics(
     del enhanced_delay_spread_predictions
     del profile_delay_spread_predictions
     del profile_direct_delay_spread_predictions
-    del delay_spread_bin_positions
     delay_spread_idx = _physics_target_index("delay_spread_ns")
     delay_spread_mask = physics_masks[:, delay_spread_idx]
     if not bool(delay_spread_mask.any()):
@@ -2463,9 +2497,15 @@ def _print_delay_spread_diagnostics(
     print(f"final_delay_spread_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
     if delay_spread_bin_logits is not None:
         masked_bin_logits = delay_spread_bin_logits[delay_spread_mask]
+        masked_bin_positions = (
+            delay_spread_bin_positions[delay_spread_mask]
+            if delay_spread_bin_positions is not None
+            else None
+        )
         _print_delay_spread_bin_head_diagnostics(
             target_raw=masked_target_raw,
             bin_logits=masked_bin_logits,
+            bin_positions=masked_bin_positions,
         )
 
 
@@ -2482,9 +2522,68 @@ def _delay_spread_bin_targets(raw_delay_spread_ns: torch.Tensor) -> torch.Tensor
     return targets
 
 
+def _delay_spread_finite_bin_bounds(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    label_to_bounds = {
+        label: (lower, upper)
+        for label, lower, upper in DELAY_SPREAD_POSITION_BINS
+    }
+    finite_mask = torch.tensor(
+        [label in label_to_bounds for label in DELAY_SPREAD_BIN_LABELS],
+        device=device,
+        dtype=torch.bool,
+    )
+    lower = torch.zeros(len(DELAY_SPREAD_BIN_LABELS), device=device, dtype=dtype)
+    upper = torch.zeros(len(DELAY_SPREAD_BIN_LABELS), device=device, dtype=dtype)
+    for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS):
+        if label not in label_to_bounds:
+            continue
+        bin_lower, bin_upper = label_to_bounds[label]
+        lower[idx] = float(bin_lower)
+        upper[idx] = float(bin_upper)
+    return lower, upper, finite_mask
+
+
+def _fuse_delay_spread_from_bin_position(
+    bin_logits: torch.Tensor,
+    bin_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lower, upper, finite_mask = _delay_spread_finite_bin_bounds(
+        device=bin_logits.device,
+        dtype=bin_logits.dtype,
+    )
+    predicted_labels = bin_logits.argmax(dim=1)
+    covered_mask = finite_mask[predicted_labels]
+    position = bin_positions.to(dtype=bin_logits.dtype).clamp(0.0, 1.0)
+    fused = lower[predicted_labels] + position * (
+        upper[predicted_labels] - lower[predicted_labels]
+    )
+    return fused, covered_mask
+
+
+def _fuse_delay_spread_soft_from_bin_position(
+    bin_logits: torch.Tensor,
+    bin_positions: torch.Tensor,
+) -> torch.Tensor:
+    lower, upper, finite_mask = _delay_spread_finite_bin_bounds(
+        device=bin_logits.device,
+        dtype=bin_logits.dtype,
+    )
+    position = bin_positions.to(dtype=bin_logits.dtype).clamp(0.0, 1.0).unsqueeze(1)
+    candidates = lower.unsqueeze(0) + position * (upper - lower).unsqueeze(0)
+    probabilities = torch.softmax(bin_logits, dim=1)
+    probabilities = probabilities * finite_mask.to(dtype=probabilities.dtype).unsqueeze(0)
+    probabilities = probabilities / probabilities.sum(dim=1, keepdim=True).clamp(min=1e-12)
+    return (probabilities * candidates).sum(dim=1)
+
+
 def _print_delay_spread_bin_head_diagnostics(
     target_raw: torch.Tensor,
     bin_logits: torch.Tensor,
+    bin_positions: torch.Tensor | None = None,
 ) -> None:
     target_labels = _delay_spread_bin_targets(target_raw)
     valid_mask = target_labels >= 0
@@ -2494,6 +2593,17 @@ def _print_delay_spread_bin_head_diagnostics(
         return
 
     predicted_labels = bin_logits.argmax(dim=1)
+    valid_targets = target_labels[valid_mask]
+    valid_predictions = predicted_labels[valid_mask]
+    confusion = torch.zeros(
+        len(DELAY_SPREAD_BIN_LABELS),
+        len(DELAY_SPREAD_BIN_LABELS),
+        dtype=torch.long,
+    )
+    for true_label, pred_label in zip(valid_targets.tolist(), valid_predictions.tolist()):
+        confusion[int(true_label), int(pred_label)] += 1
+    adjacent_hits = (valid_predictions - valid_targets).abs() <= 1
+    far_misses = (valid_predictions - valid_targets).abs() > 1
     print(f"delay_spread_bin_head_count={int(valid_mask.sum().item())}")
     print(
         "delay_spread_bin_head_label_order="
@@ -2504,10 +2614,29 @@ def _print_delay_spread_bin_head_diagnostics(
         f"{float((predicted_labels[valid_mask] == target_labels[valid_mask]).float().mean()):.4f}"
     )
     print(
+        f"delay_spread_bin_head_adjacent_accuracy="
+        f"{float(adjacent_hits.float().mean()):.4f}"
+    )
+    print(
+        f"delay_spread_bin_head_far_miss_fraction="
+        f"{float(far_misses.float().mean()):.4f}"
+    )
+    print(
         "delay_spread_bin_head_target_histogram="
         + ",".join(
             f"{label}:{int((target_labels[valid_mask] == idx).sum().item())}"
             for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS)
+        )
+    )
+    print(
+        "delay_spread_bin_head_confusion="
+        + ";".join(
+            f"{DELAY_SPREAD_BIN_LABELS[row]}:"
+            + ",".join(
+                f"{DELAY_SPREAD_BIN_LABELS[col]}:{int(confusion[row, col].item())}"
+                for col in range(len(DELAY_SPREAD_BIN_LABELS))
+            )
+            for row in range(len(DELAY_SPREAD_BIN_LABELS))
         )
     )
     print(
@@ -2517,6 +2646,36 @@ def _print_delay_spread_bin_head_diagnostics(
             for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS)
         )
     )
+    if bin_positions is None:
+        print("delay_spread_bin_fused_MAE=nan")
+        print("delay_spread_bin_soft_fused_MAE=nan")
+        print("delay_spread_bin_fused_covered_count=0")
+        return
+
+    hard_fused_raw, covered_mask = _fuse_delay_spread_from_bin_position(
+        bin_logits,
+        bin_positions,
+    )
+    soft_fused_raw = _fuse_delay_spread_soft_from_bin_position(
+        bin_logits,
+        bin_positions,
+    )
+    hard_valid_mask = valid_mask & covered_mask
+    print(f"delay_spread_bin_fused_covered_count={int(hard_valid_mask.sum().item())}")
+    if bool(hard_valid_mask.any()):
+        hard_errors = hard_fused_raw[hard_valid_mask] - target_raw[hard_valid_mask].to(
+            dtype=hard_fused_raw.dtype
+        )
+        print(f"delay_spread_bin_fused_MAE={float(hard_errors.abs().mean()):.4f}")
+        print(f"delay_spread_bin_fused_signed_mean={float(hard_errors.mean()):.4f}")
+    else:
+        print("delay_spread_bin_fused_MAE=nan")
+        print("delay_spread_bin_fused_signed_mean=nan")
+    soft_errors = soft_fused_raw[valid_mask] - target_raw[valid_mask].to(
+        dtype=soft_fused_raw.dtype
+    )
+    print(f"delay_spread_bin_soft_fused_MAE={float(soft_errors.abs().mean()):.4f}")
+    print(f"delay_spread_bin_soft_fused_signed_mean={float(soft_errors.mean()):.4f}")
 
 
 def main() -> None:
@@ -2548,7 +2707,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--first-path-power-gate-mode",
-        choices=("none", "predicted_los"),
+        choices=("none", "base", "predicted_los"),
         help="Override first-path-power final fusion mode. Defaults to checkpoint args.",
     )
     parser.add_argument(

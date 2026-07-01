@@ -10,12 +10,14 @@ train:
   temperature: 0.07
   token_norm_mode: std
   use_power_branch: true
-  first_path_power_mode: absolute
-  first_path_power_gate_mode: predicted_los
-  first_path_power_delta_limit: 3.0
+  first_path_power_mode: residual
+  first_path_power_use_internal_gate: false
+  first_path_power_gate_mode: base
+  nlos_enhanced_power_loss: false
+  first_path_power_delta_limit: 5.0
   detach_delay_spread_features: true
   detach_first_path_delay_features: false
-  detach_first_path_power_features: true
+  detach_first_path_power_features: false
   use_delay_specific_encoder: true
   use_los_angle_context_encoder: true
   use_first_path_angle_context_encoder: true
@@ -62,8 +64,10 @@ train:
     weak: 1.0
     moderate: 1.0
     strong: 1.0
-  direct_power_weight: 0.5
+  direct_power_weight: 0.0
   delay_spread_weight: 0.01
+  delay_spread_raw_weight: 0.00001
+  delay_spread_raw_beta_ns: 20.0
   first_path_delay_weight: 0.08
   first_path_delay_raw_weight: 0.001
   first_path_delay_fused_raw_weight: 0.02

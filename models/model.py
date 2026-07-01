@@ -632,6 +632,8 @@ class CSIClip(nn.Module):
         num_physics_targets: int = 10,
         attribute_num_classes: dict[str, int] | None = None,
         use_power_branch: bool = False,
+        first_path_power_mode: str = "residual",
+        first_path_power_use_internal_gate: bool = True,
         use_delay_spread_head: bool = False,
         detach_delay_spread_features: bool = False,
         detach_first_path_delay_features: bool = True,
@@ -650,6 +652,12 @@ class CSIClip(nn.Module):
         super().__init__()
         self.output_dict = output_dict
         self.use_power_branch = use_power_branch
+        if first_path_power_mode not in {"residual", "absolute"}:
+            raise ValueError(
+                "first_path_power_mode must be one of: residual, absolute."
+            )
+        self.first_path_power_mode = first_path_power_mode
+        self.first_path_power_use_internal_gate = bool(first_path_power_use_internal_gate)
         self.use_delay_spread_head = use_delay_spread_head
         self.detach_delay_spread_features = detach_delay_spread_features
         self.detach_first_path_delay_features = detach_first_path_delay_features
@@ -1393,8 +1401,15 @@ class CSIClip(nn.Module):
             + self.delay_spread_fusion_scale * delay_spread_gate * delay_spread_delta
         )
         base_first_path_power = base[:, self.first_path_power_index]
-        gated_delta = enhanced_gate * enhanced_delta
-        enhanced_first_path_power = base_first_path_power + gated_delta
+        gated_delta = (
+            enhanced_gate * enhanced_delta
+            if self.first_path_power_use_internal_gate
+            else enhanced_delta
+        )
+        if self.first_path_power_mode == "absolute":
+            enhanced_first_path_power = enhanced_delta
+        else:
+            enhanced_first_path_power = base_first_path_power + gated_delta
         final = base.clone()
         if self.use_delay_spread_head:
             final[:, self.delay_spread_index] = delay_spread_context

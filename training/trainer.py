@@ -55,6 +55,8 @@ class TrainConfig:
     strong_k_bin_weights: dict[str, float] | None = None
     direct_power_weight: float = 0.0
     delay_spread_weight: float = 0.0
+    delay_spread_raw_weight: float = 0.0
+    delay_spread_raw_beta_ns: float = 20.0
     first_path_delay_weight: float = 0.0
     first_path_delay_raw_weight: float = 0.0
     first_path_delay_fused_raw_weight: float = 0.0
@@ -81,6 +83,9 @@ class TrainConfig:
     first_path_power_bin_position_weight: float = 0.0
     first_path_power_bin_weights: dict[str, float] | None = None
     first_path_power_gate_mode: str = "none"
+    first_path_power_mode: str = "residual"
+    first_path_power_use_internal_gate: bool = True
+    nlos_enhanced_power_loss: bool = False
     freeze_csi: bool = False
     freeze_text_prototypes: bool = False
     prototype_warmup_epochs: int = 0
@@ -886,6 +891,15 @@ class Trainer:
         )
         return final
 
+    def _apply_first_path_power_base(
+        self,
+        physics_outputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        final = physics_outputs["final"].clone()
+        first_path_power_idx = 5
+        final[:, first_path_power_idx] = physics_outputs["base"][:, first_path_power_idx]
+        return final
+
     def train_step(self, batch: dict, epoch: int, cfg: TrainConfig) -> dict[str, float]:
         batch = self._move_batch(batch)
         self.model.train()
@@ -913,6 +927,9 @@ class Trainer:
         )
         effective_delay_spread_weight = (
             0.0 if warmup_active else cfg.delay_spread_weight
+        )
+        effective_delay_spread_raw_weight = (
+            0.0 if warmup_active else cfg.delay_spread_raw_weight
         )
         effective_first_path_delay_weight = (
             0.0 if warmup_active else cfg.first_path_delay_weight
@@ -1005,6 +1022,8 @@ class Trainer:
         delay_spread_bin_prediction_histogram = None
         delay_spread_bin_loss_denominator = None
         delay_spread_bin_position_mae = None
+        delay_spread_raw_mae_ns = None
+        delay_spread_normalized_mae_ns = None
         first_path_delay_bin_target_histogram = None
         first_path_delay_bin_prediction_histogram = None
         first_path_delay_bin_loss_denominator = None
@@ -1029,6 +1048,13 @@ class Trainer:
         first_path_angle_count = None
         first_path_angle_nlos_mae_deg = None
         first_path_angle_nlos_count = None
+        direct_power_loss_count = None
+        direct_power_loss_nlos_fraction = None
+        los_first_path_power_base_mae_db = None
+        nlos_first_path_power_base_mae_db = None
+        nlos_first_path_power_enhanced_mae_db = None
+        first_path_power_delta_abs_mean = None
+        first_path_power_delta_saturation_fraction = None
         delay_spread_tail_accuracy = None
         delay_spread_tail_recall = None
         delay_spread_tail_false_positive = None
@@ -1045,6 +1071,7 @@ class Trainer:
             or effective_delay_spread_tail_classifier_weight > 0.0
             or cfg.direct_power_weight > 0.0
             or effective_delay_spread_weight > 0.0
+            or effective_delay_spread_raw_weight > 0.0
             or effective_first_path_delay_weight > 0.0
             or effective_first_path_delay_raw_weight > 0.0
             or effective_first_path_delay_fused_raw_weight > 0.0
@@ -1139,7 +1166,10 @@ class Trainer:
                 first_path_angle_context=first_path_angle_context,
             )
             physics_predictions = physics_outputs["final"]
-            if cfg.first_path_power_gate_mode == "predicted_los":
+            if cfg.first_path_power_gate_mode == "base":
+                physics_predictions = self._apply_first_path_power_base(physics_outputs)
+                physics_outputs["final"] = physics_predictions
+            elif cfg.first_path_power_gate_mode == "predicted_los":
                 predicted_los_mask = self._predicted_los_mask_from_prototypes(
                     csi_features,
                     prototype_features,
@@ -1153,7 +1183,7 @@ class Trainer:
             elif cfg.first_path_power_gate_mode != "none":
                 raise ValueError(
                     "Unsupported first_path_power_gate_mode="
-                    f"{cfg.first_path_power_gate_mode!r}. Choose from: none, predicted_los."
+                    f"{cfg.first_path_power_gate_mode!r}. Choose from: none, base, predicted_los."
                 )
 
         if cfg.text_mode == "prototype":
@@ -1670,37 +1700,115 @@ class Trainer:
         if (
             physics_outputs is not None
             and bool(getattr(self.model, "use_power_branch", False))
-            and cfg.direct_power_weight > 0.0
         ):
             first_path_power_idx = 5
-            direct_power_prediction = (
-                physics_predictions[:, first_path_power_idx]
-                if cfg.first_path_power_gate_mode == "predicted_los"
-                else physics_outputs["enhanced_first_path_power"]
-            )
-            direct_power_target = batch["physics_targets"][:, first_path_power_idx]
-            direct_power_mask = batch["physics_target_mask"][:, first_path_power_idx]
-            direct_power_errors = torch.nn.functional.smooth_l1_loss(
-                direct_power_prediction,
-                direct_power_target,
-                reduction="none",
-            )
-            direct_power_weights = self._first_path_power_sample_weights(
-                batch["physics_raw_targets"][:, first_path_power_idx],
-                cfg,
-            )
-            weighted_direct_power_mask = (
-                direct_power_mask.to(dtype=direct_power_errors.dtype)
-                * direct_power_weights.to(dtype=direct_power_errors.dtype)
-            )
-            direct_power_errors = direct_power_errors * weighted_direct_power_mask
-            losses["loss_direct_power"] = (
-                direct_power_errors.sum()
-                / weighted_direct_power_mask.sum().clamp(min=1).to(dtype=direct_power_errors.dtype)
-            )
+            if cfg.direct_power_weight > 0.0:
+                if cfg.nlos_enhanced_power_loss:
+                    direct_power_prediction = physics_outputs["enhanced_first_path_power"]
+                    direct_power_sample_mask = torch.tensor(
+                        [
+                            getattr(key, "los_status", None) != "los"
+                            for key in batch["semantic_keys"]
+                        ],
+                        device=self.device,
+                        dtype=torch.bool,
+                    )
+                else:
+                    direct_power_prediction = (
+                        physics_predictions[:, first_path_power_idx]
+                        if cfg.first_path_power_gate_mode in {"base", "predicted_los"}
+                        else physics_outputs["enhanced_first_path_power"]
+                    )
+                    direct_power_sample_mask = torch.ones(
+                        direct_power_prediction.shape,
+                        device=self.device,
+                        dtype=torch.bool,
+                    )
+                direct_power_target = batch["physics_targets"][:, first_path_power_idx]
+                direct_power_mask = (
+                    batch["physics_target_mask"][:, first_path_power_idx]
+                    & direct_power_sample_mask
+                )
+                direct_power_errors = torch.nn.functional.smooth_l1_loss(
+                    direct_power_prediction,
+                    direct_power_target,
+                    reduction="none",
+                )
+                direct_power_weights = self._first_path_power_sample_weights(
+                    batch["physics_raw_targets"][:, first_path_power_idx],
+                    cfg,
+                )
+                weighted_direct_power_mask = (
+                    direct_power_mask.to(dtype=direct_power_errors.dtype)
+                    * direct_power_weights.to(dtype=direct_power_errors.dtype)
+                )
+                direct_power_errors = direct_power_errors * weighted_direct_power_mask
+                losses["loss_direct_power"] = (
+                    direct_power_errors.sum()
+                    / weighted_direct_power_mask.sum().clamp(min=1).to(dtype=direct_power_errors.dtype)
+                )
+                direct_power_loss_count = direct_power_mask.sum()
+                direct_power_loss_nlos_fraction = direct_power_sample_mask.float().mean()
+            with torch.no_grad():
+                target_scale = PHYSICS_TARGET_SCALES[first_path_power_idx].to(
+                    device=self.device,
+                    dtype=physics_predictions.dtype,
+                )
+                target_offset = PHYSICS_TARGET_OFFSETS[first_path_power_idx].to(
+                    device=self.device,
+                    dtype=physics_predictions.dtype,
+                )
+                base_raw = (
+                    physics_outputs["base"][:, first_path_power_idx] * target_scale
+                    + target_offset
+                )
+                enhanced_raw = (
+                    physics_outputs["enhanced_first_path_power"] * target_scale
+                    + target_offset
+                )
+                target_raw = batch["physics_raw_targets"][:, first_path_power_idx].to(
+                    device=self.device,
+                    dtype=physics_predictions.dtype,
+                )
+                valid_power_mask = (
+                    batch["physics_target_mask"][:, first_path_power_idx].bool()
+                    & torch.isfinite(target_raw)
+                )
+                los_sample_mask = torch.tensor(
+                    [
+                        getattr(key, "los_status", None) == "los"
+                        for key in batch["semantic_keys"]
+                    ],
+                    device=self.device,
+                    dtype=torch.bool,
+                )
+                los_power_mask = valid_power_mask & los_sample_mask
+                nlos_power_mask = valid_power_mask & ~los_sample_mask
+                if bool(los_power_mask.any()):
+                    los_first_path_power_base_mae_db = (
+                        base_raw[los_power_mask] - target_raw[los_power_mask]
+                    ).abs().mean()
+                if bool(nlos_power_mask.any()):
+                    nlos_first_path_power_base_mae_db = (
+                        base_raw[nlos_power_mask] - target_raw[nlos_power_mask]
+                    ).abs().mean()
+                    nlos_first_path_power_enhanced_mae_db = (
+                        enhanced_raw[nlos_power_mask] - target_raw[nlos_power_mask]
+                    ).abs().mean()
+                enhanced_delta = physics_outputs.get("enhanced_delta")
+                if enhanced_delta is not None:
+                    first_path_power_delta_abs_mean = enhanced_delta.detach().abs().mean()
+                    delta_limit = float(getattr(self.model, "first_path_power_delta_limit", 0.0))
+                    if delta_limit > 0.0:
+                        first_path_power_delta_saturation_fraction = (
+                            enhanced_delta.detach().abs() >= 0.95 * delta_limit
+                        ).float().mean()
         if (
             physics_outputs is not None
-            and effective_delay_spread_weight > 0.0
+            and (
+                effective_delay_spread_weight > 0.0
+                or effective_delay_spread_raw_weight > 0.0
+            )
         ):
             delay_spread_idx = 1
             csi_delay_spread = physics_outputs["csi_delay_spread"]
@@ -1751,6 +1859,38 @@ class Trainer:
                 )
                 losses["loss_delay_spread_context"] = context_delay_spread_loss
                 losses["loss_delay_spread"] = context_delay_spread_loss
+                target_scale = PHYSICS_TARGET_SCALES[delay_spread_idx].to(
+                    device=delay_spread_context.device,
+                    dtype=delay_spread_context.dtype,
+                )
+                target_offset = PHYSICS_TARGET_OFFSETS[delay_spread_idx].to(
+                    device=delay_spread_context.device,
+                    dtype=delay_spread_context.dtype,
+                )
+                raw_prediction = delay_spread_context * target_scale + target_offset
+                raw_target = batch["physics_raw_targets"][:, delay_spread_idx].to(
+                    device=raw_prediction.device,
+                    dtype=raw_prediction.dtype,
+                )
+                raw_mask = delay_spread_mask.bool() & torch.isfinite(raw_target)
+                if bool(raw_mask.any()):
+                    raw_abs_error = (raw_prediction - raw_target).abs()
+                    beta = max(float(cfg.delay_spread_raw_beta_ns), 1e-6)
+                    raw_errors = torch.where(
+                        raw_abs_error < beta,
+                        0.5 * raw_abs_error.square() / beta,
+                        raw_abs_error - 0.5 * beta,
+                    )
+                    raw_weights = delay_spread_weights[raw_mask]
+                    losses["loss_delay_spread_raw"] = (
+                        (raw_errors[raw_mask] * raw_weights.to(dtype=raw_errors.dtype)).sum()
+                        / raw_weights.sum().clamp(min=1.0).to(dtype=raw_errors.dtype)
+                    )
+                    delay_spread_raw_mae_ns = raw_abs_error[raw_mask].mean()
+                    delay_spread_normalized_mae_ns = (
+                        (delay_spread_context - delay_spread_target).abs()[raw_mask].mean()
+                        * target_scale
+                    )
             if profile_delay_spread is not None:
                 profile_delay_spread_errors = torch.nn.functional.smooth_l1_loss(
                     profile_delay_spread,
@@ -2305,6 +2445,7 @@ class Trainer:
             effective_delay_spread_tail_classifier_weight * losses.get("loss_delay_spread_tail_classifier", torch.zeros((), device=self.device)) +
             cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device)) +
             effective_delay_spread_weight * losses.get("loss_delay_spread", torch.zeros((), device=self.device)) +
+            effective_delay_spread_raw_weight * losses.get("loss_delay_spread_raw", torch.zeros((), device=self.device)) +
             effective_first_path_delay_weight * losses.get("loss_first_path_delay", torch.zeros((), device=self.device)) +
             effective_first_path_delay_raw_weight * losses.get("loss_first_path_delay_raw", torch.zeros((), device=self.device)) +
             effective_first_path_delay_fused_raw_weight * losses.get("loss_first_path_delay_fused_raw", torch.zeros((), device=self.device)) +
@@ -2372,6 +2513,16 @@ class Trainer:
         )
         metrics["aux_regression_weight"] = float(effective_aux_regression_weight)
         metrics["delay_spread_weight"] = float(effective_delay_spread_weight)
+        metrics["delay_spread_raw_weight"] = float(effective_delay_spread_raw_weight)
+        metrics["delay_spread_raw_beta_ns"] = float(cfg.delay_spread_raw_beta_ns)
+        if delay_spread_raw_mae_ns is not None:
+            metrics["delay_spread_raw_mae_ns"] = float(
+                delay_spread_raw_mae_ns.detach()
+            )
+        if delay_spread_normalized_mae_ns is not None:
+            metrics["delay_spread_normalized_mae_ns"] = float(
+                delay_spread_normalized_mae_ns.detach()
+            )
         metrics["first_path_delay_weight"] = float(effective_first_path_delay_weight)
         metrics["first_path_delay_raw_weight"] = float(effective_first_path_delay_raw_weight)
         metrics["first_path_delay_fused_raw_weight"] = float(
@@ -2624,6 +2775,39 @@ class Trainer:
                 first_path_power_bin_position_mae.detach()
             )
         metrics["direct_power_weight"] = float(cfg.direct_power_weight)
+        metrics["nlos_enhanced_power_loss"] = float(cfg.nlos_enhanced_power_loss)
+        if direct_power_loss_count is not None:
+            metrics["direct_power_loss_count"] = float(direct_power_loss_count.detach())
+        if direct_power_loss_nlos_fraction is not None:
+            metrics["direct_power_loss_nlos_fraction"] = float(
+                direct_power_loss_nlos_fraction.detach()
+            )
+        metrics["first_path_power_mode_absolute"] = float(
+            cfg.first_path_power_mode == "absolute"
+        )
+        metrics["first_path_power_use_internal_gate"] = float(
+            cfg.first_path_power_use_internal_gate
+        )
+        if los_first_path_power_base_mae_db is not None:
+            metrics["los_first_path_power_base_mae_db"] = float(
+                los_first_path_power_base_mae_db.detach()
+            )
+        if nlos_first_path_power_base_mae_db is not None:
+            metrics["nlos_first_path_power_base_mae_db"] = float(
+                nlos_first_path_power_base_mae_db.detach()
+            )
+        if nlos_first_path_power_enhanced_mae_db is not None:
+            metrics["nlos_first_path_power_enhanced_mae_db"] = float(
+                nlos_first_path_power_enhanced_mae_db.detach()
+            )
+        if first_path_power_delta_abs_mean is not None:
+            metrics["first_path_power_delta_abs_mean"] = float(
+                first_path_power_delta_abs_mean.detach()
+            )
+        if first_path_power_delta_saturation_fraction is not None:
+            metrics["first_path_power_delta_saturation_fraction"] = float(
+                first_path_power_delta_saturation_fraction.detach()
+            )
         if physics_predictions is not None:
             metrics["k_factor_sample_weight_mean"] = float(
                 self._k_factor_sample_weights(
