@@ -1413,7 +1413,8 @@ class CSIClip(nn.Module):
         final = base.clone()
         if self.use_delay_spread_head:
             final[:, self.delay_spread_index] = delay_spread_context
-        final[:, self.first_path_power_index] = enhanced_first_path_power
+        # Keep enhanced power available for diagnostics, but do not route it into final.
+        final[:, self.first_path_power_index] = base_first_path_power
         final[:, self.first_path_delay_index] = (
             first_path_delay_bin_soft_fused_raw / 3000.0
         )

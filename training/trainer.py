@@ -82,6 +82,7 @@ class TrainConfig:
     first_path_power_bin_classifier_weight: float = 0.0
     first_path_power_bin_position_weight: float = 0.0
     first_path_power_bin_weights: dict[str, float] | None = None
+    first_path_power_nlos_weight: float = 1.0
     first_path_power_gate_mode: str = "none"
     first_path_power_mode: str = "residual"
     first_path_power_use_internal_gate: bool = True
@@ -440,6 +441,30 @@ class Trainer:
                 continue
             mask = (raw_first_path_power >= lower) & (raw_first_path_power < upper)
             weights = torch.where(mask, torch.full_like(weights, bin_weight), weights)
+        return weights
+
+    def _first_path_power_supervision_weights(
+        self,
+        raw_first_path_power: torch.Tensor,
+        semantic_keys: list[object],
+        cfg: TrainConfig,
+    ) -> torch.Tensor:
+        weights = self._first_path_power_sample_weights(raw_first_path_power, cfg)
+        nlos_weight = float(cfg.first_path_power_nlos_weight)
+        if nlos_weight != 1.0:
+            nlos_mask = torch.tensor(
+                [
+                    getattr(key, "los_status", None) != "los"
+                    for key in semantic_keys
+                ],
+                dtype=torch.bool,
+                device=raw_first_path_power.device,
+            )
+            weights = torch.where(
+                nlos_mask,
+                weights * nlos_weight,
+                weights,
+            )
         return weights
 
     def _k_factor_sample_weights(
@@ -1169,21 +1194,10 @@ class Trainer:
             if cfg.first_path_power_gate_mode == "base":
                 physics_predictions = self._apply_first_path_power_base(physics_outputs)
                 physics_outputs["final"] = physics_predictions
-            elif cfg.first_path_power_gate_mode == "predicted_los":
-                predicted_los_mask = self._predicted_los_mask_from_prototypes(
-                    csi_features,
-                    prototype_features,
-                    logit_scale,
-                )
-                physics_predictions = self._apply_first_path_power_gate(
-                    physics_outputs,
-                    predicted_los_mask,
-                )
-                physics_outputs["final"] = physics_predictions
             elif cfg.first_path_power_gate_mode != "none":
                 raise ValueError(
                     "Unsupported first_path_power_gate_mode="
-                    f"{cfg.first_path_power_gate_mode!r}. Choose from: none, base, predicted_los."
+                    f"{cfg.first_path_power_gate_mode!r}. Choose from: none, base."
                 )
 
         if cfg.text_mode == "prototype":
@@ -1670,8 +1684,9 @@ class Trainer:
                     )
                 if 5 in cfg.aux_regression_indices:
                     first_path_position = cfg.aux_regression_indices.index(5)
-                    regression_weights[:, first_path_position] = self._first_path_power_sample_weights(
+                    regression_weights[:, first_path_position] = self._first_path_power_supervision_weights(
                         batch["physics_raw_targets"][:, 5],
+                        batch["semantic_keys"],
                         cfg,
                     )
             else:
@@ -1680,8 +1695,9 @@ class Trainer:
                     batch["semantic_keys"],
                     cfg,
                 )
-                regression_weights[:, 5] = self._first_path_power_sample_weights(
+                regression_weights[:, 5] = self._first_path_power_supervision_weights(
                     batch["physics_raw_targets"][:, 5],
+                    batch["semantic_keys"],
                     cfg,
                 )
             regression_errors = torch.nn.functional.smooth_l1_loss(
@@ -1714,11 +1730,7 @@ class Trainer:
                         dtype=torch.bool,
                     )
                 else:
-                    direct_power_prediction = (
-                        physics_predictions[:, first_path_power_idx]
-                        if cfg.first_path_power_gate_mode in {"base", "predicted_los"}
-                        else physics_outputs["enhanced_first_path_power"]
-                    )
+                    direct_power_prediction = physics_predictions[:, first_path_power_idx]
                     direct_power_sample_mask = torch.ones(
                         direct_power_prediction.shape,
                         device=self.device,
@@ -1734,8 +1746,9 @@ class Trainer:
                     direct_power_target,
                     reduction="none",
                 )
-                direct_power_weights = self._first_path_power_sample_weights(
+                direct_power_weights = self._first_path_power_supervision_weights(
                     batch["physics_raw_targets"][:, first_path_power_idx],
+                    batch["semantic_keys"],
                     cfg,
                 )
                 weighted_direct_power_mask = (
@@ -2817,10 +2830,14 @@ class Trainer:
                 ).detach().float().mean()
             )
             metrics["first_path_power_sample_weight_mean"] = float(
-                self._first_path_power_sample_weights(
+                self._first_path_power_supervision_weights(
                     batch["physics_raw_targets"][:, 5],
+                    batch["semantic_keys"],
                     cfg,
                 ).detach().float().mean()
+            )
+            metrics["first_path_power_nlos_weight"] = float(
+                cfg.first_path_power_nlos_weight
             )
             if "first_path_delay_ns" in PHYSICS_TARGET_NAMES:
                 first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")

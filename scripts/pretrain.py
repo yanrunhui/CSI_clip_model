@@ -1135,6 +1135,7 @@ def run_smoke_test(
     first_path_power_bin_classifier_weight: float = 0.0,
     first_path_power_bin_position_weight: float = 0.0,
     first_path_power_bin_weights: dict[str, float] | None = None,
+    first_path_power_nlos_weight: float = 1.0,
     first_path_power_gate_mode: str = "none",
     first_path_power_mode: str = "residual",
     first_path_power_use_internal_gate: bool = True,
@@ -1240,6 +1241,7 @@ def run_smoke_test(
                     delay_spread_bin_position_weight=delay_spread_bin_position_weight,
                     delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
                     first_path_power_bin_weights=first_path_power_bin_weights,
+                    first_path_power_nlos_weight=first_path_power_nlos_weight,
                     first_path_power_gate_mode=first_path_power_gate_mode,
                     first_path_power_mode=first_path_power_mode,
                     first_path_power_use_internal_gate=first_path_power_use_internal_gate,
@@ -1328,6 +1330,7 @@ def run_real_pretrain(
     delay_spread_bin_position_weight: float,
     delay_spread_tail_classifier_weight: float,
     first_path_power_bin_weights: dict[str, float],
+    first_path_power_nlos_weight: float,
     first_path_power_gate_mode: str,
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
@@ -1469,6 +1472,7 @@ def run_real_pretrain(
         delay_spread_bin_position_weight=delay_spread_bin_position_weight,
         delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
         first_path_power_bin_weights=first_path_power_bin_weights,
+        first_path_power_nlos_weight=first_path_power_nlos_weight,
         first_path_power_gate_mode=first_path_power_gate_mode,
         first_path_power_mode=first_path_power_mode,
         first_path_power_use_internal_gate=first_path_power_use_internal_gate,
@@ -1563,6 +1567,7 @@ def run_real_pretrain(
         f"delay_spread_bin_label_order={','.join(DELAY_SPREAD_BIN_LABELS)} "
         f"delay_spread_tail_label_order={','.join(DELAY_SPREAD_TAIL_LABELS)} "
         f"first_path_power_bin_weights={format_first_path_power_bin_weights(first_path_power_bin_weights)} "
+        f"first_path_power_nlos_weight={first_path_power_nlos_weight} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
         f"min_class_size_for_multipositive={min_class_size_for_multipositive} "
@@ -2175,6 +2180,7 @@ def run_real_pretrain(
                         "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
                         "delay_spread_tail_label_order": list(DELAY_SPREAD_TAIL_LABELS),
                         "first_path_power_bin_weights": first_path_power_bin_weights,
+                        "first_path_power_nlos_weight": first_path_power_nlos_weight,
                         "multipositive_distance_threshold": multipositive_distance_threshold,
                         "multipositive_positive_mode": multipositive_positive_mode,
                         "min_class_size_for_multipositive": min_class_size_for_multipositive,
@@ -2284,6 +2290,7 @@ def run_real_pretrain(
                     "delay_spread_bin_weights": delay_spread_bin_weights,
                     "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
                     "first_path_power_bin_weights": first_path_power_bin_weights,
+                    "first_path_power_nlos_weight": first_path_power_nlos_weight,
                     "multipositive_distance_threshold": multipositive_distance_threshold,
                     "multipositive_positive_mode": multipositive_positive_mode,
                     "min_class_size_for_multipositive": min_class_size_for_multipositive,
@@ -2464,12 +2471,16 @@ def main() -> None:
         help="Small explicit supervision weight for the direct first-path-power head.",
     )
     parser.add_argument(
+        "--first-path-power-nlos-weight",
+        type=float,
+        help="Sample-weight multiplier for NLoS first-path-power supervision.",
+    )
+    parser.add_argument(
         "--first-path-power-gate-mode",
-        choices=("none", "base", "predicted_los"),
+        choices=("none", "base"),
         help=(
             "How to route the final first-path-power prediction. base uses the base "
-            "physics head; predicted_los uses "
-            "base power for predicted LoS samples and enhanced power for predicted NLoS samples."
+            "physics head; none uses the model default."
         ),
     )
     parser.add_argument(
@@ -2879,14 +2890,21 @@ def main() -> None:
         if args.direct_power_weight is not None
         else float(cfg_get(train_cfg, "direct_power_weight", 0.0))
     )
+    first_path_power_nlos_weight = (
+        args.first_path_power_nlos_weight
+        if args.first_path_power_nlos_weight is not None
+        else float(cfg_get(train_cfg, "first_path_power_nlos_weight", 1.0))
+    )
+    if first_path_power_nlos_weight <= 0.0:
+        raise ValueError("--first-path-power-nlos-weight must be positive.")
     first_path_power_gate_mode = (
         args.first_path_power_gate_mode
         if args.first_path_power_gate_mode is not None
         else str(cfg_get(train_cfg, "first_path_power_gate_mode", "none"))
     )
-    if first_path_power_gate_mode not in {"none", "base", "predicted_los"}:
+    if first_path_power_gate_mode not in {"none", "base"}:
         raise ValueError(
-            "first_path_power_gate_mode must be one of: none, base, predicted_los."
+            "first_path_power_gate_mode must be one of: none, base."
         )
     first_path_power_mode = (
         args.first_path_power_mode
@@ -3197,6 +3215,7 @@ def main() -> None:
             delay_spread_bin_position_weight=delay_spread_bin_position_weight,
             delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
             first_path_power_bin_weights=first_path_power_bin_weights,
+            first_path_power_nlos_weight=first_path_power_nlos_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
@@ -3284,6 +3303,7 @@ def main() -> None:
             delay_spread_bin_position_weight=delay_spread_bin_position_weight,
             delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
             first_path_power_bin_weights=first_path_power_bin_weights,
+            first_path_power_nlos_weight=first_path_power_nlos_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,

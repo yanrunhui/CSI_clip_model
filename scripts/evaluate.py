@@ -771,9 +771,16 @@ def evaluate(
         checkpoint,
         first_path_power_gate_mode_override,
     )
-    if first_path_power_gate_mode not in {"none", "base", "predicted_los"}:
+    if first_path_power_gate_mode == "predicted_los":
+        print(
+            "warning: first_path_power_gate_mode=predicted_los is disabled; "
+            "using base final first-path power.",
+            file=sys.stderr,
+        )
+        first_path_power_gate_mode = "base"
+    if first_path_power_gate_mode not in {"none", "base"}:
         raise ValueError(
-            "first_path_power_gate_mode must be one of: none, base, predicted_los."
+            "first_path_power_gate_mode must be one of: none, base."
         )
     first_path_power_mode = _infer_first_path_power_mode(checkpoint)
     if first_path_power_mode not in {"residual", "absolute"}:
@@ -1221,21 +1228,6 @@ def evaluate(
         physics_predictions[:, first_path_power_idx] = base_physics_predictions[
             :, first_path_power_idx
         ]
-    elif first_path_power_gate_mode == "predicted_los":
-        predicted_labels = prototype_logits.argmax(dim=1)
-        predicted_los_mask = torch.tensor(
-            [
-                prototype_keys[int(label)].los_status == "los"
-                for label in predicted_labels.tolist()
-            ],
-            dtype=torch.bool,
-        )
-        physics_predictions = physics_predictions.clone()
-        physics_predictions[:, first_path_power_idx] = torch.where(
-            predicted_los_mask,
-            base_physics_predictions[:, first_path_power_idx],
-            enhanced_first_path_power_predictions,
-        )
 
     if text_mode == "prototype":
         text_features = prototype_text_features
@@ -2707,7 +2699,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--first-path-power-gate-mode",
-        choices=("none", "base", "predicted_los"),
+        choices=("none", "base"),
         help="Override first-path-power final fusion mode. Defaults to checkpoint args.",
     )
     parser.add_argument(
