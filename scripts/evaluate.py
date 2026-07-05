@@ -42,6 +42,7 @@ from models.model import (
     DELAY_SPREAD_POSITION_BINS,
     FIRST_PATH_DELAY_BIN_LABELS,
     FIRST_PATH_DELAY_POSITION_BINS,
+    REFLECTION_COUNT_BIN_LABELS,
 )
 from models.text_encoder import PhysicsTextEncoder
 from scripts.pretrain import assert_checkpoint_prototype_compatibility, deserialize_prototype_keys
@@ -80,6 +81,14 @@ FIRST_PATH_DELAY_DIAGNOSTIC_BINS = (
         (label, lower, float("inf") if idx == len(FIRST_PATH_DELAY_POSITION_BINS) - 1 else upper)
         for idx, (label, lower, upper) in enumerate(FIRST_PATH_DELAY_POSITION_BINS)
     ),
+)
+
+REFLECTION_COUNT_DIAGNOSTIC_BINS = (
+    ("0_5", 0.0, 6.0),
+    ("6_7", 6.0, 8.0),
+    ("8_10", 8.0, 11.0),
+    ("11_13", 11.0, 14.0),
+    ("14_plus", 14.0, float("inf")),
 )
 
 def build_tokenizer(samples, checkpoint: dict | None) -> CaptionTokenizer:
@@ -169,6 +178,94 @@ def _render_physical_description(record: dict[str, float | str]) -> str:
         f"{_format_scalar(float(record['delay_spread_ns']))} ns, a K-factor of about "
         f"{_format_scalar(float(record['k_factor_db']))} dB, and an azimuth spread of about "
         f"{_format_scalar(float(record['azimuth_spread_deg']))} deg."
+    )
+
+
+def _finite_float(value) -> float | None:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _format_signal_value(value, unit: str = "", decimals: int = 1) -> str:
+    finite = _finite_float(value)
+    if finite is None:
+        return "unknown"
+    formatted = f"{finite:.{decimals}f}".rstrip("0").rstrip(".")
+    return f"{formatted} {unit}".strip()
+
+
+def _format_signal_count(value) -> str:
+    finite = _finite_float(value)
+    if finite is None:
+        return "unknown"
+    return str(max(int(round(finite)), 0))
+
+
+def _angle_deg_from_sincos(sin_value, cos_value) -> float:
+    sin_value = _finite_float(sin_value)
+    cos_value = _finite_float(cos_value)
+    if sin_value is None or cos_value is None:
+        return math.nan
+    if math.hypot(sin_value, cos_value) < 1e-6:
+        return math.nan
+    return math.degrees(math.atan2(sin_value, cos_value))
+
+
+def _signal_description_record(
+    semantic_key: SemanticKey,
+    raw_values: torch.Tensor,
+    *,
+    los_delay_ns: float = math.nan,
+    los_angle_sincos: torch.Tensor | None = None,
+    reflection_count: float | None = None,
+) -> dict[str, float | str]:
+    first_angle_sin_idx = _physics_target_index("first_path_aoa_az_sin")
+    first_angle_cos_idx = _physics_target_index("first_path_aoa_az_cos")
+    if los_angle_sincos is None:
+        los_angle_deg = math.nan
+    else:
+        los_angle_deg = _angle_deg_from_sincos(
+            los_angle_sincos[0],
+            los_angle_sincos[1],
+        )
+    if reflection_count is None:
+        reflection_count = float(raw_values[_physics_target_index("reflection_count")])
+    return {
+        "environment": str(semantic_key.env_type),
+        "los_status": str(semantic_key.los_status),
+        "path_count": float(raw_values[_physics_target_index("n_paths")]),
+        "first_path_delay_ns": float(raw_values[_physics_target_index("first_path_delay_ns")]),
+        "first_path_angle_deg": _angle_deg_from_sincos(
+            raw_values[first_angle_sin_idx],
+            raw_values[first_angle_cos_idx],
+        ),
+        "first_path_power_dbw": float(raw_values[_physics_target_index("first_path_power_dbw")]),
+        "k_factor_db": float(raw_values[_physics_target_index("k_factor_db")]),
+        "delay_spread_ns": float(raw_values[_physics_target_index("delay_spread_ns")]),
+        "angle_spread_deg": float(raw_values[_physics_target_index("azimuth_spread_deg")]),
+        "los_delay_ns": float(los_delay_ns),
+        "los_angle_deg": float(los_angle_deg),
+        "reflection_count": float(reflection_count),
+    }
+
+
+def _render_signal_description(record: dict[str, float | str]) -> str:
+    los_text = "LoS" if str(record["los_status"]) == "los" else "NLoS"
+    return (
+        f"This signal is {record['environment']}, {los_text}, with "
+        f"{_format_signal_count(record['path_count'])} paths. "
+        f"Its first-path delay is {_format_signal_value(record['first_path_delay_ns'], 'ns')}, "
+        f"first-path angle is {_format_signal_value(record['first_path_angle_deg'], 'deg')}, "
+        f"and first-path power is {_format_signal_value(record['first_path_power_dbw'], 'dBW')}. "
+        f"Its K-factor is {_format_signal_value(record['k_factor_db'], 'dB')}, "
+        f"delay spread is {_format_signal_value(record['delay_spread_ns'], 'ns')}, "
+        f"and azimuth angle spread is {_format_signal_value(record['angle_spread_deg'], 'deg')}. "
+        f"The LoS delay is {_format_signal_value(record['los_delay_ns'], 'ns')}, "
+        f"the LoS angle is {_format_signal_value(record['los_angle_deg'], 'deg')}, "
+        f"and the reflection count is {_format_signal_count(record['reflection_count'])}."
     )
 
 
@@ -455,6 +552,48 @@ def _infer_max_delay_spread_ns(checkpoint: dict | None, override: float | None) 
         if value is not None:
             return float(value)
     return None
+
+
+def _infer_reflection_count_classifier_weight(checkpoint: dict | None) -> float:
+    if checkpoint is None:
+        return 0.0
+    args = checkpoint.get("args", {})
+    return float(
+        args.get(
+            "reflection_count_classifier_weight",
+            args.get("interaction_count_classifier_weight", 0.0),
+        )
+    )
+
+
+def _infer_reflection_count_regression_weight(checkpoint: dict | None) -> float:
+    if checkpoint is None:
+        return 0.0
+    args = checkpoint.get("args", {})
+    return float(
+        args.get(
+            "reflection_count_regression_weight",
+            args.get("interaction_count_regression_weight", 0.0),
+        )
+    )
+
+
+def _infer_reflection_count_nlos_weight(checkpoint: dict | None) -> float:
+    if checkpoint is None:
+        return 1.0
+    return float(checkpoint.get("args", {}).get("reflection_count_nlos_weight", 1.0))
+
+
+def _infer_interaction_count_soft_labels(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    return bool(checkpoint.get("args", {}).get("interaction_count_soft_labels", False))
+
+
+def _infer_delay_spread_raw_beta_ns(checkpoint: dict | None) -> float:
+    if checkpoint is not None:
+        return float(checkpoint.get("args", {}).get("delay_spread_raw_beta_ns", 20.0))
+    return 20.0
 
 
 def _sample_delay_spread_ns(sample) -> float:
@@ -759,6 +898,7 @@ def evaluate(
     max_delay_spread_ns_override: float | None = None,
     attribute_binary_thresholds: dict[str, float] | None = None,
     physical_caption_examples: int = 3,
+    save_signal_descriptions_path: str | None = None,
 ) -> None:
     dataset = PreprocessedCSIDataset.from_pt(data_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False) if checkpoint_path else None
@@ -818,6 +958,15 @@ def evaluate(
         checkpoint,
         limit_samples_per_attribute_value_override,
     )
+    delay_spread_raw_beta_ns = _infer_delay_spread_raw_beta_ns(checkpoint)
+    reflection_count_classifier_weight = _infer_reflection_count_classifier_weight(
+        checkpoint
+    )
+    reflection_count_regression_weight = _infer_reflection_count_regression_weight(
+        checkpoint
+    )
+    reflection_count_nlos_weight = _infer_reflection_count_nlos_weight(checkpoint)
+    interaction_count_soft_labels = _infer_interaction_count_soft_labels(checkpoint)
     max_delay_spread_ns = _infer_max_delay_spread_ns(
         checkpoint,
         max_delay_spread_ns_override,
@@ -995,6 +1144,8 @@ def evaluate(
     all_first_path_delay_bin_positions = []
     all_strong_k_bin_logits = []
     all_strong_k_positions = []
+    all_reflection_count_logits = []
+    all_reflection_count_predictions = []
     all_physics_targets = []
     all_physics_raw_targets = []
     all_physics_masks = []
@@ -1133,6 +1284,10 @@ def evaluate(
         )
         all_strong_k_bin_logits.append(physics_outputs["k_factor_strong_bin_logits"].cpu())
         all_strong_k_positions.append(physics_outputs["k_factor_strong_position"].cpu())
+        all_reflection_count_logits.append(physics_outputs["reflection_count_logits"].cpu())
+        all_reflection_count_predictions.append(
+            physics_outputs["reflection_count_prediction"].cpu()
+        )
         all_physics_predictions.append(physics_predictions.cpu())
         all_physics_targets.append(batch["physics_targets"].cpu())
         all_physics_raw_targets.append(batch["physics_raw_targets"].cpu())
@@ -1212,6 +1367,8 @@ def evaluate(
     first_path_delay_bin_positions = torch.cat(all_first_path_delay_bin_positions, dim=0)
     strong_k_bin_logits = torch.cat(all_strong_k_bin_logits, dim=0)
     strong_k_positions = torch.cat(all_strong_k_positions, dim=0)
+    reflection_count_logits = torch.cat(all_reflection_count_logits, dim=0)
+    reflection_count_predictions = torch.cat(all_reflection_count_predictions, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
     physics_masks = torch.cat(all_physics_masks, dim=0)
@@ -1285,6 +1442,11 @@ def evaluate(
     print(f"limit_samples_by_attribute={limit_samples_by_attribute}")
     print(f"limit_samples_per_attribute_value={limit_samples_per_attribute_value}")
     print(f"max_delay_spread_ns={max_delay_spread_ns}")
+    print(f"delay_spread_raw_beta_ns={delay_spread_raw_beta_ns:.4f}")
+    print(f"reflection_count_classifier_weight={reflection_count_classifier_weight:.4f}")
+    print(f"reflection_count_regression_weight={reflection_count_regression_weight:.4f}")
+    print(f"reflection_count_nlos_weight={reflection_count_nlos_weight:.4f}")
+    print(f"interaction_count_soft_labels={interaction_count_soft_labels}")
     print(f"semantic_prototypes={len(prototype_keys)}")
     if semantic_classifier_enabled and semantic_logits is not None:
         _print_semantic_classifier_metrics(semantic_logits, labels, prototype_keys)
@@ -1310,6 +1472,13 @@ def evaluate(
         physics_predictions=physics_predictions,
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
+    )
+    _print_interaction_count_head_diagnostics(
+        reflection_logits=reflection_count_logits,
+        reflection_predictions=reflection_count_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
     )
     _print_first_path_angle_diagnostics(
         physics_predictions=physics_predictions,
@@ -1374,6 +1543,7 @@ def evaluate(
         delay_spread_bin_positions=delay_spread_bin_positions if use_delay_spread_bin_head else None,
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
+        raw_beta_ns=delay_spread_raw_beta_ns,
     )
     _print_structured_physical_description_metrics(
         physics_predictions=physics_predictions,
@@ -1384,6 +1554,31 @@ def evaluate(
         prototype_keys=prototype_keys,
         example_count=physical_caption_examples,
     )
+    signal_description_payload = _build_signal_description_payload(
+        samples=samples,
+        physics_predictions=physics_predictions,
+        physics_raw_targets=physics_raw_targets,
+        semantic_keys=all_semantic_keys,
+        prototype_logits=prototype_logits,
+        prototype_keys=prototype_keys,
+        semantic_logits=semantic_logits if semantic_classifier_enabled else None,
+        los_delay_predictions=los_delay_context_predictions,
+        los_delay_raw_targets=los_delay_raw_targets,
+        los_delay_masks=los_delay_masks,
+        los_angle_predictions=los_angle_predictions,
+        los_angle_targets=los_angle_targets,
+        los_angle_masks=los_angle_masks,
+        reflection_count_predictions=reflection_count_predictions,
+    )
+    _print_signal_description_examples(
+        signal_description_payload,
+        example_count=physical_caption_examples,
+    )
+    if save_signal_descriptions_path is not None:
+        _save_signal_description_payload(
+            save_signal_descriptions_path,
+            signal_description_payload,
+        )
     if text_mode in ("instance", "multipositive"):
         _print_semantic_retrieval_metrics(
             "csi_to_instance_text_semantic",
@@ -1815,6 +2010,203 @@ def _print_physics_regression_metrics(
     print(f"physics_regression_MAE_mean={float(total_mae):.4f}")
 
 
+def _interaction_count_bin_targets(
+    raw_count: torch.Tensor,
+    bins: tuple[tuple[str, float, float], ...],
+) -> torch.Tensor:
+    targets = torch.full_like(raw_count, fill_value=-1, dtype=torch.long)
+    finite = torch.isfinite(raw_count)
+    rounded = raw_count.round()
+    for class_idx, (_, lower, upper) in enumerate(bins):
+        upper_mask = rounded <= upper if math.isinf(upper) else rounded < upper
+        mask = finite & (rounded >= lower) & upper_mask
+        targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
+    return targets
+
+
+def _print_single_interaction_count_head(
+    prefix: str,
+    target_name: str,
+    bin_labels: tuple[str, ...],
+    bins: tuple[tuple[str, float, float], ...],
+    logits: torch.Tensor,
+    predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+) -> None:
+    target_idx = PHYSICS_TARGET_NAMES.index(target_name)
+    raw_targets = physics_raw_targets[:, target_idx]
+    target_labels = _interaction_count_bin_targets(raw_targets, bins)
+    valid_mask = (target_labels >= 0) & physics_masks[:, target_idx].bool()
+    print(f"{prefix}_count={int(valid_mask.sum().item())}")
+    print(
+        f"{prefix}_bin_label_order="
+        + ",".join(bin_labels)
+    )
+    if not bool(valid_mask.any()):
+        print(f"{prefix}_head_accuracy=nan")
+        print(f"{prefix}_head_adjacent_accuracy=nan")
+        print(f"{prefix}_head_far_miss_fraction=nan")
+        print(f"{prefix}_head_MAE=nan")
+        print(f"{prefix}_head_RMSE=nan")
+        print(f"{prefix}_head_signed_mean=nan")
+        print(f"{prefix}_head_pearson=nan")
+        print(f"{prefix}_target_mean=nan")
+        print(f"{prefix}_target_std=nan")
+        print(f"{prefix}_target_min=nan")
+        print(f"{prefix}_target_p50=nan")
+        print(f"{prefix}_target_p90=nan")
+        print(f"{prefix}_target_p99=nan")
+        print(f"{prefix}_target_max=nan")
+        print(f"{prefix}_mean_baseline_MAE=nan")
+        print(f"{prefix}_median_baseline_MAE=nan")
+        print(f"{prefix}_head_confusion=nan")
+        for group in ("los", "nlos"):
+            print(f"{prefix}_{group}_count=0")
+            print(f"{prefix}_{group}_head_MAE=nan")
+            print(f"{prefix}_{group}_head_RMSE=nan")
+            print(f"{prefix}_{group}_head_signed_mean=nan")
+        return
+
+    valid_targets = target_labels[valid_mask]
+    valid_raw_targets = raw_targets[valid_mask].to(dtype=predictions.dtype)
+    target_quantiles = torch.quantile(
+        valid_raw_targets.float(),
+        torch.tensor([0.5, 0.9, 0.99], dtype=torch.float32),
+    )
+    target_mean = valid_raw_targets.mean()
+    target_median = valid_raw_targets.median()
+    predicted_labels = logits.argmax(dim=1)
+    valid_predictions = predicted_labels[valid_mask]
+    confusion = torch.zeros(len(bin_labels), len(bin_labels), dtype=torch.long)
+    for target_label, predicted_label in zip(
+        valid_targets.tolist(),
+        valid_predictions.tolist(),
+    ):
+        confusion[int(target_label), int(predicted_label)] += 1
+    adjacent_hits = (valid_predictions - valid_targets).abs() <= 1
+    far_misses = (valid_predictions - valid_targets).abs() > 1
+    print(
+        f"{prefix}_head_accuracy="
+        f"{float((valid_predictions == valid_targets).float().mean()):.4f}"
+    )
+    print(
+        f"{prefix}_head_adjacent_accuracy="
+        f"{float(adjacent_hits.float().mean()):.4f}"
+    )
+    print(
+        f"{prefix}_head_far_miss_fraction="
+        f"{float(far_misses.float().mean()):.4f}"
+    )
+    scale = PHYSICS_TARGET_SCALES[target_idx].to(dtype=predictions.dtype)
+    offset = PHYSICS_TARGET_OFFSETS[target_idx].to(dtype=predictions.dtype)
+    raw_predictions = predictions * scale + offset
+    valid_raw_predictions = raw_predictions[valid_mask]
+    errors = valid_raw_predictions - valid_raw_targets
+    print(f"{prefix}_head_MAE={float(errors.abs().mean()):.4f}")
+    print(f"{prefix}_head_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
+    print(f"{prefix}_head_signed_mean={float(errors.mean()):.4f}")
+    print(
+        f"{prefix}_head_pearson="
+        f"{_safe_pearson(valid_raw_predictions.float(), valid_raw_targets.float()):.4f}"
+    )
+    print(f"{prefix}_target_mean={float(target_mean):.4f}")
+    print(f"{prefix}_target_std={float(valid_raw_targets.float().std(correction=0)):.4f}")
+    print(f"{prefix}_target_min={float(valid_raw_targets.min()):.4f}")
+    print(f"{prefix}_target_p50={float(target_quantiles[0]):.4f}")
+    print(f"{prefix}_target_p90={float(target_quantiles[1]):.4f}")
+    print(f"{prefix}_target_p99={float(target_quantiles[2]):.4f}")
+    print(f"{prefix}_target_max={float(valid_raw_targets.max()):.4f}")
+    print(
+        f"{prefix}_mean_baseline_MAE="
+        f"{float((valid_raw_targets - target_mean).abs().mean()):.4f}"
+    )
+    print(
+        f"{prefix}_median_baseline_MAE="
+        f"{float((valid_raw_targets - target_median).abs().mean()):.4f}"
+    )
+    print(
+        f"{prefix}_target_histogram="
+        + ",".join(
+            f"{label}:{int((valid_targets == idx).sum().item())}"
+            for idx, label in enumerate(bin_labels)
+        )
+    )
+    print(
+        f"{prefix}_head_confusion="
+        + ";".join(
+            f"{bin_labels[row]}:"
+            + ",".join(
+                f"{bin_labels[col]}:{int(confusion[row, col].item())}"
+                for col in range(len(bin_labels))
+            )
+            for row in range(len(bin_labels))
+        )
+    )
+    print(
+        f"{prefix}_prediction_histogram="
+        + ",".join(
+            f"{label}:{int((valid_predictions == idx).sum().item())}"
+            for idx, label in enumerate(bin_labels)
+        )
+    )
+
+    los_mask = torch.tensor(
+        [key.los_status == "los" for key in semantic_keys],
+        dtype=torch.bool,
+        device=valid_mask.device,
+    )
+
+    def print_group(prefix_suffix: str, group_mask: torch.Tensor) -> None:
+        mask = valid_mask & group_mask
+        count = int(mask.sum().item())
+        print(f"{prefix}_{prefix_suffix}_count={count}")
+        if count == 0:
+            print(f"{prefix}_{prefix_suffix}_head_MAE=nan")
+            print(f"{prefix}_{prefix_suffix}_head_RMSE=nan")
+            print(f"{prefix}_{prefix_suffix}_head_signed_mean=nan")
+            return
+        group_errors = raw_predictions[mask] - raw_targets[mask].to(
+            dtype=predictions.dtype
+        )
+        print(
+            f"{prefix}_{prefix_suffix}_head_MAE="
+            f"{float(group_errors.abs().mean()):.4f}"
+        )
+        print(
+            f"{prefix}_{prefix_suffix}_head_RMSE="
+            f"{float(torch.sqrt(group_errors.square().mean())):.4f}"
+        )
+        print(
+            f"{prefix}_{prefix_suffix}_head_signed_mean="
+            f"{float(group_errors.mean()):.4f}"
+        )
+
+    print_group("los", los_mask)
+    print_group("nlos", ~los_mask)
+
+
+def _print_interaction_count_head_diagnostics(
+    reflection_logits: torch.Tensor,
+    reflection_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+) -> None:
+    _print_single_interaction_count_head(
+        "reflection_count",
+        "reflection_count",
+        REFLECTION_COUNT_BIN_LABELS,
+        REFLECTION_COUNT_DIAGNOSTIC_BINS,
+        reflection_logits,
+        reflection_predictions,
+        physics_raw_targets,
+        physics_masks,
+        semantic_keys,
+    )
+
+
 def _print_angle_diagnostics(
     prefix: str,
     predictions: torch.Tensor,
@@ -1825,21 +2217,12 @@ def _print_angle_diagnostics(
     print(f"{prefix}_count={count}")
     if count == 0:
         print(f"{prefix}_MAE=nan")
-        print(f"{prefix}_median_error=nan")
-        print(f"{prefix}_p90_error=nan")
-        print(f"{prefix}_accuracy@5deg=nan")
         print(f"{prefix}_accuracy@10deg=nan")
-        print(f"{prefix}_accuracy@15deg=nan")
         print(f"{prefix}_accuracy@30deg=nan")
-        print(f"{prefix}_loss=nan")
-        print(f"{prefix}_cosine_mean=nan")
         print(f"{prefix}_signed_mean=nan")
-        print(f"{prefix}_prediction_norm_mean=nan")
         return
-    raw_prediction_norm = torch.linalg.vector_norm(predictions[mask].float(), dim=-1)
     valid_predictions = F.normalize(predictions[mask], dim=-1, eps=1e-6)
     valid_targets = F.normalize(targets[mask], dim=-1, eps=1e-6)
-    cosine = (valid_predictions * valid_targets).sum(dim=-1).clamp(-1.0, 1.0)
     predicted_angle = torch.atan2(valid_predictions[:, 0], valid_predictions[:, 1])
     target_angle = torch.atan2(valid_targets[:, 0], valid_targets[:, 1])
     signed_angle_error = torch.atan2(
@@ -1849,17 +2232,12 @@ def _print_angle_diagnostics(
     angle_error_deg = signed_angle_error.abs() * (180.0 / math.pi)
     signed_error_deg = signed_angle_error * (180.0 / math.pi)
     print(f"{prefix}_MAE={float(angle_error_deg.mean()):.4f}")
-    print(f"{prefix}_median_error={float(angle_error_deg.median()):.4f}")
-    print(f"{prefix}_p90_error={float(torch.quantile(angle_error_deg.float(), 0.9)):.4f}")
-    for threshold in (5.0, 10.0, 15.0, 30.0):
+    for threshold in (10.0, 30.0):
         print(
             f"{prefix}_accuracy@{_format_scalar(threshold)}deg="
             f"{float((angle_error_deg <= threshold).float().mean()):.4f}"
         )
-    print(f"{prefix}_loss={float((1.0 - cosine).mean()):.4f}")
-    print(f"{prefix}_cosine_mean={float(cosine.mean()):.4f}")
     print(f"{prefix}_signed_mean={float(signed_error_deg.mean()):.4f}")
-    print(f"{prefix}_prediction_norm_mean={float(raw_prediction_norm.mean()):.4f}")
 
 
 def _metric_suffix(value: str) -> str:
@@ -1937,14 +2315,6 @@ def _print_first_path_angle_diagnostics(
         targets=targets,
         mask=mask & ~los_mask,
     )
-    for field in ("first_delay_bin", "path_richness", "k_factor_bin"):
-        _print_first_path_angle_nlos_bucket_diagnostics(
-            predictions=predictions,
-            targets=targets,
-            valid_mask=mask,
-            semantic_keys=semantic_keys,
-            field=field,
-        )
 
 
 def _strong_k_targets(
@@ -2140,6 +2510,130 @@ def _print_structured_physical_description_metrics(
             f"physical_description_example_{idx + 1}_true_text="
             f"{_render_physical_description(target_record)}"
         )
+
+
+def _build_signal_description_payload(
+    *,
+    samples,
+    physics_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+    prototype_logits: torch.Tensor,
+    prototype_keys: list[SemanticKey],
+    semantic_logits: torch.Tensor | None,
+    los_delay_predictions: torch.Tensor,
+    los_delay_raw_targets: torch.Tensor,
+    los_delay_masks: torch.Tensor,
+    los_angle_predictions: torch.Tensor,
+    los_angle_targets: torch.Tensor,
+    los_angle_masks: torch.Tensor,
+    reflection_count_predictions: torch.Tensor,
+) -> dict:
+    raw_predictions = _physics_raw_predictions(physics_predictions).cpu()
+    physics_raw_targets = physics_raw_targets.cpu()
+    predicted_labels = (
+        semantic_logits.argmax(dim=1).cpu()
+        if semantic_logits is not None
+        else prototype_logits.argmax(dim=1).cpu()
+    )
+    los_delay_raw_predictions = (los_delay_predictions.cpu() * 3000.0)
+    los_angle_predictions = los_angle_predictions.cpu()
+    los_angle_targets = los_angle_targets.cpu()
+    los_delay_raw_targets = los_delay_raw_targets.cpu()
+    los_delay_masks = los_delay_masks.cpu().bool()
+    los_angle_masks = los_angle_masks.cpu().bool()
+    reflection_idx = _physics_target_index("reflection_count")
+    reflection_raw_predictions = (
+        reflection_count_predictions.cpu()
+        * PHYSICS_TARGET_SCALES[reflection_idx]
+        + PHYSICS_TARGET_OFFSETS[reflection_idx]
+    )
+
+    predicted_records = []
+    target_records = []
+    predicted_texts = []
+    target_texts = []
+    comparisons = []
+    for idx in range(raw_predictions.shape[0]):
+        predicted_key = prototype_keys[int(predicted_labels[idx])]
+        target_key = semantic_keys[idx]
+        predicted_record = _signal_description_record(
+            predicted_key,
+            raw_predictions[idx],
+            los_delay_ns=float(los_delay_raw_predictions[idx]),
+            los_angle_sincos=los_angle_predictions[idx],
+            reflection_count=float(reflection_raw_predictions[idx]),
+        )
+        target_record = _signal_description_record(
+            target_key,
+            physics_raw_targets[idx],
+            los_delay_ns=(
+                float(los_delay_raw_targets[idx])
+                if bool(los_delay_masks[idx])
+                else math.nan
+            ),
+            los_angle_sincos=(
+                los_angle_targets[idx]
+                if bool(los_angle_masks[idx])
+                else None
+            ),
+            reflection_count=float(physics_raw_targets[idx, reflection_idx]),
+        )
+        predicted_text = _render_signal_description(predicted_record)
+        target_text = _render_signal_description(target_record)
+        predicted_records.append(predicted_record)
+        target_records.append(target_record)
+        predicted_texts.append(predicted_text)
+        target_texts.append(target_text)
+        sample = samples[idx]
+        comparisons.append(
+            {
+                "index": idx,
+                "group_id": getattr(sample, "group_id", ""),
+                "config_key": getattr(sample, "config_key", ""),
+                "predicted_signal_description": predicted_text,
+                "target_signal_description": target_text,
+                "predicted_record": predicted_record,
+                "target_record": target_record,
+            }
+        )
+
+    return {
+        "predicted_signal_descriptions": predicted_texts,
+        "target_signal_descriptions": target_texts,
+        "predicted_signal_records": predicted_records,
+        "target_signal_records": target_records,
+        "comparisons": comparisons,
+        "predicted_semantic_labels": predicted_labels,
+        "physics_raw_predictions": raw_predictions,
+        "physics_raw_targets": physics_raw_targets,
+        "los_delay_raw_predictions": los_delay_raw_predictions,
+        "los_delay_raw_targets": los_delay_raw_targets,
+        "los_angle_predictions": los_angle_predictions,
+        "los_angle_targets": los_angle_targets,
+        "reflection_count_raw_predictions": reflection_raw_predictions,
+    }
+
+
+def _print_signal_description_examples(payload: dict, example_count: int) -> None:
+    predicted_texts = payload["predicted_signal_descriptions"]
+    target_texts = payload["target_signal_descriptions"]
+    for idx in range(min(example_count, len(predicted_texts))):
+        print(
+            f"signal_description_example_{idx + 1}_pred_text="
+            f"{predicted_texts[idx]}"
+        )
+        print(
+            f"signal_description_example_{idx + 1}_true_text="
+            f"{target_texts[idx]}"
+        )
+
+
+def _save_signal_description_payload(path: str, payload: dict) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, output_path)
+    print(f"saved_signal_descriptions={output_path}")
 
 
 def _print_first_path_power_diagnostics(
@@ -2453,6 +2947,7 @@ def _print_delay_spread_diagnostics(
     delay_spread_bin_positions: torch.Tensor | None,
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
+    raw_beta_ns: float,
 ) -> None:
     del base_physics_predictions
     del csi_delay_spread_predictions
@@ -2463,30 +2958,90 @@ def _print_delay_spread_diagnostics(
     delay_spread_mask = physics_masks[:, delay_spread_idx]
     if not bool(delay_spread_mask.any()):
         print("delay_context_spread_MAE=nan")
+        print("delay_context_spread_normalized_MAE=nan")
+        print("delay_context_spread_normalized_smooth_l1=nan")
+        print("delay_context_spread_raw_huber=nan")
         print("final_delay_spread_MAE=nan")
+        print("final_delay_spread_normalized_MAE=nan")
+        print("final_delay_spread_normalized_smooth_l1=nan")
+        print("final_delay_spread_raw_huber=nan")
         return
 
     final_physics_raw_predictions = _physics_raw_predictions(physics_predictions)
+    target_scale = PHYSICS_TARGET_SCALES[delay_spread_idx].to(
+        device=physics_raw_targets.device,
+        dtype=physics_raw_targets.dtype,
+    )
+    target_offset = PHYSICS_TARGET_OFFSETS[delay_spread_idx].to(
+        device=physics_raw_targets.device,
+        dtype=physics_raw_targets.dtype,
+    )
     delay_context_raw_predictions = None
     if delay_spread_context_predictions is not None:
         delay_context_raw_predictions = (
-            delay_spread_context_predictions * PHYSICS_TARGET_SCALES[delay_spread_idx]
-            + PHYSICS_TARGET_OFFSETS[delay_spread_idx]
+            delay_spread_context_predictions * target_scale
+            + target_offset
         )
 
     masked_final_raw = final_physics_raw_predictions[delay_spread_mask, delay_spread_idx]
     masked_target_raw = physics_raw_targets[delay_spread_mask, delay_spread_idx]
+    masked_final_normalized = physics_predictions[delay_spread_mask, delay_spread_idx]
+    masked_target_normalized = (masked_target_raw - target_offset) / target_scale
     masked_delay_context_raw = (
         delay_context_raw_predictions[delay_spread_mask]
         if delay_context_raw_predictions is not None
         else None
     )
+    masked_delay_context_normalized = (
+        delay_spread_context_predictions[delay_spread_mask]
+        if delay_spread_context_predictions is not None
+        else None
+    )
 
-    if masked_delay_context_raw is not None:
+    def _smooth_l1_mean(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.smooth_l1_loss(predictions, targets, reduction="mean")
+
+    def _raw_huber_mean(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        beta = max(float(raw_beta_ns), 1e-6)
+        abs_error = (predictions - targets).abs()
+        return torch.where(
+            abs_error < beta,
+            0.5 * abs_error.square() / beta,
+            abs_error - 0.5 * beta,
+        ).mean()
+
+    if masked_delay_context_raw is not None and masked_delay_context_normalized is not None:
         print(f"delay_context_spread_MAE={float((masked_delay_context_raw - masked_target_raw).abs().mean()):.4f}")
+        print(
+            "delay_context_spread_normalized_MAE="
+            f"{float((masked_delay_context_normalized - masked_target_normalized).abs().mean()):.4f}"
+        )
+        print(
+            "delay_context_spread_normalized_smooth_l1="
+            f"{float(_smooth_l1_mean(masked_delay_context_normalized, masked_target_normalized)):.4f}"
+        )
+        print(
+            "delay_context_spread_raw_huber="
+            f"{float(_raw_huber_mean(masked_delay_context_raw, masked_target_raw)):.4f}"
+        )
     else:
         print("delay_context_spread_MAE=nan")
+        print("delay_context_spread_normalized_MAE=nan")
+        print("delay_context_spread_normalized_smooth_l1=nan")
+        print("delay_context_spread_raw_huber=nan")
     print(f"final_delay_spread_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
+    print(
+        "final_delay_spread_normalized_MAE="
+        f"{float((masked_final_normalized - masked_target_normalized).abs().mean()):.4f}"
+    )
+    print(
+        "final_delay_spread_normalized_smooth_l1="
+        f"{float(_smooth_l1_mean(masked_final_normalized, masked_target_normalized)):.4f}"
+    )
+    print(
+        "final_delay_spread_raw_huber="
+        f"{float(_raw_huber_mean(masked_final_raw, masked_target_raw)):.4f}"
+    )
     if delay_spread_bin_logits is not None:
         masked_bin_logits = delay_spread_bin_logits[delay_spread_mask]
         masked_bin_positions = (
@@ -2755,6 +3310,13 @@ def main() -> None:
         default=3,
         help="How many structured physical caption prediction examples to print.",
     )
+    parser.add_argument(
+        "--save-signal-descriptions",
+        help=(
+            "Optional .pt path for predicted-vs-target signal description texts "
+            "and their structured records."
+        ),
+    )
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     evaluate(
@@ -2782,6 +3344,7 @@ def main() -> None:
         max_delay_spread_ns_override=args.max_delay_spread_ns,
         attribute_binary_thresholds=parse_attribute_binary_thresholds(args.attribute_binary_threshold),
         physical_caption_examples=args.physical_caption_examples,
+        save_signal_descriptions_path=args.save_signal_descriptions,
     )
 
 

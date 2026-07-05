@@ -13,6 +13,7 @@ K_FACTOR_STRONG_BIN_LABELS = ("low", "mid", "high", "very_high")
 DELAY_SPREAD_BIN_LABELS = ("0_25", "25_50", "50_100", "100_200", "200_400", "400_plus")
 DELAY_SPREAD_TAIL_LABELS = ("ge100", "ge200")
 DELAY_SPREAD_TAIL_THRESHOLDS_NS = (100.0, 200.0)
+REFLECTION_COUNT_BIN_LABELS = ("0_5", "6_7", "8_10", "11_13", "14_plus")
 CSI_DELAY_CONTEXT_DIM = 64
 DELAY_SPREAD_POSITION_BINS = (
     ("0_25", 0.0, 25.0),
@@ -716,6 +717,9 @@ class CSIClip(nn.Module):
         self.power_context_dim = embed_dim + 32 + 32
         self.delay_profile_stats_dim = 14
         self.delay_profile_context_dim = 32 + 32 + self.delay_profile_stats_dim
+        self.interaction_count_context_dim = (
+            embed_dim + self.csi_delay_context_dim + 32 + self.delay_profile_stats_dim
+        )
         self.delay_spread_index = 1
         self.first_path_delay_index = 4
         self.first_path_power_index = 5
@@ -729,6 +733,7 @@ class CSIClip(nn.Module):
         self.k_factor_strong_bin_labels = K_FACTOR_STRONG_BIN_LABELS
         self.delay_spread_bin_labels = DELAY_SPREAD_BIN_LABELS
         self.delay_spread_tail_labels = DELAY_SPREAD_TAIL_LABELS
+        self.reflection_count_bin_labels = REFLECTION_COUNT_BIN_LABELS
         self.first_path_delay_bin_labels = FIRST_PATH_DELAY_BIN_LABELS
         self.physics_head = nn.Sequential(
             nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
@@ -844,6 +849,18 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, len(self.delay_spread_tail_labels)),
         )
+        self.reflection_count_classifier = nn.Sequential(
+            nn.LayerNorm(self.interaction_count_context_dim),
+            nn.Linear(self.interaction_count_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(self.reflection_count_bin_labels)),
+        )
+        self.reflection_count_regression_head = nn.Sequential(
+            nn.LayerNorm(self.interaction_count_context_dim),
+            nn.Linear(self.interaction_count_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
         self.first_path_power_bin_classifier = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, hidden_dim),
@@ -940,6 +957,8 @@ class CSIClip(nn.Module):
             *self.first_path_angle_fusion_head.modules(),
             *self.first_path_angle_selector_fusion_head.modules(),
             *self.delay_spread_tail_classifier.modules(),
+            *self.reflection_count_classifier.modules(),
+            *self.reflection_count_regression_head.modules(),
         ):
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=1e-3)
@@ -1304,6 +1323,35 @@ class CSIClip(nn.Module):
                 torch.cat([first_path_angle_input, first_path_angle_context], dim=-1)
             )
         delay_spread_tail_logits = self.delay_spread_tail_classifier(delay_head_input)
+        if power_context is None:
+            raw_power_context = torch.zeros(
+                csi_features.shape[0],
+                32,
+                device=csi_features.device,
+                dtype=csi_features.dtype,
+            )
+            delay_profile_stats = torch.zeros(
+                csi_features.shape[0],
+                self.delay_profile_stats_dim,
+                device=csi_features.device,
+                dtype=csi_features.dtype,
+            )
+        else:
+            raw_power_context = power_context["raw_power_context"]
+            delay_profile_stats = power_context["delay_profile_stats"]
+        interaction_count_input = torch.cat(
+            [
+                csi_features,
+                delay_context,
+                raw_power_context,
+                delay_profile_stats,
+            ],
+            dim=-1,
+        )
+        reflection_count_logits = self.reflection_count_classifier(interaction_count_input)
+        reflection_count_prediction = self.reflection_count_regression_head(
+            interaction_count_input
+        ).squeeze(-1)
         first_path_power_bin_logits = self.first_path_power_bin_classifier(
             csi_features
         )
@@ -1351,6 +1399,8 @@ class CSIClip(nn.Module):
                 "delay_spread_bin_logits": delay_spread_bin_logits,
                 "delay_spread_bin_position": delay_spread_bin_position,
                 "delay_spread_tail_logits": delay_spread_tail_logits,
+                "reflection_count_logits": reflection_count_logits,
+                "reflection_count_prediction": reflection_count_prediction,
                 "first_path_power_bin_logits": first_path_power_bin_logits,
                 "first_path_power_bin_position": first_path_power_bin_position,
                 "k_factor_strong_bin_logits": k_factor_strong_bin_logits,
@@ -1443,6 +1493,8 @@ class CSIClip(nn.Module):
             "delay_spread_bin_logits": delay_spread_bin_logits,
             "delay_spread_bin_position": delay_spread_bin_position,
             "delay_spread_tail_logits": delay_spread_tail_logits,
+            "reflection_count_logits": reflection_count_logits,
+            "reflection_count_prediction": reflection_count_prediction,
             "first_path_power_bin_logits": first_path_power_bin_logits,
             "first_path_power_bin_position": first_path_power_bin_position,
             "k_factor_strong_bin_logits": k_factor_strong_bin_logits,

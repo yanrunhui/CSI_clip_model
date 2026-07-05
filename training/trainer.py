@@ -20,6 +20,7 @@ from models.model import (
     DELAY_SPREAD_TAIL_THRESHOLDS_NS,
     FIRST_PATH_DELAY_BIN_LABELS,
     FIRST_PATH_DELAY_POSITION_BINS,
+    REFLECTION_COUNT_BIN_LABELS,
 )
 
 from .losses import (
@@ -79,6 +80,12 @@ class TrainConfig:
     delay_spread_bin_classifier_weight: float = 0.0
     delay_spread_bin_position_weight: float = 0.0
     delay_spread_tail_classifier_weight: float = 0.0
+    interaction_count_classifier_weight: float = 0.0
+    interaction_count_regression_weight: float = 0.0
+    reflection_count_classifier_weight: float = 0.0
+    reflection_count_regression_weight: float = 0.0
+    reflection_count_nlos_weight: float = 1.0
+    interaction_count_soft_labels: bool = False
     first_path_power_bin_classifier_weight: float = 0.0
     first_path_power_bin_position_weight: float = 0.0
     first_path_power_bin_weights: dict[str, float] | None = None
@@ -115,6 +122,14 @@ class Trainer:
     DELAY_SPREAD_BIN_LABELS = DELAY_SPREAD_BIN_LABELS
     DELAY_SPREAD_TAIL_LABELS = DELAY_SPREAD_TAIL_LABELS
     DELAY_SPREAD_TAIL_THRESHOLDS_NS = DELAY_SPREAD_TAIL_THRESHOLDS_NS
+    REFLECTION_COUNT_BIN_LABELS = REFLECTION_COUNT_BIN_LABELS
+    REFLECTION_COUNT_BINS = (
+        ("0_5", 0.0, 6.0),
+        ("6_7", 6.0, 8.0),
+        ("8_10", 8.0, 11.0),
+        ("11_13", 11.0, 14.0),
+        ("14_plus", 14.0, float("inf")),
+    )
     DELAY_SPREAD_POSITION_BINS = DELAY_SPREAD_POSITION_BINS
     DELAY_SPREAD_BINS = (
         *DELAY_SPREAD_POSITION_BINS,
@@ -303,6 +318,34 @@ class Trainer:
                 f"out_features={delay_spread_tail_linear.out_features} "
                 f"labels={self.DELAY_SPREAD_TAIL_LABELS}."
             )
+        reflection_count_labels = tuple(
+            getattr(model, "reflection_count_bin_labels", self.REFLECTION_COUNT_BIN_LABELS)
+        )
+        if reflection_count_labels != self.REFLECTION_COUNT_BIN_LABELS:
+            raise ValueError(
+                "reflection-count bin label order mismatch: "
+                f"model={reflection_count_labels} "
+                f"trainer={self.REFLECTION_COUNT_BIN_LABELS}."
+            )
+        reflection_count_linear = self._last_linear(
+            getattr(model, "reflection_count_classifier", None)
+        )
+        if (
+            reflection_count_linear is not None
+            and reflection_count_linear.out_features != len(self.REFLECTION_COUNT_BIN_LABELS)
+        ):
+            raise ValueError(
+                "reflection-count classifier output size mismatch: "
+                f"out_features={reflection_count_linear.out_features} "
+                f"labels={self.REFLECTION_COUNT_BIN_LABELS}."
+            )
+        for name in ("reflection_count_regression_head",):
+            linear = self._last_linear(getattr(model, name, None))
+            if linear is not None and linear.out_features != 1:
+                raise ValueError(
+                    f"{name} output size mismatch: "
+                    f"out_features={linear.out_features}, expected 1."
+                )
 
     def _attribute_targets(self, semantic_keys: list[object]) -> dict[str, torch.Tensor]:
         targets = {}
@@ -741,6 +784,74 @@ class Trainer:
             targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
         return targets
 
+    def _interaction_count_bin_targets(
+        self,
+        raw_count: torch.Tensor,
+        bins: tuple[tuple[str, float, float], ...],
+    ) -> torch.Tensor:
+        targets = torch.full_like(raw_count, fill_value=-1, dtype=torch.long)
+        finite = torch.isfinite(raw_count)
+        rounded = raw_count.round()
+        for class_idx, (_, lower, upper) in enumerate(bins):
+            upper_mask = rounded <= upper if math.isinf(upper) else rounded < upper
+            mask = finite & (rounded >= lower) & upper_mask
+            targets = torch.where(mask, torch.full_like(targets, class_idx), targets)
+        return targets
+
+    def _interaction_count_soft_targets(
+        self,
+        hard_targets: torch.Tensor,
+        num_classes: int,
+        target_mass: float = 0.8,
+    ) -> torch.Tensor:
+        soft_targets = torch.zeros(
+            hard_targets.shape[0],
+            num_classes,
+            device=hard_targets.device,
+            dtype=torch.float32,
+        )
+        soft_targets.scatter_(1, hard_targets.unsqueeze(1), target_mass)
+        neighbor_mass = (1.0 - target_mass) * 0.5
+        previous_mask = hard_targets > 0
+        if bool(previous_mask.any()):
+            soft_targets[
+                previous_mask,
+                hard_targets[previous_mask] - 1,
+            ] += neighbor_mass
+        next_mask = hard_targets < num_classes - 1
+        if bool(next_mask.any()):
+            soft_targets[
+                next_mask,
+                hard_targets[next_mask] + 1,
+            ] += neighbor_mass
+        return soft_targets / soft_targets.sum(dim=1, keepdim=True).clamp(min=1e-12)
+
+    def _reflection_count_sample_weights(
+        self,
+        semantic_keys: list[object],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        cfg: TrainConfig,
+    ) -> torch.Tensor:
+        weights = torch.ones(len(semantic_keys), device=device, dtype=dtype)
+        nlos_weight = float(cfg.reflection_count_nlos_weight)
+        if nlos_weight != 1.0:
+            nlos_mask = torch.tensor(
+                [
+                    getattr(key, "los_status", None) != "los"
+                    for key in semantic_keys
+                ],
+                dtype=torch.bool,
+                device=device,
+            )
+            weights = torch.where(
+                nlos_mask,
+                weights * nlos_weight,
+                weights,
+            )
+        return weights
+
     def _first_path_power_bin_class_weight(
         self,
         dtype: torch.dtype,
@@ -1004,6 +1115,22 @@ class Trainer:
         effective_delay_spread_tail_classifier_weight = (
             0.0 if warmup_active else cfg.delay_spread_tail_classifier_weight
         )
+        effective_reflection_count_classifier_weight = (
+            0.0
+            if warmup_active
+            else max(
+                cfg.reflection_count_classifier_weight,
+                cfg.interaction_count_classifier_weight,
+            )
+        )
+        effective_reflection_count_regression_weight = (
+            0.0
+            if warmup_active
+            else max(
+                cfg.reflection_count_regression_weight,
+                cfg.interaction_count_regression_weight,
+            )
+        )
         self.optimizer.zero_grad(set_to_none=True)
         csi_features_raw = self.model.encode_csi(
             batch["tokens"],
@@ -1085,6 +1212,10 @@ class Trainer:
         delay_spread_tail_false_positive = None
         delay_spread_tail_positive_fraction = None
         delay_spread_tail_prediction_fraction = None
+        reflection_count_accuracy = None
+        reflection_count_mae = None
+        reflection_count_target_histogram = None
+        reflection_count_prediction_histogram = None
         if (
             effective_aux_regression_weight > 0
             or effective_strong_k_bin_classifier_weight > 0.0
@@ -1110,6 +1241,8 @@ class Trainer:
             or effective_los_angle_weight > 0.0
             or effective_first_path_angle_weight > 0.0
             or effective_first_path_angle_nlos_weight > 0.0
+            or effective_reflection_count_classifier_weight > 0.0
+            or effective_reflection_count_regression_weight > 0.0
         ):
             power_context = None
             delay_context = None
@@ -1598,6 +1731,103 @@ class Trainer:
                 )
                 delay_spread_tail_positive_fraction = valid_targets.mean(dim=0)
                 delay_spread_tail_prediction_fraction = tail_predictions.float().mean(dim=0)
+        if (
+            physics_outputs is not None
+            and effective_reflection_count_classifier_weight > 0.0
+        ):
+            target_idx = PHYSICS_TARGET_NAMES.index("reflection_count")
+            logits = physics_outputs["reflection_count_logits"]
+            targets = self._interaction_count_bin_targets(
+                batch["physics_raw_targets"][:, target_idx],
+                self.REFLECTION_COUNT_BINS,
+            )
+            mask = (
+                (targets >= 0)
+                & batch["physics_target_mask"][:, target_idx].bool()
+            )
+            if bool(mask.any()):
+                valid_logits = logits[mask]
+                valid_targets = targets[mask]
+                sample_weight = self._reflection_count_sample_weights(
+                    batch["semantic_keys"],
+                    device=valid_logits.device,
+                    dtype=valid_logits.dtype,
+                    cfg=cfg,
+                )[mask]
+                if cfg.interaction_count_soft_labels:
+                    soft_targets = self._interaction_count_soft_targets(
+                        valid_targets,
+                        len(self.REFLECTION_COUNT_BIN_LABELS),
+                    ).to(dtype=valid_logits.dtype)
+                    per_sample_classifier_loss = -(
+                        soft_targets
+                        * torch.nn.functional.log_softmax(valid_logits, dim=1)
+                    ).sum(dim=1)
+                else:
+                    per_sample_classifier_loss = torch.nn.functional.cross_entropy(
+                        valid_logits,
+                        valid_targets,
+                        reduction="none",
+                    )
+                loss = (
+                    (per_sample_classifier_loss * sample_weight).sum()
+                    / sample_weight.sum().clamp(min=1.0)
+                )
+                predictions = valid_logits.argmax(dim=1)
+                reflection_count_accuracy = (predictions == valid_targets).float().mean()
+                reflection_count_target_histogram = self._histogram(
+                    valid_targets,
+                    len(self.REFLECTION_COUNT_BIN_LABELS),
+                )
+                reflection_count_prediction_histogram = self._histogram(
+                    predictions,
+                    len(self.REFLECTION_COUNT_BIN_LABELS),
+                )
+                losses["loss_reflection_count_classifier"] = loss
+                losses["accuracy_reflection_count_classifier"] = reflection_count_accuracy
+                losses["loss_interaction_count_classifier"] = loss
+        if (
+            physics_outputs is not None
+            and effective_reflection_count_regression_weight > 0.0
+        ):
+            target_idx = PHYSICS_TARGET_NAMES.index("reflection_count")
+            prediction = physics_outputs["reflection_count_prediction"]
+            target = batch["physics_targets"][:, target_idx]
+            mask = batch["physics_target_mask"][:, target_idx].bool()
+            if bool(mask.any()):
+                sample_weight = self._reflection_count_sample_weights(
+                    batch["semantic_keys"],
+                    device=prediction.device,
+                    dtype=prediction.dtype,
+                    cfg=cfg,
+                )[mask]
+                errors = torch.nn.functional.smooth_l1_loss(
+                    prediction[mask],
+                    target[mask],
+                    reduction="none",
+                )
+                loss = (
+                    (errors * sample_weight).sum()
+                    / sample_weight.sum().clamp(min=1.0)
+                )
+                raw_scale = PHYSICS_TARGET_SCALES[target_idx].to(
+                    device=prediction.device,
+                    dtype=prediction.dtype,
+                )
+                raw_offset = PHYSICS_TARGET_OFFSETS[target_idx].to(
+                    device=prediction.device,
+                    dtype=prediction.dtype,
+                )
+                raw_prediction = prediction * raw_scale + raw_offset
+                raw_target = batch["physics_raw_targets"][:, target_idx].to(
+                    device=prediction.device,
+                    dtype=prediction.dtype,
+                )
+                reflection_count_mae = (
+                    raw_prediction[mask] - raw_target[mask]
+                ).abs().mean()
+                losses["loss_reflection_count_regression"] = loss
+                losses["loss_interaction_count_regression"] = loss
         if (
             physics_outputs is not None
             and effective_first_path_power_bin_classifier_weight > 0.0
@@ -2456,6 +2686,8 @@ class Trainer:
             effective_delay_spread_bin_classifier_weight * losses.get("loss_delay_spread_bin_classifier", torch.zeros((), device=self.device)) +
             effective_delay_spread_bin_position_weight * losses.get("loss_delay_spread_bin_position", torch.zeros((), device=self.device)) +
             effective_delay_spread_tail_classifier_weight * losses.get("loss_delay_spread_tail_classifier", torch.zeros((), device=self.device)) +
+            effective_reflection_count_classifier_weight * losses.get("loss_interaction_count_classifier", torch.zeros((), device=self.device)) +
+            effective_reflection_count_regression_weight * losses.get("loss_interaction_count_regression", torch.zeros((), device=self.device)) +
             cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device)) +
             effective_delay_spread_weight * losses.get("loss_delay_spread", torch.zeros((), device=self.device)) +
             effective_delay_spread_raw_weight * losses.get("loss_delay_spread_raw", torch.zeros((), device=self.device)) +
@@ -2735,6 +2967,39 @@ class Trainer:
                 metrics[f"delay_spread_tail_{label}_false_positive"] = float(
                     delay_spread_tail_false_positive[idx].detach()
                 )
+        metrics["reflection_count_classifier_weight"] = float(
+            effective_reflection_count_classifier_weight
+        )
+        metrics["reflection_count_regression_weight"] = float(
+            effective_reflection_count_regression_weight
+        )
+        metrics["interaction_count_classifier_weight"] = float(
+            effective_reflection_count_classifier_weight
+        )
+        metrics["interaction_count_regression_weight"] = float(
+            effective_reflection_count_regression_weight
+        )
+        metrics["reflection_count_nlos_weight"] = float(cfg.reflection_count_nlos_weight)
+        metrics["interaction_count_soft_labels"] = float(
+            cfg.interaction_count_soft_labels
+        )
+        metrics["reflection_count_bin_label_order"] = ",".join(
+            self.REFLECTION_COUNT_BIN_LABELS
+        )
+        if reflection_count_accuracy is not None:
+            metrics["accuracy_reflection_count_classifier"] = float(
+                reflection_count_accuracy.detach()
+            )
+        if reflection_count_mae is not None:
+            metrics["reflection_count_mae"] = float(reflection_count_mae.detach())
+        if reflection_count_target_histogram is not None:
+            metrics["reflection_count_target_histogram"] = self._format_histogram(
+                reflection_count_target_histogram
+            )
+        if reflection_count_prediction_histogram is not None:
+            metrics["reflection_count_prediction_histogram"] = self._format_histogram(
+                reflection_count_prediction_histogram
+            )
         metrics["strong_k_bin_classifier_weight"] = float(
             effective_strong_k_bin_classifier_weight
         )

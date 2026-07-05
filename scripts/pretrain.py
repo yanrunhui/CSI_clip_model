@@ -46,6 +46,7 @@ from models.model import (
     DELAY_SPREAD_TAIL_LABELS,
     FIRST_PATH_DELAY_BIN_LABELS,
     K_FACTOR_STRONG_BIN_LABELS,
+    REFLECTION_COUNT_BIN_LABELS,
 )
 from models.text_encoder import PhysicsTextEncoder
 from training.scheduler import build_lr_scheduler
@@ -1132,6 +1133,12 @@ def run_smoke_test(
     delay_spread_bin_classifier_weight: float = 0.0,
     delay_spread_bin_position_weight: float = 0.0,
     delay_spread_tail_classifier_weight: float = 0.0,
+    interaction_count_classifier_weight: float = 0.0,
+    interaction_count_regression_weight: float = 0.0,
+    reflection_count_classifier_weight: float = 0.0,
+    reflection_count_regression_weight: float = 0.0,
+    reflection_count_nlos_weight: float = 1.0,
+    interaction_count_soft_labels: bool = False,
     first_path_power_bin_classifier_weight: float = 0.0,
     first_path_power_bin_position_weight: float = 0.0,
     first_path_power_bin_weights: dict[str, float] | None = None,
@@ -1240,6 +1247,12 @@ def run_smoke_test(
                     delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
                     delay_spread_bin_position_weight=delay_spread_bin_position_weight,
                     delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
+                    interaction_count_classifier_weight=interaction_count_classifier_weight,
+                    interaction_count_regression_weight=interaction_count_regression_weight,
+                    reflection_count_classifier_weight=reflection_count_classifier_weight,
+                    reflection_count_regression_weight=reflection_count_regression_weight,
+                    reflection_count_nlos_weight=reflection_count_nlos_weight,
+                    interaction_count_soft_labels=interaction_count_soft_labels,
                     first_path_power_bin_weights=first_path_power_bin_weights,
                     first_path_power_nlos_weight=first_path_power_nlos_weight,
                     first_path_power_gate_mode=first_path_power_gate_mode,
@@ -1329,6 +1342,12 @@ def run_real_pretrain(
     delay_spread_bin_classifier_weight: float,
     delay_spread_bin_position_weight: float,
     delay_spread_tail_classifier_weight: float,
+    interaction_count_classifier_weight: float,
+    interaction_count_regression_weight: float,
+    reflection_count_classifier_weight: float,
+    reflection_count_regression_weight: float,
+    reflection_count_nlos_weight: float,
+    interaction_count_soft_labels: bool,
     first_path_power_bin_weights: dict[str, float],
     first_path_power_nlos_weight: float,
     first_path_power_gate_mode: str,
@@ -1471,6 +1490,12 @@ def run_real_pretrain(
         delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
         delay_spread_bin_position_weight=delay_spread_bin_position_weight,
         delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
+        interaction_count_classifier_weight=interaction_count_classifier_weight,
+        interaction_count_regression_weight=interaction_count_regression_weight,
+        reflection_count_classifier_weight=reflection_count_classifier_weight,
+        reflection_count_regression_weight=reflection_count_regression_weight,
+        reflection_count_nlos_weight=reflection_count_nlos_weight,
+        interaction_count_soft_labels=interaction_count_soft_labels,
         first_path_power_bin_weights=first_path_power_bin_weights,
         first_path_power_nlos_weight=first_path_power_nlos_weight,
         first_path_power_gate_mode=first_path_power_gate_mode,
@@ -1563,6 +1588,13 @@ def run_real_pretrain(
         f"delay_spread_bin_classifier_weight={delay_spread_bin_classifier_weight} "
         f"delay_spread_bin_position_weight={delay_spread_bin_position_weight} "
         f"delay_spread_tail_classifier_weight={delay_spread_tail_classifier_weight} "
+        f"reflection_count_classifier_weight={reflection_count_classifier_weight} "
+        f"reflection_count_regression_weight={reflection_count_regression_weight} "
+        f"reflection_count_nlos_weight={reflection_count_nlos_weight} "
+        f"interaction_count_soft_labels={interaction_count_soft_labels} "
+        f"interaction_count_classifier_weight={interaction_count_classifier_weight} "
+        f"interaction_count_regression_weight={interaction_count_regression_weight} "
+        f"reflection_count_bin_label_order={','.join(REFLECTION_COUNT_BIN_LABELS)} "
         f"delay_spread_bin_weights={format_delay_spread_bin_weights(delay_spread_bin_weights)} "
         f"delay_spread_bin_label_order={','.join(DELAY_SPREAD_BIN_LABELS)} "
         f"delay_spread_tail_label_order={','.join(DELAY_SPREAD_TAIL_LABELS)} "
@@ -2176,6 +2208,13 @@ def run_real_pretrain(
                         "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
                         "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
                         "delay_spread_tail_classifier_weight": delay_spread_tail_classifier_weight,
+                        "reflection_count_classifier_weight": reflection_count_classifier_weight,
+                        "reflection_count_regression_weight": reflection_count_regression_weight,
+                        "reflection_count_nlos_weight": reflection_count_nlos_weight,
+                        "interaction_count_soft_labels": interaction_count_soft_labels,
+                        "interaction_count_classifier_weight": interaction_count_classifier_weight,
+                        "interaction_count_regression_weight": interaction_count_regression_weight,
+                        "reflection_count_bin_label_order": list(REFLECTION_COUNT_BIN_LABELS),
                         "delay_spread_bin_weights": delay_spread_bin_weights,
                         "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
                         "delay_spread_tail_label_order": list(DELAY_SPREAD_TAIL_LABELS),
@@ -2287,6 +2326,14 @@ def run_real_pretrain(
                     "delay_spread_teacher_weight": delay_spread_teacher_weight,
                     "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
                     "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
+                    "delay_spread_tail_classifier_weight": delay_spread_tail_classifier_weight,
+                    "reflection_count_classifier_weight": reflection_count_classifier_weight,
+                    "reflection_count_regression_weight": reflection_count_regression_weight,
+                    "reflection_count_nlos_weight": reflection_count_nlos_weight,
+                    "interaction_count_soft_labels": interaction_count_soft_labels,
+                    "interaction_count_classifier_weight": interaction_count_classifier_weight,
+                    "interaction_count_regression_weight": interaction_count_regression_weight,
+                    "reflection_count_bin_label_order": list(REFLECTION_COUNT_BIN_LABELS),
                     "delay_spread_bin_weights": delay_spread_bin_weights,
                     "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
                     "first_path_power_bin_weights": first_path_power_bin_weights,
@@ -2612,6 +2659,50 @@ def main() -> None:
         "--delay-spread-tail-classifier-weight",
         type=float,
         help="Auxiliary binary classification weight for CSI-only delay-spread >=100ns/>=200ns prediction.",
+    )
+    parser.add_argument(
+        "--reflection-count-classifier-weight",
+        type=float,
+        help=(
+            "Auxiliary classification weight for total reflection-count bins "
+            "from global CSI, delay context, and power stats."
+        ),
+    )
+    parser.add_argument(
+        "--reflection-count-regression-weight",
+        type=float,
+        help=(
+            "Auxiliary regression weight for total reflection count "
+            "from global CSI, delay context, and power stats."
+        ),
+    )
+    parser.add_argument(
+        "--reflection-count-nlos-weight",
+        type=float,
+        help="Sample weight multiplier for NLoS reflection-count supervision.",
+    )
+    parser.add_argument(
+        "--interaction-count-soft-labels",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Use ordinal soft labels for interaction/reflection count classification."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-count-classifier-weight",
+        type=float,
+        help=(
+            "Auxiliary classification weight for total reflection-count bins "
+            "from global CSI, delay context, and power stats."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-count-regression-weight",
+        type=float,
+        help=(
+            "Auxiliary regression weight for total reflection count "
+            "from global CSI, delay context, and power stats."
+        ),
     )
     parser.add_argument(
         "--delay-spread-bin-weight",
@@ -3083,6 +3174,68 @@ def main() -> None:
         if args.delay_spread_tail_classifier_weight is not None
         else float(cfg_get(train_cfg, "delay_spread_tail_classifier_weight", 0.0))
     )
+    reflection_count_classifier_weight = (
+        args.reflection_count_classifier_weight
+        if args.reflection_count_classifier_weight is not None
+        else float(
+            cfg_get(
+                train_cfg,
+                "reflection_count_classifier_weight",
+                cfg_get(train_cfg, "interaction_count_classifier_weight", 0.0),
+            )
+        )
+    )
+    if reflection_count_classifier_weight < 0.0:
+        raise ValueError("--reflection-count-classifier-weight must be non-negative.")
+    reflection_count_regression_weight = (
+        args.reflection_count_regression_weight
+        if args.reflection_count_regression_weight is not None
+        else float(
+            cfg_get(
+                train_cfg,
+                "reflection_count_regression_weight",
+                cfg_get(train_cfg, "interaction_count_regression_weight", 0.0),
+            )
+        )
+    )
+    if reflection_count_regression_weight < 0.0:
+        raise ValueError("--reflection-count-regression-weight must be non-negative.")
+    reflection_count_nlos_weight = (
+        args.reflection_count_nlos_weight
+        if args.reflection_count_nlos_weight is not None
+        else float(cfg_get(train_cfg, "reflection_count_nlos_weight", 1.0))
+    )
+    if reflection_count_nlos_weight <= 0.0:
+        raise ValueError("--reflection-count-nlos-weight must be positive.")
+    interaction_count_soft_labels = (
+        args.interaction_count_soft_labels
+        if args.interaction_count_soft_labels is not None
+        else bool(cfg_get(train_cfg, "interaction_count_soft_labels", False))
+    )
+    interaction_count_classifier_weight = (
+        args.interaction_count_classifier_weight
+        if args.interaction_count_classifier_weight is not None
+        else reflection_count_classifier_weight
+    )
+    if interaction_count_classifier_weight < 0.0:
+        raise ValueError("--interaction-count-classifier-weight must be non-negative.")
+    if (
+        args.reflection_count_classifier_weight is None
+        and args.interaction_count_classifier_weight is not None
+    ):
+        reflection_count_classifier_weight = interaction_count_classifier_weight
+    interaction_count_regression_weight = (
+        args.interaction_count_regression_weight
+        if args.interaction_count_regression_weight is not None
+        else reflection_count_regression_weight
+    )
+    if interaction_count_regression_weight < 0.0:
+        raise ValueError("--interaction-count-regression-weight must be non-negative.")
+    if (
+        args.reflection_count_regression_weight is None
+        and args.interaction_count_regression_weight is not None
+    ):
+        reflection_count_regression_weight = interaction_count_regression_weight
     first_path_power_bin_weights = parse_first_path_power_bin_weights(
         args.first_path_power_bin_weight
         if args.first_path_power_bin_weight is not None
@@ -3093,6 +3246,8 @@ def main() -> None:
             first_path_power_bin_classifier_weight > 0.0
             or first_path_power_bin_position_weight > 0.0
             or direct_power_weight > 0.0
+            or reflection_count_classifier_weight > 0.0
+            or reflection_count_regression_weight > 0.0
         )
         and not use_power_branch
     ):
@@ -3214,6 +3369,12 @@ def main() -> None:
             delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
             delay_spread_bin_position_weight=delay_spread_bin_position_weight,
             delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
+            interaction_count_classifier_weight=interaction_count_classifier_weight,
+            interaction_count_regression_weight=interaction_count_regression_weight,
+            reflection_count_classifier_weight=reflection_count_classifier_weight,
+            reflection_count_regression_weight=reflection_count_regression_weight,
+            reflection_count_nlos_weight=reflection_count_nlos_weight,
+            interaction_count_soft_labels=interaction_count_soft_labels,
             first_path_power_bin_weights=first_path_power_bin_weights,
             first_path_power_nlos_weight=first_path_power_nlos_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
@@ -3302,6 +3463,12 @@ def main() -> None:
             delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
             delay_spread_bin_position_weight=delay_spread_bin_position_weight,
             delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
+            interaction_count_classifier_weight=interaction_count_classifier_weight,
+            interaction_count_regression_weight=interaction_count_regression_weight,
+            reflection_count_classifier_weight=reflection_count_classifier_weight,
+            reflection_count_regression_weight=reflection_count_regression_weight,
+            reflection_count_nlos_weight=reflection_count_nlos_weight,
+            interaction_count_soft_labels=interaction_count_soft_labels,
             first_path_power_bin_weights=first_path_power_bin_weights,
             first_path_power_nlos_weight=first_path_power_nlos_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
