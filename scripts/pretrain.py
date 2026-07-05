@@ -442,6 +442,28 @@ def format_attribute_remap(remap: dict[str, dict[str, tuple[str, ...]]]) -> str:
     )
 
 
+def parse_interaction_count_fields(value) -> tuple[str, ...]:
+    if value is None:
+        return ("reflection_count",)
+    if isinstance(value, str):
+        fields = tuple(part.strip() for part in value.split(",") if part.strip())
+    else:
+        fields = tuple(str(part) for part in value)
+    if not fields:
+        return ("reflection_count",)
+    unknown = [field for field in fields if field != "reflection_count"]
+    if unknown:
+        raise ValueError(
+            f"Unknown interaction_count_fields: {unknown}. "
+            "Choose from: reflection_count"
+        )
+    return fields
+
+
+def format_interaction_count_fields(fields: tuple[str, ...]) -> str:
+    return ",".join(fields) if fields else "none"
+
+
 def semantic_key_sort_key(key: SemanticKey) -> tuple[str, ...]:
     return (
         key.env_type,
@@ -1125,6 +1147,8 @@ def run_smoke_test(
     first_path_delay_tail_underestimate_weight: float = 0.0,
     los_delay_weight: float = 0.0,
     los_delay_nonnegative_weight: float = 0.0,
+    use_physics_calibration_loss: bool = False,
+    los_delay_consistency_weight: float = 0.0,
     los_angle_weight: float = 0.0,
     first_path_angle_weight: float = 0.0,
     first_path_angle_nlos_weight: float = 0.0,
@@ -1139,6 +1163,7 @@ def run_smoke_test(
     reflection_count_regression_weight: float = 0.0,
     reflection_count_nlos_weight: float = 1.0,
     interaction_count_soft_labels: bool = False,
+    interaction_count_fields: tuple[str, ...] = ("reflection_count",),
     first_path_power_bin_classifier_weight: float = 0.0,
     first_path_power_bin_position_weight: float = 0.0,
     first_path_power_bin_weights: dict[str, float] | None = None,
@@ -1239,6 +1264,8 @@ def run_smoke_test(
                     first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
                     los_delay_weight=los_delay_weight,
                     los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+                    use_physics_calibration_loss=use_physics_calibration_loss,
+                    los_delay_consistency_weight=los_delay_consistency_weight,
                     los_angle_weight=los_angle_weight,
                     first_path_angle_weight=first_path_angle_weight,
                     first_path_angle_nlos_weight=first_path_angle_nlos_weight,
@@ -1332,6 +1359,8 @@ def run_real_pretrain(
     first_path_delay_tail_underestimate_weight: float,
     los_delay_weight: float,
     los_delay_nonnegative_weight: float,
+    use_physics_calibration_loss: bool,
+    los_delay_consistency_weight: float,
     los_angle_weight: float,
     first_path_angle_weight: float,
     first_path_angle_nlos_weight: float,
@@ -1348,6 +1377,7 @@ def run_real_pretrain(
     reflection_count_regression_weight: float,
     reflection_count_nlos_weight: float,
     interaction_count_soft_labels: bool,
+    interaction_count_fields: tuple[str, ...],
     first_path_power_bin_weights: dict[str, float],
     first_path_power_nlos_weight: float,
     first_path_power_gate_mode: str,
@@ -1482,6 +1512,8 @@ def run_real_pretrain(
         first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
         los_delay_weight=los_delay_weight,
         los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+        use_physics_calibration_loss=use_physics_calibration_loss,
+        los_delay_consistency_weight=los_delay_consistency_weight,
         los_angle_weight=los_angle_weight,
         first_path_angle_weight=first_path_angle_weight,
         first_path_angle_nlos_weight=first_path_angle_nlos_weight,
@@ -1581,6 +1613,8 @@ def run_real_pretrain(
         f"first_path_delay_bin_label_order={','.join(FIRST_PATH_DELAY_BIN_LABELS)} "
         f"los_delay_weight={los_delay_weight} "
         f"los_delay_nonnegative_weight={los_delay_nonnegative_weight} "
+        f"use_physics_calibration_loss={use_physics_calibration_loss} "
+        f"los_delay_consistency_weight={los_delay_consistency_weight} "
         f"los_angle_weight={los_angle_weight} "
         f"first_path_angle_weight={first_path_angle_weight} "
         f"first_path_angle_nlos_weight={first_path_angle_nlos_weight} "
@@ -1592,6 +1626,7 @@ def run_real_pretrain(
         f"reflection_count_regression_weight={reflection_count_regression_weight} "
         f"reflection_count_nlos_weight={reflection_count_nlos_weight} "
         f"interaction_count_soft_labels={interaction_count_soft_labels} "
+        f"interaction_count_fields={format_interaction_count_fields(interaction_count_fields)} "
         f"interaction_count_classifier_weight={interaction_count_classifier_weight} "
         f"interaction_count_regression_weight={interaction_count_regression_weight} "
         f"reflection_count_bin_label_order={','.join(REFLECTION_COUNT_BIN_LABELS)} "
@@ -1926,6 +1961,19 @@ def run_real_pretrain(
         mean_los_delay_nonnegative = sum(
             m.get("loss_los_delay_nonnegative", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
+        mean_los_delay_consistency = sum(
+            m.get("loss_los_delay_consistency", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        los_delay_consistency_mae_values = [
+            m["los_delay_consistency_mae_ns"]
+            for m in epoch_metrics
+            if "los_delay_consistency_mae_ns" in m
+        ]
+        mean_los_delay_consistency_mae_ns = (
+            sum(los_delay_consistency_mae_values) / len(los_delay_consistency_mae_values)
+            if los_delay_consistency_mae_values
+            else 0.0
+        )
         mean_los_angle = sum(m.get("loss_los_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_first_path_angle = sum(m.get("loss_first_path_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_first_path_angle_nlos = sum(
@@ -2016,6 +2064,8 @@ def run_real_pretrain(
             f"first_delay_fused_mae={mean_first_path_delay_fused_raw_mae_ns:.2f}ns "
             f"first_delay_bin_violate={mean_first_path_delay_bin_consistency_violation_ns:.2f}ns "
             f"los_nonneg={mean_los_delay_nonnegative:.4f} "
+            f"los_cons={mean_los_delay_consistency:.4f} "
+            f"los_cons_mae={mean_los_delay_consistency_mae_ns:.2f}ns "
             f"los_angle_mae={mean_los_angle_mae_deg:.2f}deg "
             f"first_angle_mae={mean_first_path_angle_mae_deg:.2f}deg "
             f"first_angle_nlos_mae={mean_first_path_angle_nlos_mae_deg:.2f}deg "
@@ -2133,6 +2183,8 @@ def run_real_pretrain(
                         "loss_first_path_delay": mean_first_path_delay,
                         "loss_los_delay": mean_los_delay,
                         "loss_los_delay_nonnegative": mean_los_delay_nonnegative,
+                        "loss_los_delay_consistency": mean_los_delay_consistency,
+                        "los_delay_consistency_mae_ns": mean_los_delay_consistency_mae_ns,
                         "loss_los_angle": mean_los_angle,
                         "los_angle_mae_deg": mean_los_angle_mae_deg,
                         "loss_first_path_angle": mean_first_path_angle,
@@ -2201,6 +2253,8 @@ def run_real_pretrain(
                         "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
                         "los_delay_weight": los_delay_weight,
                         "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
+                        "use_physics_calibration_loss": use_physics_calibration_loss,
+                        "los_delay_consistency_weight": los_delay_consistency_weight,
                         "los_angle_weight": los_angle_weight,
                         "first_path_angle_weight": first_path_angle_weight,
                         "first_path_angle_nlos_weight": first_path_angle_nlos_weight,
@@ -2212,6 +2266,7 @@ def run_real_pretrain(
                         "reflection_count_regression_weight": reflection_count_regression_weight,
                         "reflection_count_nlos_weight": reflection_count_nlos_weight,
                         "interaction_count_soft_labels": interaction_count_soft_labels,
+                        "interaction_count_fields": list(interaction_count_fields),
                         "interaction_count_classifier_weight": interaction_count_classifier_weight,
                         "interaction_count_regression_weight": interaction_count_regression_weight,
                         "reflection_count_bin_label_order": list(REFLECTION_COUNT_BIN_LABELS),
@@ -2320,6 +2375,8 @@ def run_real_pretrain(
                     "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
                     "los_delay_weight": los_delay_weight,
                     "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
+                    "use_physics_calibration_loss": use_physics_calibration_loss,
+                    "los_delay_consistency_weight": los_delay_consistency_weight,
                     "los_angle_weight": los_angle_weight,
                     "first_path_angle_weight": first_path_angle_weight,
                     "first_path_angle_nlos_weight": first_path_angle_nlos_weight,
@@ -2331,6 +2388,7 @@ def run_real_pretrain(
                     "reflection_count_regression_weight": reflection_count_regression_weight,
                     "reflection_count_nlos_weight": reflection_count_nlos_weight,
                     "interaction_count_soft_labels": interaction_count_soft_labels,
+                    "interaction_count_fields": list(interaction_count_fields),
                     "interaction_count_classifier_weight": interaction_count_classifier_weight,
                     "interaction_count_regression_weight": interaction_count_regression_weight,
                     "reflection_count_bin_label_order": list(REFLECTION_COUNT_BIN_LABELS),
@@ -2626,6 +2684,22 @@ def main() -> None:
         help="Penalty weight for negative LoS delay predictions on LoS samples.",
     )
     parser.add_argument(
+        "--use-physics-calibration-loss",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Enable the Physics Calibration Loss Pack. The initial pack adds "
+            "LoS first-path-delay/LoS-delay consistency."
+        ),
+    )
+    parser.add_argument(
+        "--los-delay-consistency-weight",
+        type=float,
+        help=(
+            "Physics calibration weight for LoS consistency between "
+            "first_path_delay and los_delay."
+        ),
+    )
+    parser.add_argument(
         "--los-angle-weight",
         type=float,
         help="Supervision weight for LoS azimuth angle sin/cos prediction on LoS samples.",
@@ -2686,6 +2760,15 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         help=(
             "Use ordinal soft labels for interaction/reflection count classification."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-count-fields",
+        nargs="+",
+        choices=("reflection_count",),
+        help=(
+            "Interaction-count targets included in the current calibration pack. "
+            "Currently only reflection_count is implemented."
         ),
     )
     parser.add_argument(
@@ -3128,6 +3211,18 @@ def main() -> None:
         if args.los_delay_nonnegative_weight is not None
         else float(cfg_get(train_cfg, "los_delay_nonnegative_weight", 0.0))
     )
+    use_physics_calibration_loss = (
+        args.use_physics_calibration_loss
+        if args.use_physics_calibration_loss is not None
+        else bool(cfg_get(train_cfg, "use_physics_calibration_loss", False))
+    )
+    los_delay_consistency_weight = (
+        args.los_delay_consistency_weight
+        if args.los_delay_consistency_weight is not None
+        else float(cfg_get(train_cfg, "los_delay_consistency_weight", 0.0))
+    )
+    if los_delay_consistency_weight < 0.0:
+        raise ValueError("--los-delay-consistency-weight must be non-negative.")
     los_angle_weight = (
         args.los_angle_weight
         if args.los_angle_weight is not None
@@ -3211,6 +3306,11 @@ def main() -> None:
         args.interaction_count_soft_labels
         if args.interaction_count_soft_labels is not None
         else bool(cfg_get(train_cfg, "interaction_count_soft_labels", False))
+    )
+    interaction_count_fields = parse_interaction_count_fields(
+        args.interaction_count_fields
+        if args.interaction_count_fields is not None
+        else cfg_get(train_cfg, "interaction_count_fields", ("reflection_count",))
     )
     interaction_count_classifier_weight = (
         args.interaction_count_classifier_weight
@@ -3361,6 +3461,8 @@ def main() -> None:
             first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
             los_delay_weight=los_delay_weight,
             los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+            use_physics_calibration_loss=use_physics_calibration_loss,
+            los_delay_consistency_weight=los_delay_consistency_weight,
             los_angle_weight=los_angle_weight,
             first_path_angle_weight=first_path_angle_weight,
             first_path_angle_nlos_weight=first_path_angle_nlos_weight,
@@ -3375,6 +3477,7 @@ def main() -> None:
             reflection_count_regression_weight=reflection_count_regression_weight,
             reflection_count_nlos_weight=reflection_count_nlos_weight,
             interaction_count_soft_labels=interaction_count_soft_labels,
+            interaction_count_fields=interaction_count_fields,
             first_path_power_bin_weights=first_path_power_bin_weights,
             first_path_power_nlos_weight=first_path_power_nlos_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
@@ -3455,6 +3558,8 @@ def main() -> None:
             first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
             los_delay_weight=los_delay_weight,
             los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+            use_physics_calibration_loss=use_physics_calibration_loss,
+            los_delay_consistency_weight=los_delay_consistency_weight,
             los_angle_weight=los_angle_weight,
             first_path_angle_weight=first_path_angle_weight,
             first_path_angle_nlos_weight=first_path_angle_nlos_weight,
@@ -3469,6 +3574,7 @@ def main() -> None:
             reflection_count_regression_weight=reflection_count_regression_weight,
             reflection_count_nlos_weight=reflection_count_nlos_weight,
             interaction_count_soft_labels=interaction_count_soft_labels,
+            interaction_count_fields=interaction_count_fields,
             first_path_power_bin_weights=first_path_power_bin_weights,
             first_path_power_nlos_weight=first_path_power_nlos_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,

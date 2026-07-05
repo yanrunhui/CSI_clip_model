@@ -596,6 +596,18 @@ def _infer_delay_spread_raw_beta_ns(checkpoint: dict | None) -> float:
     return 20.0
 
 
+def _infer_use_physics_calibration_loss(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    return bool(checkpoint.get("args", {}).get("use_physics_calibration_loss", False))
+
+
+def _infer_los_delay_consistency_weight(checkpoint: dict | None) -> float:
+    if checkpoint is None:
+        return 0.0
+    return float(checkpoint.get("args", {}).get("los_delay_consistency_weight", 0.0))
+
+
 def _sample_delay_spread_ns(sample) -> float:
     scale = 1.0
     if hasattr(sample, "delay_spread_ns"):
@@ -959,6 +971,8 @@ def evaluate(
         limit_samples_per_attribute_value_override,
     )
     delay_spread_raw_beta_ns = _infer_delay_spread_raw_beta_ns(checkpoint)
+    use_physics_calibration_loss = _infer_use_physics_calibration_loss(checkpoint)
+    los_delay_consistency_weight = _infer_los_delay_consistency_weight(checkpoint)
     reflection_count_classifier_weight = _infer_reflection_count_classifier_weight(
         checkpoint
     )
@@ -1443,6 +1457,8 @@ def evaluate(
     print(f"limit_samples_per_attribute_value={limit_samples_per_attribute_value}")
     print(f"max_delay_spread_ns={max_delay_spread_ns}")
     print(f"delay_spread_raw_beta_ns={delay_spread_raw_beta_ns:.4f}")
+    print(f"use_physics_calibration_loss={use_physics_calibration_loss}")
+    print(f"los_delay_consistency_weight={los_delay_consistency_weight:.4f}")
     print(f"reflection_count_classifier_weight={reflection_count_classifier_weight:.4f}")
     print(f"reflection_count_regression_weight={reflection_count_regression_weight:.4f}")
     print(f"reflection_count_nlos_weight={reflection_count_nlos_weight:.4f}")

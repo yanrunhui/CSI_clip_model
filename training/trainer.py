@@ -72,6 +72,8 @@ class TrainConfig:
     first_path_delay_tail_underestimate_weight: float = 0.0
     los_delay_weight: float = 0.0
     los_delay_nonnegative_weight: float = 0.0
+    use_physics_calibration_loss: bool = False
+    los_delay_consistency_weight: float = 0.0
     los_angle_weight: float = 0.0
     first_path_angle_weight: float = 0.0
     first_path_angle_nlos_weight: float = 0.0
@@ -1096,6 +1098,11 @@ class Trainer:
         )
         effective_los_delay_nonnegative_weight = (
             0.0 if warmup_active else cfg.los_delay_nonnegative_weight
+        )
+        effective_los_delay_consistency_weight = (
+            0.0
+            if warmup_active or not cfg.use_physics_calibration_loss
+            else cfg.los_delay_consistency_weight
         )
         effective_los_angle_weight = (
             0.0 if warmup_active else cfg.los_angle_weight
@@ -2593,6 +2600,39 @@ class Trainer:
                 los_angle_count = los_angle_mask.sum()
         if (
             physics_outputs is not None
+            and effective_los_delay_consistency_weight > 0.0
+        ):
+            first_delay_raw_prediction = physics_outputs[
+                "first_path_delay_bin_soft_fused_raw"
+            ]
+            los_delay_raw_prediction = physics_outputs["los_delay_context"] * 3000.0
+            los_delay_target_mask = batch["los_delay_target_mask"].bool()
+            los_sample_mask = torch.tensor(
+                [key.los_status == "los" for key in batch["semantic_keys"]],
+                device=self.device,
+                dtype=torch.bool,
+            )
+            consistency_mask = (
+                los_sample_mask
+                & los_delay_target_mask
+                & torch.isfinite(first_delay_raw_prediction)
+                & torch.isfinite(los_delay_raw_prediction)
+            )
+            if bool(consistency_mask.any()):
+                consistency_diff_ns = (
+                    first_delay_raw_prediction[consistency_mask]
+                    - los_delay_raw_prediction[consistency_mask]
+                ).abs()
+                beta = max(float(cfg.first_path_delay_raw_beta_ns), 1e-6)
+                losses["loss_los_delay_consistency"] = torch.where(
+                    consistency_diff_ns < beta,
+                    0.5 * consistency_diff_ns.square() / beta,
+                    consistency_diff_ns - 0.5 * beta,
+                ).mean() / 3000.0
+                los_delay_consistency_mae_ns = consistency_diff_ns.mean()
+                los_delay_consistency_count = consistency_mask.sum()
+        if (
+            physics_outputs is not None
             and (
                 effective_first_path_angle_weight > 0.0
                 or effective_first_path_angle_nlos_weight > 0.0
@@ -2701,6 +2741,7 @@ class Trainer:
             effective_first_path_delay_tail_underestimate_weight * losses.get("loss_first_path_delay_tail_underestimate", torch.zeros((), device=self.device)) +
             effective_los_delay_weight * losses.get("loss_los_delay", torch.zeros((), device=self.device)) +
             effective_los_delay_nonnegative_weight * losses.get("loss_los_delay_nonnegative", torch.zeros((), device=self.device)) +
+            effective_los_delay_consistency_weight * losses.get("loss_los_delay_consistency", torch.zeros((), device=self.device)) +
             effective_los_angle_weight * losses.get("loss_los_angle", torch.zeros((), device=self.device)) +
             effective_first_path_angle_weight * losses.get("loss_first_path_angle", torch.zeros((), device=self.device)) +
             effective_first_path_angle_nlos_weight * losses.get("loss_first_path_angle_nlos", torch.zeros((), device=self.device))
@@ -2878,8 +2919,22 @@ class Trainer:
         metrics["los_delay_nonnegative_weight"] = float(
             effective_los_delay_nonnegative_weight
         )
+        metrics["use_physics_calibration_loss"] = float(
+            cfg.use_physics_calibration_loss
+        )
+        metrics["los_delay_consistency_weight"] = float(
+            effective_los_delay_consistency_weight
+        )
         if los_delay_raw_mae_ns is not None:
             metrics["los_delay_raw_mae_ns"] = float(los_delay_raw_mae_ns.detach())
+        if "los_delay_consistency_mae_ns" in locals():
+            metrics["los_delay_consistency_mae_ns"] = float(
+                los_delay_consistency_mae_ns.detach()
+            )
+        if "los_delay_consistency_count" in locals():
+            metrics["los_delay_consistency_count"] = float(
+                los_delay_consistency_count.detach()
+            )
         metrics["los_angle_weight"] = float(effective_los_angle_weight)
         if los_angle_mae_deg is not None:
             metrics["los_angle_mae_deg"] = float(los_angle_mae_deg.detach())
