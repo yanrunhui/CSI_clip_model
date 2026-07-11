@@ -648,6 +648,8 @@ class CSIClip(nn.Module):
         pdp_latent_token_norm_mode: str = "std",
         freeze_pdp_latent_aux: bool = True,
         pdp_latent_aux_scale: float = 1.0,
+        use_shared_physics_token: bool = False,
+        shared_physics_token_residual_scale: float = 1.0,
         output_dict: bool = True,
     ):
         super().__init__()
@@ -668,10 +670,24 @@ class CSIClip(nn.Module):
         self.use_pdp_latent_aux = use_pdp_latent_aux
         self.freeze_pdp_latent_aux = freeze_pdp_latent_aux
         self.pdp_latent_aux_scale = float(pdp_latent_aux_scale)
+        self.use_shared_physics_token = bool(use_shared_physics_token)
+        self.shared_physics_token_residual_scale = float(shared_physics_token_residual_scale)
         self.csi = csi_encoder
         self.text = text_encoder
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
         hidden_dim = embed_dim * 2
+        self.shared_physics_token = None
+        if self.use_shared_physics_token:
+            self.shared_physics_token = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, embed_dim),
+            )
+            final_linear = self.shared_physics_token[-1]
+            if isinstance(final_linear, nn.Linear):
+                nn.init.zeros_(final_linear.weight)
+                nn.init.zeros_(final_linear.bias)
         self.power_feature_encoder = PowerFeatureEncoder()
         self.csi_delay_context_encoder = (
             CSIDelaySpecificEncoder()
@@ -1029,6 +1045,11 @@ class CSIClip(nn.Module):
             raise RuntimeError("This CSIClip instance was created without learnable prototypes.")
         return F.normalize(self.prototypes, dim=-1) if normalize else self.prototypes
 
+    def encode_shared_physics_token(self, csi_features: torch.Tensor) -> torch.Tensor:
+        if self.shared_physics_token is None:
+            return csi_features
+        return csi_features + self.shared_physics_token_residual_scale * self.shared_physics_token(csi_features)
+
     def encode_power_context(
         self,
         tokens: torch.Tensor,
@@ -1257,14 +1278,15 @@ class CSIClip(nn.Module):
         los_angle_context: torch.Tensor | None = None,
         first_path_angle_context: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        base = self.physics_head(csi_features)
+        physics_features = self.encode_shared_physics_token(csi_features)
+        base = self.physics_head(physics_features)
         if self.use_delay_spread_head:
             base = base.clone()
             base[:, self.delay_spread_index] = 0.0
         delay_csi_features = (
-            csi_features.detach()
+            physics_features.detach()
             if self.detach_delay_spread_features
-            else csi_features
+            else physics_features
         )
         csi_delay_spread = self.csi_delay_spread_head(delay_csi_features).squeeze(-1)
         if delay_context is None:
@@ -1341,7 +1363,7 @@ class CSIClip(nn.Module):
             delay_profile_stats = power_context["delay_profile_stats"]
         interaction_count_input = torch.cat(
             [
-                csi_features,
+                physics_features,
                 delay_context,
                 raw_power_context,
                 delay_profile_stats,
@@ -1353,14 +1375,14 @@ class CSIClip(nn.Module):
             interaction_count_input
         ).squeeze(-1)
         first_path_power_bin_logits = self.first_path_power_bin_classifier(
-            csi_features
+            physics_features
         )
         first_path_power_bin_position = torch.sigmoid(
-            self.first_path_power_bin_position_head(csi_features).squeeze(-1)
+            self.first_path_power_bin_position_head(physics_features).squeeze(-1)
         )
-        k_factor_strong_bin_logits = self.k_factor_strong_bin_classifier(csi_features)
+        k_factor_strong_bin_logits = self.k_factor_strong_bin_classifier(physics_features)
         k_factor_strong_position = torch.sigmoid(
-            self.k_factor_strong_position_head(csi_features).squeeze(-1)
+            self.k_factor_strong_position_head(physics_features).squeeze(-1)
         )
         if not self.use_power_branch or power_context is None:
             zeros = torch.zeros(
@@ -1409,7 +1431,7 @@ class CSIClip(nn.Module):
             }
         enhanced_input = torch.cat(
             [
-                csi_features,
+                physics_features,
                 power_context["delay_map_context"],
                 power_context["raw_power_context"],
             ],

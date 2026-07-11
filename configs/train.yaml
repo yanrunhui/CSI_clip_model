@@ -21,6 +21,8 @@ train:
   use_delay_specific_encoder: true
   use_los_angle_context_encoder: true
   use_first_path_angle_context_encoder: true
+  use_shared_physics_token: true
+  shared_physics_token_residual_scale: 0.5
   warmup_epochs: 5
   min_lr: 1.0e-5
 
@@ -57,7 +59,7 @@ train:
     mid: 0.7
     high: 1.5
     very_high: 1.2
-  first_path_power_bin_classifier_weight: 0.05
+  first_path_power_bin_classifier_weight: 0.03
   first_path_power_bin_position_weight: 0.1
   first_path_power_bin_weights:
     very_weak: 1.0
@@ -74,7 +76,7 @@ train:
   first_path_delay_fused_raw_weight: 0.02
   first_path_delay_raw_beta_ns: 20.0
   first_path_delay_bin_classifier_weight: 0.02
-  first_path_delay_bin_position_weight: 0.008
+  first_path_delay_bin_position_weight: 0.01
   first_path_delay_bin_consistency_weight: 0.01
   first_path_delay_bin_weights:
     "0_25": 1.0

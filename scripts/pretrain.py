@@ -625,6 +625,8 @@ def build_components_from_samples(
     use_delay_specific_encoder: bool = False,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
+    use_shared_physics_token: bool = False,
+    shared_physics_token_residual_scale: float = 1.0,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
@@ -683,6 +685,8 @@ def build_components_from_samples(
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         los_angle_context_token_norm_mode=token_norm_mode,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -938,6 +942,8 @@ def build_demo_components(
     use_delay_specific_encoder: bool = False,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
+    use_shared_physics_token: bool = False,
+    shared_physics_token_residual_scale: float = 1.0,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ):
@@ -962,6 +968,8 @@ def build_demo_components(
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
     )
@@ -982,6 +990,8 @@ def build_real_components(
     use_delay_specific_encoder: bool = False,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
+    use_shared_physics_token: bool = False,
+    shared_physics_token_residual_scale: float = 1.0,
     min_class_size: int = 1,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
@@ -1106,6 +1116,8 @@ def build_real_components(
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
         tokenizer_word2id=tokenizer_word2id,
@@ -1184,6 +1196,8 @@ def run_smoke_test(
     use_delay_specific_encoder: bool = False,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
+    use_shared_physics_token: bool = False,
+    shared_physics_token_residual_scale: float = 1.0,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> None:
     loader, model, _, prototype_bank = build_demo_components(
@@ -1199,6 +1213,8 @@ def run_smoke_test(
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_classifier_fields,
         attribute_remap=attribute_remap,
     )
@@ -1317,6 +1333,8 @@ def run_real_pretrain(
     use_delay_specific_encoder: bool,
     use_los_angle_context_encoder: bool,
     use_first_path_angle_context_encoder: bool,
+    use_shared_physics_token: bool,
+    shared_physics_token_residual_scale: float,
     warmup_epochs: int,
     min_lr: float,
     prototype_weight: float,
@@ -1418,6 +1436,8 @@ def run_real_pretrain(
         use_delay_specific_encoder=use_delay_specific_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         min_class_size=min_class_size,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
@@ -2219,6 +2239,8 @@ def run_real_pretrain(
                         "use_delay_specific_encoder": use_delay_specific_encoder,
                         "use_los_angle_context_encoder": use_los_angle_context_encoder,
                         "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
+                        "use_shared_physics_token": use_shared_physics_token,
+                        "shared_physics_token_residual_scale": shared_physics_token_residual_scale,
                         "aux_regression_weight": aux_regression_weight,
                         "aux_regression_targets": list(aux_regression_targets),
                         "k_factor_loss_weights": k_factor_loss_weights,
@@ -2320,6 +2342,8 @@ def run_real_pretrain(
                     "use_delay_specific_encoder": use_delay_specific_encoder,
                     "use_los_angle_context_encoder": use_los_angle_context_encoder,
                     "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
+                    "use_shared_physics_token": use_shared_physics_token,
+                    "shared_physics_token_residual_scale": shared_physics_token_residual_scale,
                     "warmup_epochs": warmup_epochs,
                     "min_lr": min_lr,
                     "csi_to_text_weight": csi_to_text_weight,
@@ -2474,6 +2498,19 @@ def main() -> None:
         "--use-first-path-angle-context-encoder",
         action="store_true",
         help="Use a first-path selector context branch dedicated to first-path angle prediction.",
+    )
+    parser.add_argument(
+        "--use-shared-physics-token",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Route physics heads through a residual shared physical representation "
+            "z_phys before independent task heads."
+        ),
+    )
+    parser.add_argument(
+        "--shared-physics-token-residual-scale",
+        type=float,
+        help="Residual scale for the shared physics token MLP.",
     )
     parser.add_argument("--warmup-epochs", type=int)
     parser.add_argument("--min-lr", type=float)
@@ -2948,6 +2985,18 @@ def main() -> None:
         args.use_first_path_angle_context_encoder
         or cfg_get(train_cfg, "use_first_path_angle_context_encoder", False)
     )
+    use_shared_physics_token = (
+        args.use_shared_physics_token
+        if args.use_shared_physics_token is not None
+        else bool(cfg_get(train_cfg, "use_shared_physics_token", False))
+    )
+    shared_physics_token_residual_scale = (
+        args.shared_physics_token_residual_scale
+        if args.shared_physics_token_residual_scale is not None
+        else float(cfg_get(train_cfg, "shared_physics_token_residual_scale", 1.0))
+    )
+    if shared_physics_token_residual_scale < 0.0:
+        raise ValueError("--shared-physics-token-residual-scale must be non-negative.")
     warmup_epochs = (
         args.warmup_epochs
         if args.warmup_epochs is not None
@@ -3491,6 +3540,8 @@ def main() -> None:
             use_delay_specific_encoder=use_delay_specific_encoder,
             use_los_angle_context_encoder=use_los_angle_context_encoder,
             use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+            use_shared_physics_token=use_shared_physics_token,
+            shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         )
         return
 
@@ -3513,6 +3564,8 @@ def main() -> None:
             use_delay_specific_encoder=use_delay_specific_encoder,
             use_los_angle_context_encoder=use_los_angle_context_encoder,
             use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+            use_shared_physics_token=use_shared_physics_token,
+            shared_physics_token_residual_scale=shared_physics_token_residual_scale,
             warmup_epochs=warmup_epochs,
             min_lr=min_lr,
             csi_to_text_weight=csi_to_text_weight,

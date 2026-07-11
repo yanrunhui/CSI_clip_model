@@ -602,6 +602,18 @@ def _infer_use_physics_calibration_loss(checkpoint: dict | None) -> bool:
     return bool(checkpoint.get("args", {}).get("use_physics_calibration_loss", False))
 
 
+def _infer_use_shared_physics_token(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    return bool(checkpoint.get("args", {}).get("use_shared_physics_token", False))
+
+
+def _infer_shared_physics_token_residual_scale(checkpoint: dict | None) -> float:
+    if checkpoint is None:
+        return 1.0
+    return float(checkpoint.get("args", {}).get("shared_physics_token_residual_scale", 1.0))
+
+
 def _infer_los_delay_consistency_weight(checkpoint: dict | None) -> float:
     if checkpoint is None:
         return 0.0
@@ -972,6 +984,10 @@ def evaluate(
     )
     delay_spread_raw_beta_ns = _infer_delay_spread_raw_beta_ns(checkpoint)
     use_physics_calibration_loss = _infer_use_physics_calibration_loss(checkpoint)
+    use_shared_physics_token = _infer_use_shared_physics_token(checkpoint)
+    shared_physics_token_residual_scale = _infer_shared_physics_token_residual_scale(
+        checkpoint
+    )
     los_delay_consistency_weight = _infer_los_delay_consistency_weight(checkpoint)
     reflection_count_classifier_weight = _infer_reflection_count_classifier_weight(
         checkpoint
@@ -1119,6 +1135,8 @@ def evaluate(
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         los_angle_context_token_norm_mode=token_norm_mode,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -1446,6 +1464,8 @@ def evaluate(
     print(f"use_delay_specific_encoder={use_delay_specific_encoder}")
     print(f"use_los_angle_context_encoder={use_los_angle_context_encoder}")
     print(f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder}")
+    print(f"use_shared_physics_token={use_shared_physics_token}")
+    print(f"shared_physics_token_residual_scale={shared_physics_token_residual_scale:.4f}")
     print(f"use_delay_family_heads={delay_family_heads_enabled}")
     print(f"use_delay_spread_bin_head={use_delay_spread_bin_head}")
     print(f"use_first_path_delay_bin_head={use_first_path_delay_bin_head}")
