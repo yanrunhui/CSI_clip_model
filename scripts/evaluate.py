@@ -2009,14 +2009,16 @@ def _print_physics_regression_metrics(
     raw_predictions = _physics_raw_predictions(physics_predictions)
     errors = (raw_predictions - physics_raw_targets).abs()
     mae_values = []
-    angle_sin_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_sin")
-    angle_cos_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_cos")
+    hidden_names = {
+        "delay_spread_ns",
+        "first_path_delay_ns",
+        "first_path_aoa_az_sin",
+        "first_path_aoa_az_cos",
+        "first_path_power_dbw",
+        "reflection_count",
+    }
     for idx, name in enumerate(PHYSICS_TARGET_NAMES):
-        if name in {
-            "first_path_aoa_az_sin",
-            "first_path_aoa_az_cos",
-            "first_path_power_dbw",
-        }:
+        if name in hidden_names:
             continue
         mask = physics_masks[:, idx]
         if not bool(mask.any()):
@@ -2024,21 +2026,6 @@ def _print_physics_regression_metrics(
         mae = errors[:, idx][mask].mean()
         mae_values.append(mae)
         print(f"physics_regression_{name}_MAE={float(mae):.4f}")
-    angle_mask = physics_masks[:, angle_sin_idx] & physics_masks[:, angle_cos_idx]
-    if bool(angle_mask.any()):
-        pred_angle = torch.atan2(
-            raw_predictions[:, angle_sin_idx],
-            raw_predictions[:, angle_cos_idx],
-        )
-        target_angle = torch.atan2(
-            physics_raw_targets[:, angle_sin_idx],
-            physics_raw_targets[:, angle_cos_idx],
-        )
-        delta = pred_angle - target_angle
-        circular_errors = torch.rad2deg(torch.atan2(torch.sin(delta), torch.cos(delta)).abs())
-        circular_mae = circular_errors[angle_mask].mean()
-        mae_values.append(circular_mae)
-        print(f"physics_regression_first_path_aoa_az_deg_MAE={float(circular_mae):.4f}")
     if mae_values:
         total_mae = torch.stack(mae_values).mean()
     else:

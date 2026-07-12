@@ -121,6 +121,7 @@ train:
     "200_400": 4.0
     "400_plus": 1.0
   aux_regression_targets:
+    - n_paths
     - first_path_power_dbw
     - k_factor_db
     - azimuth_spread_deg
