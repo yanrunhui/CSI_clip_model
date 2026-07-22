@@ -923,6 +923,7 @@ def evaluate(
     attribute_binary_thresholds: dict[str, float] | None = None,
     physical_caption_examples: int = 3,
     save_signal_descriptions_path: str | None = None,
+    verbose_diagnostics: bool = False,
 ) -> None:
     dataset = PreprocessedCSIDataset.from_pt(data_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False) if checkpoint_path else None
@@ -1448,45 +1449,55 @@ def evaluate(
             text_prototype_targets,
         )
     eval_loss = instance_loss + csi_prototype_loss + text_prototype_loss
-    print(f"eval_learnable_prototype_loss={float(eval_loss):.4f}")
-    print(f"eval_csi_to_text_loss={float(instance_loss):.4f}")
-    print(f"eval_csi_to_prototype_loss={float(csi_prototype_loss):.4f}")
-    print(f"eval_text_to_prototype_loss={float(text_prototype_loss):.4f}")
-    print(f"logit_scale={logit_scale:.4f}")
-    print(f"text_mode={text_mode}")
-    print(f"semantic_key_mode={semantic_key_mode}")
-    print(f"token_norm_mode={token_norm_mode}")
-    print(f"use_power_branch={use_power_branch}")
-    print(f"first_path_power_gate_mode={first_path_power_gate_mode}")
-    print(f"first_path_power_mode={first_path_power_mode}")
-    print(f"first_path_power_use_internal_gate={first_path_power_use_internal_gate}")
-    print(f"use_delay_spread_head={use_delay_spread_head}")
-    print(f"use_delay_specific_encoder={use_delay_specific_encoder}")
-    print(f"use_los_angle_context_encoder={use_los_angle_context_encoder}")
-    print(f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder}")
-    print(f"use_shared_physics_token={use_shared_physics_token}")
-    print(f"shared_physics_token_residual_scale={shared_physics_token_residual_scale:.4f}")
-    print(f"use_delay_family_heads={delay_family_heads_enabled}")
-    print(f"use_delay_spread_bin_head={use_delay_spread_bin_head}")
-    print(f"use_first_path_delay_bin_head={use_first_path_delay_bin_head}")
-    print(f"min_class_size={min_class_size}")
-    print(f"attribute_remap={format_attribute_remap(attribute_remap)}")
-    print(f"filter_attribute_values={format_attribute_value_filters(filter_attribute_values)}")
-    print(f"limit_samples={limit_samples}")
-    print(f"limit_samples_by_attribute={limit_samples_by_attribute}")
-    print(f"limit_samples_per_attribute_value={limit_samples_per_attribute_value}")
-    print(f"max_delay_spread_ns={max_delay_spread_ns}")
-    print(f"delay_spread_raw_beta_ns={delay_spread_raw_beta_ns:.4f}")
-    print(f"use_physics_calibration_loss={use_physics_calibration_loss}")
-    print(f"los_delay_consistency_weight={los_delay_consistency_weight:.4f}")
-    print(f"reflection_count_classifier_weight={reflection_count_classifier_weight:.4f}")
-    print(f"reflection_count_regression_weight={reflection_count_regression_weight:.4f}")
-    print(f"reflection_count_nlos_weight={reflection_count_nlos_weight:.4f}")
-    print(f"interaction_count_soft_labels={interaction_count_soft_labels}")
-    print(f"semantic_prototypes={len(prototype_keys)}")
-    if semantic_classifier_enabled and semantic_logits is not None:
-        _print_semantic_classifier_metrics(semantic_logits, labels, prototype_keys)
-    if checkpoint is not None and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0:
+    if verbose_diagnostics:
+        print(f"eval_learnable_prototype_loss={float(eval_loss):.4f}")
+        print(f"text_mode={text_mode}")
+        print(f"semantic_key_mode={semantic_key_mode}")
+        print(f"token_norm_mode={token_norm_mode}")
+        print(f"use_power_branch={use_power_branch}")
+        print(f"use_delay_family_heads={delay_family_heads_enabled}")
+        print(f"use_delay_spread_bin_head={use_delay_spread_bin_head}")
+        print(f"use_first_path_delay_bin_head={use_first_path_delay_bin_head}")
+        print(f"semantic_prototypes={len(prototype_keys)}")
+        print(f"eval_csi_to_text_loss={float(instance_loss):.4f}")
+        print(f"eval_csi_to_prototype_loss={float(csi_prototype_loss):.4f}")
+        print(f"eval_text_to_prototype_loss={float(text_prototype_loss):.4f}")
+        print(f"logit_scale={logit_scale:.4f}")
+        print(f"first_path_power_gate_mode={first_path_power_gate_mode}")
+        print(f"first_path_power_mode={first_path_power_mode}")
+        print(f"first_path_power_use_internal_gate={first_path_power_use_internal_gate}")
+        print(f"use_delay_spread_head={use_delay_spread_head}")
+        print(f"use_delay_specific_encoder={use_delay_specific_encoder}")
+        print(f"use_los_angle_context_encoder={use_los_angle_context_encoder}")
+        print(f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder}")
+        print(f"use_shared_physics_token={use_shared_physics_token}")
+        print(f"shared_physics_token_residual_scale={shared_physics_token_residual_scale:.4f}")
+        print(f"delay_spread_raw_beta_ns={delay_spread_raw_beta_ns:.4f}")
+        print(f"use_physics_calibration_loss={use_physics_calibration_loss}")
+        print(f"los_delay_consistency_weight={los_delay_consistency_weight:.4f}")
+        print(f"reflection_count_classifier_weight={reflection_count_classifier_weight:.4f}")
+        print(f"reflection_count_regression_weight={reflection_count_regression_weight:.4f}")
+        print(f"reflection_count_nlos_weight={reflection_count_nlos_weight:.4f}")
+        print(f"interaction_count_soft_labels={interaction_count_soft_labels}")
+        print(f"min_class_size={min_class_size}")
+        print(f"attribute_remap={format_attribute_remap(attribute_remap)}")
+        print(f"filter_attribute_values={format_attribute_value_filters(filter_attribute_values)}")
+        print(f"limit_samples={limit_samples}")
+        print(f"limit_samples_by_attribute={limit_samples_by_attribute}")
+        print(f"limit_samples_per_attribute_value={limit_samples_per_attribute_value}")
+        print(f"max_delay_spread_ns={max_delay_spread_ns}")
+    if verbose_diagnostics and semantic_classifier_enabled and semantic_logits is not None:
+        _print_semantic_classifier_metrics(
+            semantic_logits,
+            labels,
+            prototype_keys,
+            verbose=verbose_diagnostics,
+        )
+    if (
+        verbose_diagnostics
+        and checkpoint is not None
+        and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0
+    ):
         print(f"attribute_classifier_fields={','.join(attribute_fields)}")
         print(
             "attribute_classifier_class_weight="
@@ -1496,50 +1507,22 @@ def evaluate(
             "attribute_classifier_logit_adjustment="
             f"{float(checkpoint.get('args', {}).get('attribute_classifier_logit_adjustment', 0.0)):.4f}"
         )
-    _print_retrieval_metrics(text_metric_prefix, logits, text_labels)
-    if checkpoint is not None and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0:
+    if verbose_diagnostics:
+        _print_retrieval_metrics(text_metric_prefix, logits, text_labels)
+    if (
+        verbose_diagnostics
+        and checkpoint is not None
+        and float(checkpoint.get("args", {}).get("attribute_classifier_weight", 0.0)) > 0
+    ):
         _print_attribute_classifier_metrics(
             attribute_logits,
             attribute_labels,
             attribute_label_maps,
             attribute_binary_thresholds or {},
+            verbose=verbose_diagnostics,
         )
-    _print_physics_regression_metrics(
-        physics_predictions=physics_predictions,
-        physics_raw_targets=physics_raw_targets,
-        physics_masks=physics_masks,
-    )
-    _print_interaction_count_head_diagnostics(
-        reflection_logits=reflection_count_logits,
-        reflection_predictions=reflection_count_predictions,
-        physics_raw_targets=physics_raw_targets,
-        physics_masks=physics_masks,
-        semantic_keys=all_semantic_keys,
-    )
-    _print_first_path_angle_diagnostics(
-        physics_predictions=physics_predictions,
-        physics_targets=physics_targets,
-        physics_masks=physics_masks,
-        semantic_keys=all_semantic_keys,
-    )
-    _print_k_factor_diagnostics(
-        physics_predictions=physics_predictions,
-        physics_raw_targets=physics_raw_targets,
-        physics_masks=physics_masks,
-        semantic_keys=all_semantic_keys,
-    )
-    _print_first_path_power_diagnostics(
-        base_physics_predictions=base_physics_predictions,
-        physics_predictions=physics_predictions,
-        enhanced_first_path_power_predictions=enhanced_first_path_power_predictions,
-        physics_raw_targets=physics_raw_targets,
-        physics_masks=physics_masks,
-        semantic_keys=all_semantic_keys,
-        prototype_logits=prototype_logits,
-        prototype_keys=prototype_keys,
-    )
     if delay_family_heads_enabled:
-        _print_delay_family_diagnostics(
+        _print_first_path_delay_metrics(
             first_path_delay_predictions=first_path_delay_context_predictions,
             first_path_delay_bin_logits=(
                 first_path_delay_bin_logits if use_first_path_delay_bin_head else None
@@ -1557,16 +1540,15 @@ def evaluate(
                 if use_first_path_delay_bin_head
                 else None
             ),
-            los_delay_predictions=los_delay_context_predictions,
-            los_angle_predictions=los_angle_predictions,
             physics_raw_targets=physics_raw_targets,
             physics_masks=physics_masks,
-            los_delay_raw_targets=los_delay_raw_targets,
-            los_delay_masks=los_delay_masks,
-            los_angle_targets=los_angle_targets,
-            los_angle_masks=los_angle_masks,
             semantic_keys=all_semantic_keys,
+            verbose=verbose_diagnostics,
         )
+    else:
+        print("first_path_delay_context_MAE=nan")
+        print("first_path_delay_los_MAE=nan")
+        print("first_path_delay_nlos_MAE=nan")
     _print_delay_spread_diagnostics(
         base_physics_predictions=base_physics_predictions,
         physics_predictions=physics_predictions,
@@ -1580,16 +1562,80 @@ def evaluate(
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
         raw_beta_ns=delay_spread_raw_beta_ns,
+        verbose=verbose_diagnostics,
     )
-    _print_structured_physical_description_metrics(
+    _print_selected_physics_regression_metrics(
         physics_predictions=physics_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_masks=physics_masks,
+        metrics=(("k_factor_db", "k_factor_db_MAE"),),
+    )
+    _print_k_factor_diagnostics(
+        physics_predictions=physics_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
+    )
+    _print_first_path_power_diagnostics(
+        base_physics_predictions=base_physics_predictions,
+        physics_predictions=physics_predictions,
+        enhanced_first_path_power_predictions=enhanced_first_path_power_predictions,
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
         semantic_keys=all_semantic_keys,
         prototype_logits=prototype_logits,
         prototype_keys=prototype_keys,
-        example_count=physical_caption_examples,
+        verbose=verbose_diagnostics,
     )
+    if delay_family_heads_enabled:
+        _print_los_delay_angle_metrics(
+            los_delay_predictions=los_delay_context_predictions,
+            los_angle_predictions=los_angle_predictions,
+            los_delay_raw_targets=los_delay_raw_targets,
+            los_delay_masks=los_delay_masks,
+            los_angle_targets=los_angle_targets,
+            los_angle_masks=los_angle_masks,
+            semantic_keys=all_semantic_keys,
+            verbose=verbose_diagnostics,
+        )
+    else:
+        print("los_delay_context_MAE=nan")
+        print("los_angle_MAE=nan")
+    _print_first_path_angle_diagnostics(
+        physics_predictions=physics_predictions,
+        physics_targets=physics_targets,
+        physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
+        verbose=verbose_diagnostics,
+    )
+    _print_interaction_count_head_diagnostics(
+        reflection_logits=reflection_count_logits,
+        reflection_predictions=reflection_count_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
+        verbose=verbose_diagnostics,
+    )
+    _print_selected_physics_regression_metrics(
+        physics_predictions=physics_predictions,
+        physics_raw_targets=physics_raw_targets,
+        physics_masks=physics_masks,
+        metrics=(
+            ("n_paths", "n_paths_MAE"),
+            ("azimuth_spread_deg", "azimuth_spread_MAE"),
+        ),
+    )
+    if verbose_diagnostics:
+        _print_structured_physical_description_metrics(
+            physics_predictions=physics_predictions,
+            physics_raw_targets=physics_raw_targets,
+            physics_masks=physics_masks,
+            semantic_keys=all_semantic_keys,
+            prototype_logits=prototype_logits,
+            prototype_keys=prototype_keys,
+            example_count=physical_caption_examples,
+            print_examples=True,
+        )
     signal_description_payload = _build_signal_description_payload(
         samples=samples,
         physics_predictions=physics_predictions,
@@ -1615,7 +1661,7 @@ def evaluate(
             save_signal_descriptions_path,
             signal_description_payload,
         )
-    if text_mode in ("instance", "multipositive"):
+    if verbose_diagnostics and text_mode in ("instance", "multipositive"):
         _print_semantic_retrieval_metrics(
             "csi_to_instance_text_semantic",
             logits,
@@ -1649,13 +1695,13 @@ def evaluate(
                 else 0.25
             ),
         )
-    _print_retrieval_metrics("csi_to_learnable_prototype", prototype_logits, labels)
-
-    _print_retrieval_metrics(
-        "text_proto_to_learnable_prototype",
-        logit_scale * prototype_text_features @ prototype_features.T,
-        torch.arange(prototype_features.shape[0], dtype=torch.long),
-    )
+    if verbose_diagnostics:
+        _print_retrieval_metrics("csi_to_learnable_prototype", prototype_logits, labels)
+        _print_retrieval_metrics(
+            "text_proto_to_learnable_prototype",
+            logit_scale * prototype_text_features @ prototype_features.T,
+            torch.arange(prototype_features.shape[0], dtype=torch.long),
+        )
 
 
 def _print_retrieval_metrics(prefix: str, logits: torch.Tensor, labels: torch.Tensor) -> None:
@@ -1737,6 +1783,7 @@ def _print_attribute_classifier_metrics(
     attribute_labels: dict[str, torch.Tensor],
     attribute_label_maps: dict[str, dict[str, int]],
     attribute_binary_thresholds: dict[str, float],
+    verbose: bool = False,
 ) -> None:
     for field, logits in attribute_logits.items():
         labels = attribute_labels[field]
@@ -1761,12 +1808,13 @@ def _print_attribute_classifier_metrics(
         print(f"attribute_classifier_{field}_loss={float(F.cross_entropy(logits, labels)):.4f}")
         print(f"attribute_classifier_{field}_top1={float(top1):.4f}")
         print(f"attribute_classifier_{field}_macro_top1={float(macro_acc):.4f}")
-        print(f"attribute_classifier_{field}_majority_baseline_R@1={majority_acc:.4f}")
-        print(f"attribute_classifier_{field}_majority_value={id_to_value[majority_label]}")
-        print(
-            f"attribute_classifier_{field}_class_size_accuracy_pearson="
-            f"{_safe_pearson(class_sizes[nonempty].float(), class_accuracy[nonempty]):.4f}"
-        )
+        if verbose:
+            print(f"attribute_classifier_{field}_majority_baseline_R@1={majority_acc:.4f}")
+            print(f"attribute_classifier_{field}_majority_value={id_to_value[majority_label]}")
+            print(
+                f"attribute_classifier_{field}_class_size_accuracy_pearson="
+                f"{_safe_pearson(class_sizes[nonempty].float(), class_accuracy[nonempty]):.4f}"
+            )
         if num_classes == 2:
             threshold_metrics = _binary_threshold_metrics(logits, labels)
             print(
@@ -1831,6 +1879,8 @@ def _print_attribute_classifier_metrics(
                     f"attribute_classifier_{field}_fixed_threshold_value_{id_to_value[1]}_acc="
                     f"{fixed_threshold_metrics['class1_acc']:.4f}"
                 )
+        if not verbose:
+            continue
         for class_idx in range(num_classes):
             print(
                 f"attribute_classifier_{field}_value_{id_to_value[class_idx]}="
@@ -1860,6 +1910,7 @@ def _print_semantic_classifier_metrics(
     logits: torch.Tensor,
     labels: torch.Tensor,
     prototype_keys: list[SemanticKey],
+    verbose: bool = False,
 ) -> None:
     predictions = logits.argmax(dim=1)
     num_classes = len(prototype_keys)
@@ -1881,6 +1932,8 @@ def _print_semantic_classifier_metrics(
     print(f"semantic_classifier_loss={float(F.cross_entropy(logits, labels)):.4f}")
     print(f"semantic_classifier_top1={float(top1):.4f}")
     print(f"semantic_classifier_macro_top1={float(macro_acc):.4f}")
+    if not verbose:
+        return
     print(f"semantic_classifier_majority_baseline_R@1={majority_acc:.4f}")
     print(f"semantic_classifier_majority_key={prototype_keys[majority_label]}")
     print(
@@ -2001,14 +2054,47 @@ def _print_physics_neighbor_retrieval_metrics(
     print(f"{prefix}_positive_count_mean={float(positive_counts_tensor.mean()):.2f}")
 
 
+def _print_selected_physics_regression_metrics(
+    physics_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    metrics: tuple[tuple[str, str], ...],
+) -> None:
+    raw_predictions = _physics_raw_predictions(physics_predictions)
+    errors = (raw_predictions - physics_raw_targets).abs()
+    for target_name, metric_name in metrics:
+        idx = _physics_target_index(target_name)
+        mask = physics_masks[:, idx]
+        if bool(mask.any()):
+            print(f"{metric_name}={float(errors[:, idx][mask].mean()):.4f}")
+        else:
+            print(f"{metric_name}=nan")
+
+
 def _print_physics_regression_metrics(
     physics_predictions: torch.Tensor,
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey] | None = None,
+    verbose: bool = False,
 ) -> None:
     raw_predictions = _physics_raw_predictions(physics_predictions)
     errors = (raw_predictions - physics_raw_targets).abs()
     mae_values = []
+    los_mask = (
+        torch.tensor(
+            [key.los_status == "los" for key in semantic_keys],
+            dtype=torch.bool,
+            device=physics_masks.device,
+        )
+        if semantic_keys is not None
+        else None
+    )
+    default_names = {
+        "n_paths": "n_paths_MAE",
+        "azimuth_spread_deg": "azimuth_spread_MAE",
+        "k_factor_db": "k_factor_db_MAE",
+    }
     hidden_names = {
         "delay_spread_ns",
         "first_path_delay_ns",
@@ -2018,19 +2104,31 @@ def _print_physics_regression_metrics(
         "reflection_count",
     }
     for idx, name in enumerate(PHYSICS_TARGET_NAMES):
-        if name in hidden_names:
+        if not verbose and name not in default_names:
+            continue
+        if verbose and name in hidden_names:
             continue
         mask = physics_masks[:, idx]
         if not bool(mask.any()):
             continue
         mae = errors[:, idx][mask].mean()
         mae_values.append(mae)
-        print(f"physics_regression_{name}_MAE={float(mae):.4f}")
-    if mae_values:
-        total_mae = torch.stack(mae_values).mean()
-    else:
-        total_mae = torch.zeros(())
-    print(f"physics_regression_MAE_mean={float(total_mae):.4f}")
+        metric_name = default_names.get(name, f"physics_regression_{name}_MAE")
+        print(f"{metric_name}={float(mae):.4f}")
+        if verbose and los_mask is not None:
+            for group_name, group_mask in (("los", los_mask), ("nlos", ~los_mask)):
+                combined_mask = mask & group_mask
+                if bool(combined_mask.any()):
+                    group_mae = errors[:, idx][combined_mask].mean()
+                    print(f"physics_regression_{name}_{group_name}_MAE={float(group_mae):.4f}")
+                else:
+                    print(f"physics_regression_{name}_{group_name}_MAE=nan")
+    if verbose:
+        if mae_values:
+            total_mae = torch.stack(mae_values).mean()
+        else:
+            total_mae = torch.zeros(())
+        print(f"physics_regression_MAE_mean={float(total_mae):.4f}")
 
 
 def _interaction_count_bin_targets(
@@ -2057,39 +2155,42 @@ def _print_single_interaction_count_head(
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
     semantic_keys: list[SemanticKey],
+    verbose: bool = False,
 ) -> None:
     target_idx = PHYSICS_TARGET_NAMES.index(target_name)
     raw_targets = physics_raw_targets[:, target_idx]
     target_labels = _interaction_count_bin_targets(raw_targets, bins)
     valid_mask = (target_labels >= 0) & physics_masks[:, target_idx].bool()
-    print(f"{prefix}_count={int(valid_mask.sum().item())}")
-    print(
-        f"{prefix}_bin_label_order="
-        + ",".join(bin_labels)
-    )
+    if verbose:
+        print(f"{prefix}_count={int(valid_mask.sum().item())}")
+        print(
+            f"{prefix}_bin_label_order="
+            + ",".join(bin_labels)
+        )
     if not bool(valid_mask.any()):
+        print(f"{prefix}_head_MAE=nan")
         print(f"{prefix}_head_accuracy=nan")
         print(f"{prefix}_head_adjacent_accuracy=nan")
-        print(f"{prefix}_head_far_miss_fraction=nan")
-        print(f"{prefix}_head_MAE=nan")
-        print(f"{prefix}_head_RMSE=nan")
-        print(f"{prefix}_head_signed_mean=nan")
         print(f"{prefix}_head_pearson=nan")
-        print(f"{prefix}_target_mean=nan")
-        print(f"{prefix}_target_std=nan")
-        print(f"{prefix}_target_min=nan")
-        print(f"{prefix}_target_p50=nan")
-        print(f"{prefix}_target_p90=nan")
-        print(f"{prefix}_target_p99=nan")
-        print(f"{prefix}_target_max=nan")
-        print(f"{prefix}_mean_baseline_MAE=nan")
-        print(f"{prefix}_median_baseline_MAE=nan")
-        print(f"{prefix}_head_confusion=nan")
-        for group in ("los", "nlos"):
-            print(f"{prefix}_{group}_count=0")
-            print(f"{prefix}_{group}_head_MAE=nan")
-            print(f"{prefix}_{group}_head_RMSE=nan")
-            print(f"{prefix}_{group}_head_signed_mean=nan")
+        if verbose:
+            print(f"{prefix}_head_RMSE=nan")
+            print(f"{prefix}_head_signed_mean=nan")
+            print(f"{prefix}_head_far_miss_fraction=nan")
+            print(f"{prefix}_target_mean=nan")
+            print(f"{prefix}_target_std=nan")
+            print(f"{prefix}_target_min=nan")
+            print(f"{prefix}_target_p50=nan")
+            print(f"{prefix}_target_p90=nan")
+            print(f"{prefix}_target_p99=nan")
+            print(f"{prefix}_target_max=nan")
+            print(f"{prefix}_mean_baseline_MAE=nan")
+            print(f"{prefix}_median_baseline_MAE=nan")
+            print(f"{prefix}_head_confusion=nan")
+            for group in ("los", "nlos"):
+                print(f"{prefix}_{group}_count=0")
+                print(f"{prefix}_{group}_head_MAE=nan")
+                print(f"{prefix}_{group}_head_RMSE=nan")
+                print(f"{prefix}_{group}_head_signed_mean=nan")
         return
 
     valid_targets = target_labels[valid_mask]
@@ -2110,6 +2211,17 @@ def _print_single_interaction_count_head(
         confusion[int(target_label), int(predicted_label)] += 1
     adjacent_hits = (valid_predictions - valid_targets).abs() <= 1
     far_misses = (valid_predictions - valid_targets).abs() > 1
+    if verbose:
+        print(
+            f"{prefix}_head_far_miss_fraction="
+            f"{float(far_misses.float().mean()):.4f}"
+        )
+    scale = PHYSICS_TARGET_SCALES[target_idx].to(dtype=predictions.dtype)
+    offset = PHYSICS_TARGET_OFFSETS[target_idx].to(dtype=predictions.dtype)
+    raw_predictions = predictions * scale + offset
+    valid_raw_predictions = raw_predictions[valid_mask]
+    errors = valid_raw_predictions - valid_raw_targets
+    print(f"{prefix}_head_MAE={float(errors.abs().mean()):.4f}")
     print(
         f"{prefix}_head_accuracy="
         f"{float((valid_predictions == valid_targets).float().mean()):.4f}"
@@ -2119,61 +2231,52 @@ def _print_single_interaction_count_head(
         f"{float(adjacent_hits.float().mean()):.4f}"
     )
     print(
-        f"{prefix}_head_far_miss_fraction="
-        f"{float(far_misses.float().mean()):.4f}"
-    )
-    scale = PHYSICS_TARGET_SCALES[target_idx].to(dtype=predictions.dtype)
-    offset = PHYSICS_TARGET_OFFSETS[target_idx].to(dtype=predictions.dtype)
-    raw_predictions = predictions * scale + offset
-    valid_raw_predictions = raw_predictions[valid_mask]
-    errors = valid_raw_predictions - valid_raw_targets
-    print(f"{prefix}_head_MAE={float(errors.abs().mean()):.4f}")
-    print(f"{prefix}_head_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
-    print(f"{prefix}_head_signed_mean={float(errors.mean()):.4f}")
-    print(
         f"{prefix}_head_pearson="
         f"{_safe_pearson(valid_raw_predictions.float(), valid_raw_targets.float()):.4f}"
     )
-    print(f"{prefix}_target_mean={float(target_mean):.4f}")
-    print(f"{prefix}_target_std={float(valid_raw_targets.float().std(correction=0)):.4f}")
-    print(f"{prefix}_target_min={float(valid_raw_targets.min()):.4f}")
-    print(f"{prefix}_target_p50={float(target_quantiles[0]):.4f}")
-    print(f"{prefix}_target_p90={float(target_quantiles[1]):.4f}")
-    print(f"{prefix}_target_p99={float(target_quantiles[2]):.4f}")
-    print(f"{prefix}_target_max={float(valid_raw_targets.max()):.4f}")
-    print(
-        f"{prefix}_mean_baseline_MAE="
-        f"{float((valid_raw_targets - target_mean).abs().mean()):.4f}"
-    )
-    print(
-        f"{prefix}_median_baseline_MAE="
-        f"{float((valid_raw_targets - target_median).abs().mean()):.4f}"
-    )
-    print(
-        f"{prefix}_target_histogram="
-        + ",".join(
-            f"{label}:{int((valid_targets == idx).sum().item())}"
-            for idx, label in enumerate(bin_labels)
+    if verbose:
+        print(f"{prefix}_head_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
+        print(f"{prefix}_head_signed_mean={float(errors.mean()):.4f}")
+        print(f"{prefix}_target_mean={float(target_mean):.4f}")
+        print(f"{prefix}_target_std={float(valid_raw_targets.float().std(correction=0)):.4f}")
+        print(f"{prefix}_target_min={float(valid_raw_targets.min()):.4f}")
+        print(f"{prefix}_target_p50={float(target_quantiles[0]):.4f}")
+        print(f"{prefix}_target_p90={float(target_quantiles[1]):.4f}")
+        print(f"{prefix}_target_p99={float(target_quantiles[2]):.4f}")
+        print(f"{prefix}_target_max={float(valid_raw_targets.max()):.4f}")
+        print(
+            f"{prefix}_mean_baseline_MAE="
+            f"{float((valid_raw_targets - target_mean).abs().mean()):.4f}"
         )
-    )
-    print(
-        f"{prefix}_head_confusion="
-        + ";".join(
-            f"{bin_labels[row]}:"
+        print(
+            f"{prefix}_median_baseline_MAE="
+            f"{float((valid_raw_targets - target_median).abs().mean()):.4f}"
+        )
+        print(
+            f"{prefix}_target_histogram="
             + ",".join(
-                f"{bin_labels[col]}:{int(confusion[row, col].item())}"
-                for col in range(len(bin_labels))
+                f"{label}:{int((valid_targets == idx).sum().item())}"
+                for idx, label in enumerate(bin_labels)
             )
-            for row in range(len(bin_labels))
         )
-    )
-    print(
-        f"{prefix}_prediction_histogram="
-        + ",".join(
-            f"{label}:{int((valid_predictions == idx).sum().item())}"
-            for idx, label in enumerate(bin_labels)
+        print(
+            f"{prefix}_head_confusion="
+            + ";".join(
+                f"{bin_labels[row]}:"
+                + ",".join(
+                    f"{bin_labels[col]}:{int(confusion[row, col].item())}"
+                    for col in range(len(bin_labels))
+                )
+                for row in range(len(bin_labels))
+            )
         )
-    )
+        print(
+            f"{prefix}_prediction_histogram="
+            + ",".join(
+                f"{label}:{int((valid_predictions == idx).sum().item())}"
+                for idx, label in enumerate(bin_labels)
+            )
+        )
 
     los_mask = torch.tensor(
         [key.los_status == "los" for key in semantic_keys],
@@ -2206,8 +2309,9 @@ def _print_single_interaction_count_head(
             f"{float(group_errors.mean()):.4f}"
         )
 
-    print_group("los", los_mask)
-    print_group("nlos", ~los_mask)
+    if verbose:
+        print_group("los", los_mask)
+        print_group("nlos", ~los_mask)
 
 
 def _print_interaction_count_head_diagnostics(
@@ -2216,6 +2320,7 @@ def _print_interaction_count_head_diagnostics(
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
     semantic_keys: list[SemanticKey],
+    verbose: bool = False,
 ) -> None:
     _print_single_interaction_count_head(
         "reflection_count",
@@ -2227,6 +2332,7 @@ def _print_interaction_count_head_diagnostics(
         physics_raw_targets,
         physics_masks,
         semantic_keys,
+        verbose=verbose,
     )
 
 
@@ -2235,14 +2341,17 @@ def _print_angle_diagnostics(
     predictions: torch.Tensor,
     targets: torch.Tensor,
     mask: torch.Tensor,
+    verbose: bool = False,
 ) -> None:
     count = int(mask.sum().item())
-    print(f"{prefix}_count={count}")
+    if verbose:
+        print(f"{prefix}_count={count}")
     if count == 0:
         print(f"{prefix}_MAE=nan")
-        print(f"{prefix}_accuracy@10deg=nan")
-        print(f"{prefix}_accuracy@30deg=nan")
-        print(f"{prefix}_signed_mean=nan")
+        if verbose:
+            print(f"{prefix}_accuracy@10deg=nan")
+            print(f"{prefix}_accuracy@30deg=nan")
+            print(f"{prefix}_signed_mean=nan")
         return
     valid_predictions = F.normalize(predictions[mask], dim=-1, eps=1e-6)
     valid_targets = F.normalize(targets[mask], dim=-1, eps=1e-6)
@@ -2255,12 +2364,13 @@ def _print_angle_diagnostics(
     angle_error_deg = signed_angle_error.abs() * (180.0 / math.pi)
     signed_error_deg = signed_angle_error * (180.0 / math.pi)
     print(f"{prefix}_MAE={float(angle_error_deg.mean()):.4f}")
-    for threshold in (10.0, 30.0):
-        print(
-            f"{prefix}_accuracy@{_format_scalar(threshold)}deg="
-            f"{float((angle_error_deg <= threshold).float().mean()):.4f}"
-        )
-    print(f"{prefix}_signed_mean={float(signed_error_deg.mean()):.4f}")
+    if verbose:
+        for threshold in (10.0, 30.0):
+            print(
+                f"{prefix}_accuracy@{_format_scalar(threshold)}deg="
+                f"{float((angle_error_deg <= threshold).float().mean()):.4f}"
+            )
+        print(f"{prefix}_signed_mean={float(signed_error_deg.mean()):.4f}")
 
 
 def _metric_suffix(value: str) -> str:
@@ -2305,6 +2415,7 @@ def _print_first_path_angle_diagnostics(
     physics_targets: torch.Tensor,
     physics_masks: torch.Tensor,
     semantic_keys: list[SemanticKey],
+    verbose: bool = False,
 ) -> None:
     sin_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_sin")
     cos_idx = PHYSICS_TARGET_NAMES.index("first_path_aoa_az_cos")
@@ -2320,23 +2431,27 @@ def _print_first_path_angle_diagnostics(
         dtype=torch.bool,
         device=mask.device,
     )
-    _print_angle_diagnostics(
-        "first_path_angle",
-        predictions=predictions,
-        targets=targets,
-        mask=mask,
-    )
+    if verbose:
+        _print_angle_diagnostics(
+            "first_path_angle",
+            predictions=predictions,
+            targets=targets,
+            mask=mask,
+            verbose=True,
+        )
     _print_angle_diagnostics(
         "first_path_angle_los",
         predictions=predictions,
         targets=targets,
         mask=mask & los_mask,
+        verbose=verbose,
     )
     _print_angle_diagnostics(
         "first_path_angle_nlos",
         predictions=predictions,
         targets=targets,
         mask=mask & ~los_mask,
+        verbose=verbose,
     )
 
 
@@ -2454,6 +2569,7 @@ def _print_structured_physical_description_metrics(
     prototype_logits: torch.Tensor,
     prototype_keys: list[SemanticKey],
     example_count: int,
+    print_examples: bool = False,
 ) -> None:
     raw_predictions = _physics_raw_predictions(physics_predictions)
     predicted_labels = prototype_logits.argmax(dim=1)
@@ -2513,6 +2629,9 @@ def _print_structured_physical_description_metrics(
         else:
             print("physical_description_sentence_level_accuracy=nan")
             print("physical_description_sentence_level_valid_samples=0")
+
+    if not print_examples:
+        return
 
     for idx in range(min(example_count, raw_predictions.shape[0])):
         predicted_record = _structured_physical_record(
@@ -2668,23 +2787,27 @@ def _print_first_path_power_diagnostics(
     semantic_keys: list[SemanticKey],
     prototype_logits: torch.Tensor,
     prototype_keys: list[SemanticKey],
+    verbose: bool = False,
 ) -> None:
     first_path_power_idx = _physics_target_index("first_path_power_dbw")
     first_path_power_mask = physics_masks[:, first_path_power_idx]
     if not bool(first_path_power_mask.any()):
         print("base_first_power_MAE=nan")
         print("enhanced_first_power_MAE=nan")
-        print("final_first_power_MAE=nan")
-        print("los_base_first_power_MAE=nan")
-        print("los_enhanced_first_power_MAE=nan")
-        print("los_final_first_power_MAE=nan")
-        print("nlos_base_first_power_MAE=nan")
-        print("nlos_enhanced_first_power_MAE=nan")
-        print("nlos_final_first_power_MAE=nan")
-        print("oracle_los_base_nlos_enhanced_first_power_MAE=nan")
-        print("oracle_los_enhanced_nlos_base_first_power_MAE=nan")
-        print("predicted_los_status_first_power_accuracy=nan")
-        print("predicted_los_base_nlos_enhanced_first_power_MAE=nan")
+        print("los_first_power_MAE=nan")
+        print("nlos_first_power_MAE=nan")
+        if verbose:
+            print("final_first_power_MAE=nan")
+            print("los_base_first_power_MAE=nan")
+            print("los_enhanced_first_power_MAE=nan")
+            print("los_final_first_power_MAE=nan")
+            print("nlos_base_first_power_MAE=nan")
+            print("nlos_enhanced_first_power_MAE=nan")
+            print("nlos_final_first_power_MAE=nan")
+            print("oracle_los_base_nlos_enhanced_first_power_MAE=nan")
+            print("oracle_los_enhanced_nlos_base_first_power_MAE=nan")
+            print("predicted_los_status_first_power_accuracy=nan")
+            print("predicted_los_base_nlos_enhanced_first_power_MAE=nan")
         return
 
     base_physics_raw_predictions = _physics_raw_predictions(base_physics_predictions)
@@ -2701,29 +2824,37 @@ def _print_first_path_power_diagnostics(
 
     print(f"base_first_power_MAE={float((masked_base_raw - masked_target_raw).abs().mean()):.4f}")
     print(f"enhanced_first_power_MAE={float((masked_enhanced_raw - masked_target_raw).abs().mean()):.4f}")
-    print(f"final_first_power_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
+    if verbose:
+        print(f"final_first_power_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
 
     def print_group_mae(prefix: str, group_mask: torch.Tensor) -> None:
         mask = first_path_power_mask & group_mask
         if not bool(mask.any()):
-            print(f"{prefix}_base_first_power_MAE=nan")
-            print(f"{prefix}_enhanced_first_power_MAE=nan")
-            print(f"{prefix}_final_first_power_MAE=nan")
+            print(f"{prefix}_first_power_MAE=nan")
+            if verbose:
+                print(f"{prefix}_base_first_power_MAE=nan")
+                print(f"{prefix}_enhanced_first_power_MAE=nan")
+                print(f"{prefix}_final_first_power_MAE=nan")
             return
         group_base_raw = base_physics_raw_predictions[mask, first_path_power_idx]
         group_enhanced_raw = enhanced_raw_predictions[mask]
         group_final_raw = final_physics_raw_predictions[mask, first_path_power_idx]
         group_target_raw = physics_raw_targets[mask, first_path_power_idx]
+        if verbose:
+            print(
+                f"{prefix}_base_first_power_MAE="
+                f"{float((group_base_raw - group_target_raw).abs().mean()):.4f}"
+            )
+            print(
+                f"{prefix}_enhanced_first_power_MAE="
+                f"{float((group_enhanced_raw - group_target_raw).abs().mean()):.4f}"
+            )
+            print(
+                f"{prefix}_final_first_power_MAE="
+                f"{float((group_final_raw - group_target_raw).abs().mean()):.4f}"
+            )
         print(
-            f"{prefix}_base_first_power_MAE="
-            f"{float((group_base_raw - group_target_raw).abs().mean()):.4f}"
-        )
-        print(
-            f"{prefix}_enhanced_first_power_MAE="
-            f"{float((group_enhanced_raw - group_target_raw).abs().mean()):.4f}"
-        )
-        print(
-            f"{prefix}_final_first_power_MAE="
+            f"{prefix}_first_power_MAE="
             f"{float((group_final_raw - group_target_raw).abs().mean()):.4f}"
         )
 
@@ -2734,6 +2865,9 @@ def _print_first_path_power_diagnostics(
     )
     print_group_mae("los", los_mask)
     print_group_mae("nlos", ~los_mask)
+
+    if not verbose:
+        return
 
     def print_fused_mae(prefix: str, use_base_mask: torch.Tensor) -> None:
         masked_use_base = use_base_mask[first_path_power_mask]
@@ -2766,21 +2900,16 @@ def _print_first_path_power_diagnostics(
     print_fused_mae("predicted_los_base_nlos_enhanced", predicted_los_mask)
 
 
-def _print_delay_family_diagnostics(
+def _print_first_path_delay_metrics(
     first_path_delay_predictions: torch.Tensor,
     first_path_delay_bin_logits: torch.Tensor | None,
     first_path_delay_bin_positions: torch.Tensor | None,
     first_path_delay_bin_fused_raw: torch.Tensor | None,
     first_path_delay_bin_soft_fused_raw: torch.Tensor | None,
-    los_delay_predictions: torch.Tensor,
-    los_angle_predictions: torch.Tensor,
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
-    los_delay_raw_targets: torch.Tensor,
-    los_delay_masks: torch.Tensor,
-    los_angle_targets: torch.Tensor,
-    los_angle_masks: torch.Tensor,
     semantic_keys: list[SemanticKey],
+    verbose: bool = False,
 ) -> None:
     del first_path_delay_bin_positions
     first_delay_idx = _physics_target_index("first_path_delay_ns")
@@ -2797,59 +2926,76 @@ def _print_delay_family_diagnostics(
         first_delay_target = physics_raw_targets[first_delay_mask, first_delay_idx]
         first_delay_pred = first_delay_raw[first_delay_mask]
         first_delay_errors = first_delay_pred - first_delay_target
-        print(f"first_path_delay_context_count={int(first_delay_mask.sum().item())}")
+        if verbose:
+            print(f"first_path_delay_context_count={int(first_delay_mask.sum().item())}")
         print(f"first_path_delay_context_MAE={float(first_delay_errors.abs().mean()):.4f}")
-        print(f"first_path_delay_context_signed_mean={float(first_delay_errors.mean()):.4f}")
+        if verbose:
+            print(f"first_path_delay_context_signed_mean={float(first_delay_errors.mean()):.4f}")
         _print_first_path_delay_group_metrics(
-            prefix="first_path_delay_context_los",
+            prefix="first_path_delay_los",
             predictions=first_delay_raw,
             targets=physics_raw_targets[:, first_delay_idx],
             mask=first_delay_mask & los_sample_mask,
+            verbose=verbose,
         )
         _print_first_path_delay_group_metrics(
-            prefix="first_path_delay_context_nlos",
+            prefix="first_path_delay_nlos",
             predictions=first_delay_raw,
             targets=physics_raw_targets[:, first_delay_idx],
             mask=first_delay_mask & ~los_sample_mask,
+            verbose=verbose,
         )
-        if first_path_delay_bin_logits is not None:
+        if verbose and first_path_delay_bin_logits is not None:
             _print_first_path_delay_bin_head_diagnostics(
                 target_raw=first_delay_target,
                 bin_logits=first_path_delay_bin_logits[first_delay_mask],
             )
-        if first_path_delay_bin_fused_raw is not None:
+        if verbose and first_path_delay_bin_fused_raw is not None:
             fused_pred = first_path_delay_bin_fused_raw.to(dtype=first_delay_raw.dtype)
-            fused_target = physics_raw_targets[:, first_delay_idx]
             fused_errors = fused_pred[first_delay_mask] - first_delay_target
             print(f"first_path_delay_bin_fused_MAE={float(fused_errors.abs().mean()):.4f}")
             print(f"first_path_delay_bin_fused_signed_mean={float(fused_errors.mean()):.4f}")
-        if first_path_delay_bin_soft_fused_raw is not None:
+        if verbose and first_path_delay_bin_soft_fused_raw is not None:
             soft_fused_pred = first_path_delay_bin_soft_fused_raw.to(dtype=first_delay_raw.dtype)
-            fused_target = physics_raw_targets[:, first_delay_idx]
             soft_fused_errors = soft_fused_pred[first_delay_mask] - first_delay_target
             print(f"first_path_delay_bin_soft_fused_MAE={float(soft_fused_errors.abs().mean()):.4f}")
             print(f"first_path_delay_bin_soft_fused_signed_mean={float(soft_fused_errors.mean()):.4f}")
     else:
-        print("first_path_delay_context_count=0")
+        if verbose:
+            print("first_path_delay_context_count=0")
         print("first_path_delay_context_MAE=nan")
-        print("first_path_delay_context_signed_mean=nan")
-        print("first_path_delay_context_los_count=0")
-        print("first_path_delay_context_los_MAE=nan")
-        print("first_path_delay_context_los_signed_mean=nan")
-        print("first_path_delay_context_nlos_count=0")
-        print("first_path_delay_context_nlos_MAE=nan")
-        print("first_path_delay_context_nlos_signed_mean=nan")
-        if first_path_delay_bin_fused_raw is not None:
+        if verbose:
+            print("first_path_delay_context_signed_mean=nan")
+        print("first_path_delay_los_MAE=nan")
+        print("first_path_delay_nlos_MAE=nan")
+        if verbose and first_path_delay_bin_fused_raw is not None:
             print("first_path_delay_bin_fused_MAE=nan")
             print("first_path_delay_bin_fused_signed_mean=nan")
-        if first_path_delay_bin_soft_fused_raw is not None:
+        if verbose and first_path_delay_bin_soft_fused_raw is not None:
             print("first_path_delay_bin_soft_fused_MAE=nan")
             print("first_path_delay_bin_soft_fused_signed_mean=nan")
+
+
+def _print_los_delay_angle_metrics(
+    los_delay_predictions: torch.Tensor,
+    los_angle_predictions: torch.Tensor,
+    los_delay_raw_targets: torch.Tensor,
+    los_delay_masks: torch.Tensor,
+    los_angle_targets: torch.Tensor,
+    los_angle_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+    verbose: bool = False,
+) -> None:
+    los_sample_mask = torch.tensor(
+        [key.los_status == "los" for key in semantic_keys],
+        dtype=torch.bool,
+    )
     los_delay_mask = los_delay_masks & los_sample_mask
     _print_los_delay_diagnostics(
         predictions=los_delay_predictions * 3000.0,
         targets=los_delay_raw_targets,
         mask=los_delay_mask,
+        verbose=verbose,
     )
     los_angle_mask = (
         los_angle_masks
@@ -2860,6 +3006,109 @@ def _print_delay_family_diagnostics(
         predictions=los_angle_predictions,
         targets=los_angle_targets,
         mask=los_angle_mask,
+        verbose=verbose,
+    )
+
+
+def _print_delay_family_diagnostics(
+    first_path_delay_predictions: torch.Tensor,
+    first_path_delay_bin_logits: torch.Tensor | None,
+    first_path_delay_bin_positions: torch.Tensor | None,
+    first_path_delay_bin_fused_raw: torch.Tensor | None,
+    first_path_delay_bin_soft_fused_raw: torch.Tensor | None,
+    los_delay_predictions: torch.Tensor,
+    los_angle_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    los_delay_raw_targets: torch.Tensor,
+    los_delay_masks: torch.Tensor,
+    los_angle_targets: torch.Tensor,
+    los_angle_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+    verbose: bool = False,
+) -> None:
+    del first_path_delay_bin_positions
+    first_delay_idx = _physics_target_index("first_path_delay_ns")
+    first_delay_raw = (
+        first_path_delay_predictions * PHYSICS_TARGET_SCALES[first_delay_idx]
+        + PHYSICS_TARGET_OFFSETS[first_delay_idx]
+    )
+    first_delay_mask = physics_masks[:, first_delay_idx]
+    los_sample_mask = torch.tensor(
+        [key.los_status == "los" for key in semantic_keys],
+        dtype=torch.bool,
+    )
+    if bool(first_delay_mask.any()):
+        first_delay_target = physics_raw_targets[first_delay_mask, first_delay_idx]
+        first_delay_pred = first_delay_raw[first_delay_mask]
+        first_delay_errors = first_delay_pred - first_delay_target
+        if verbose:
+            print(f"first_path_delay_context_count={int(first_delay_mask.sum().item())}")
+        print(f"first_path_delay_context_MAE={float(first_delay_errors.abs().mean()):.4f}")
+        if verbose:
+            print(f"first_path_delay_context_signed_mean={float(first_delay_errors.mean()):.4f}")
+        _print_first_path_delay_group_metrics(
+            prefix="first_path_delay_los",
+            predictions=first_delay_raw,
+            targets=physics_raw_targets[:, first_delay_idx],
+            mask=first_delay_mask & los_sample_mask,
+            verbose=verbose,
+        )
+        _print_first_path_delay_group_metrics(
+            prefix="first_path_delay_nlos",
+            predictions=first_delay_raw,
+            targets=physics_raw_targets[:, first_delay_idx],
+            mask=first_delay_mask & ~los_sample_mask,
+            verbose=verbose,
+        )
+        if verbose and first_path_delay_bin_logits is not None:
+            _print_first_path_delay_bin_head_diagnostics(
+                target_raw=first_delay_target,
+                bin_logits=first_path_delay_bin_logits[first_delay_mask],
+            )
+        if verbose and first_path_delay_bin_fused_raw is not None:
+            fused_pred = first_path_delay_bin_fused_raw.to(dtype=first_delay_raw.dtype)
+            fused_target = physics_raw_targets[:, first_delay_idx]
+            fused_errors = fused_pred[first_delay_mask] - first_delay_target
+            print(f"first_path_delay_bin_fused_MAE={float(fused_errors.abs().mean()):.4f}")
+            print(f"first_path_delay_bin_fused_signed_mean={float(fused_errors.mean()):.4f}")
+        if verbose and first_path_delay_bin_soft_fused_raw is not None:
+            soft_fused_pred = first_path_delay_bin_soft_fused_raw.to(dtype=first_delay_raw.dtype)
+            fused_target = physics_raw_targets[:, first_delay_idx]
+            soft_fused_errors = soft_fused_pred[first_delay_mask] - first_delay_target
+            print(f"first_path_delay_bin_soft_fused_MAE={float(soft_fused_errors.abs().mean()):.4f}")
+            print(f"first_path_delay_bin_soft_fused_signed_mean={float(soft_fused_errors.mean()):.4f}")
+    else:
+        if verbose:
+            print("first_path_delay_context_count=0")
+        print("first_path_delay_context_MAE=nan")
+        if verbose:
+            print("first_path_delay_context_signed_mean=nan")
+        print("first_path_delay_los_MAE=nan")
+        print("first_path_delay_nlos_MAE=nan")
+        if verbose and first_path_delay_bin_fused_raw is not None:
+            print("first_path_delay_bin_fused_MAE=nan")
+            print("first_path_delay_bin_fused_signed_mean=nan")
+        if verbose and first_path_delay_bin_soft_fused_raw is not None:
+            print("first_path_delay_bin_soft_fused_MAE=nan")
+            print("first_path_delay_bin_soft_fused_signed_mean=nan")
+    los_delay_mask = los_delay_masks & los_sample_mask
+    _print_los_delay_diagnostics(
+        predictions=los_delay_predictions * 3000.0,
+        targets=los_delay_raw_targets,
+        mask=los_delay_mask,
+        verbose=verbose,
+    )
+    los_angle_mask = (
+        los_angle_masks
+        & los_sample_mask
+        & torch.isfinite(los_angle_targets).all(dim=1)
+    )
+    _print_los_angle_diagnostics(
+        predictions=los_angle_predictions,
+        targets=los_angle_targets,
+        mask=los_angle_mask,
+        verbose=verbose,
     )
 
 
@@ -2867,12 +3116,14 @@ def _print_los_angle_diagnostics(
     predictions: torch.Tensor,
     targets: torch.Tensor,
     mask: torch.Tensor,
+    verbose: bool = False,
 ) -> None:
     _print_angle_diagnostics(
         "los_angle",
         predictions=predictions,
         targets=targets,
         mask=mask,
+        verbose=verbose,
     )
 
 
@@ -2881,16 +3132,20 @@ def _print_first_path_delay_group_metrics(
     predictions: torch.Tensor,
     targets: torch.Tensor,
     mask: torch.Tensor,
+    verbose: bool = False,
 ) -> None:
     count = int(mask.sum().item())
-    print(f"{prefix}_count={count}")
+    if verbose:
+        print(f"{prefix}_count={count}")
     if count == 0:
         print(f"{prefix}_MAE=nan")
-        print(f"{prefix}_signed_mean=nan")
+        if verbose:
+            print(f"{prefix}_signed_mean=nan")
         return
     errors = predictions[mask] - targets[mask]
     print(f"{prefix}_MAE={float(errors.abs().mean()):.4f}")
-    print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
+    if verbose:
+        print(f"{prefix}_signed_mean={float(errors.mean()):.4f}")
 
 
 def _first_path_delay_bin_targets(raw_first_path_delay_ns: torch.Tensor) -> torch.Tensor:
@@ -2937,14 +3192,17 @@ def _print_los_delay_diagnostics(
     predictions: torch.Tensor,
     targets: torch.Tensor,
     mask: torch.Tensor,
+    verbose: bool = False,
 ) -> None:
-    print(f"los_delay_context_count={int(mask.sum().item())}")
+    if verbose:
+        print(f"los_delay_context_count={int(mask.sum().item())}")
     if not bool(mask.any()):
         print("los_delay_context_MAE=nan")
-        print("los_delay_context_signed_mean=nan")
-        print("los_delay_context_RMSE=nan")
-        print("los_delay_context_pearson=nan")
-        print("los_delay_context_accuracy@50ns=nan")
+        if verbose:
+            print("los_delay_context_signed_mean=nan")
+            print("los_delay_context_RMSE=nan")
+            print("los_delay_context_pearson=nan")
+            print("los_delay_context_accuracy@50ns=nan")
         return
 
     pred = predictions[mask].float()
@@ -2952,10 +3210,11 @@ def _print_los_delay_diagnostics(
     errors = pred - target
     abs_errors = errors.abs()
     print(f"los_delay_context_MAE={float(abs_errors.mean()):.4f}")
-    print(f"los_delay_context_signed_mean={float(errors.mean()):.4f}")
-    print(f"los_delay_context_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
-    print(f"los_delay_context_pearson={_safe_pearson(pred, target):.4f}")
-    print(f"los_delay_context_accuracy@50ns={float((abs_errors <= 50.0).float().mean()):.4f}")
+    if verbose:
+        print(f"los_delay_context_signed_mean={float(errors.mean()):.4f}")
+        print(f"los_delay_context_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
+        print(f"los_delay_context_pearson={_safe_pearson(pred, target):.4f}")
+        print(f"los_delay_context_accuracy@50ns={float((abs_errors <= 50.0).float().mean()):.4f}")
 
 
 def _print_delay_spread_diagnostics(
@@ -2971,6 +3230,7 @@ def _print_delay_spread_diagnostics(
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
     raw_beta_ns: float,
+    verbose: bool = False,
 ) -> None:
     del base_physics_predictions
     del csi_delay_spread_predictions
@@ -2980,14 +3240,16 @@ def _print_delay_spread_diagnostics(
     delay_spread_idx = _physics_target_index("delay_spread_ns")
     delay_spread_mask = physics_masks[:, delay_spread_idx]
     if not bool(delay_spread_mask.any()):
-        print("delay_context_spread_MAE=nan")
-        print("delay_context_spread_normalized_MAE=nan")
-        print("delay_context_spread_normalized_smooth_l1=nan")
-        print("delay_context_spread_raw_huber=nan")
-        print("final_delay_spread_MAE=nan")
-        print("final_delay_spread_normalized_MAE=nan")
-        print("final_delay_spread_normalized_smooth_l1=nan")
-        print("final_delay_spread_raw_huber=nan")
+        print("delay_spread_MAE=nan")
+        if verbose:
+            print("delay_context_spread_MAE=nan")
+            print("final_delay_spread_MAE=nan")
+            print("delay_context_spread_normalized_MAE=nan")
+            print("delay_context_spread_normalized_smooth_l1=nan")
+            print("delay_context_spread_raw_huber=nan")
+            print("final_delay_spread_normalized_MAE=nan")
+            print("final_delay_spread_normalized_smooth_l1=nan")
+            print("final_delay_spread_raw_huber=nan")
         return
 
     final_physics_raw_predictions = _physics_raw_predictions(physics_predictions)
@@ -3034,38 +3296,43 @@ def _print_delay_spread_diagnostics(
         ).mean()
 
     if masked_delay_context_raw is not None and masked_delay_context_normalized is not None:
-        print(f"delay_context_spread_MAE={float((masked_delay_context_raw - masked_target_raw).abs().mean()):.4f}")
-        print(
-            "delay_context_spread_normalized_MAE="
-            f"{float((masked_delay_context_normalized - masked_target_normalized).abs().mean()):.4f}"
-        )
-        print(
-            "delay_context_spread_normalized_smooth_l1="
-            f"{float(_smooth_l1_mean(masked_delay_context_normalized, masked_target_normalized)):.4f}"
-        )
-        print(
-            "delay_context_spread_raw_huber="
-            f"{float(_raw_huber_mean(masked_delay_context_raw, masked_target_raw)):.4f}"
-        )
+        if verbose:
+            print(f"delay_context_spread_MAE={float((masked_delay_context_raw - masked_target_raw).abs().mean()):.4f}")
+            print(
+                "delay_context_spread_normalized_MAE="
+                f"{float((masked_delay_context_normalized - masked_target_normalized).abs().mean()):.4f}"
+            )
+            print(
+                "delay_context_spread_normalized_smooth_l1="
+                f"{float(_smooth_l1_mean(masked_delay_context_normalized, masked_target_normalized)):.4f}"
+            )
+            print(
+                "delay_context_spread_raw_huber="
+                f"{float(_raw_huber_mean(masked_delay_context_raw, masked_target_raw)):.4f}"
+            )
     else:
-        print("delay_context_spread_MAE=nan")
-        print("delay_context_spread_normalized_MAE=nan")
-        print("delay_context_spread_normalized_smooth_l1=nan")
-        print("delay_context_spread_raw_huber=nan")
-    print(f"final_delay_spread_MAE={float((masked_final_raw - masked_target_raw).abs().mean()):.4f}")
-    print(
-        "final_delay_spread_normalized_MAE="
-        f"{float((masked_final_normalized - masked_target_normalized).abs().mean()):.4f}"
-    )
-    print(
-        "final_delay_spread_normalized_smooth_l1="
-        f"{float(_smooth_l1_mean(masked_final_normalized, masked_target_normalized)):.4f}"
-    )
-    print(
-        "final_delay_spread_raw_huber="
-        f"{float(_raw_huber_mean(masked_final_raw, masked_target_raw)):.4f}"
-    )
-    if delay_spread_bin_logits is not None:
+        if verbose:
+            print("delay_context_spread_MAE=nan")
+            print("delay_context_spread_normalized_MAE=nan")
+            print("delay_context_spread_normalized_smooth_l1=nan")
+            print("delay_context_spread_raw_huber=nan")
+    final_delay_spread_mae = float((masked_final_raw - masked_target_raw).abs().mean())
+    print(f"delay_spread_MAE={final_delay_spread_mae:.4f}")
+    if verbose:
+        print(f"final_delay_spread_MAE={final_delay_spread_mae:.4f}")
+        print(
+            "final_delay_spread_normalized_MAE="
+            f"{float((masked_final_normalized - masked_target_normalized).abs().mean()):.4f}"
+        )
+        print(
+            "final_delay_spread_normalized_smooth_l1="
+            f"{float(_smooth_l1_mean(masked_final_normalized, masked_target_normalized)):.4f}"
+        )
+        print(
+            "final_delay_spread_raw_huber="
+            f"{float(_raw_huber_mean(masked_final_raw, masked_target_raw)):.4f}"
+        )
+    if verbose and delay_spread_bin_logits is not None:
         masked_bin_logits = delay_spread_bin_logits[delay_spread_mask]
         masked_bin_positions = (
             delay_spread_bin_positions[delay_spread_mask]
@@ -3076,6 +3343,7 @@ def _print_delay_spread_diagnostics(
             target_raw=masked_target_raw,
             bin_logits=masked_bin_logits,
             bin_positions=masked_bin_positions,
+            verbose=verbose,
         )
 
 
@@ -3154,6 +3422,7 @@ def _print_delay_spread_bin_head_diagnostics(
     target_raw: torch.Tensor,
     bin_logits: torch.Tensor,
     bin_positions: torch.Tensor | None = None,
+    verbose: bool = False,
 ) -> None:
     target_labels = _delay_spread_bin_targets(target_raw)
     valid_mask = target_labels >= 0
@@ -3175,10 +3444,11 @@ def _print_delay_spread_bin_head_diagnostics(
     adjacent_hits = (valid_predictions - valid_targets).abs() <= 1
     far_misses = (valid_predictions - valid_targets).abs() > 1
     print(f"delay_spread_bin_head_count={int(valid_mask.sum().item())}")
-    print(
-        "delay_spread_bin_head_label_order="
-        + ",".join(DELAY_SPREAD_BIN_LABELS)
-    )
+    if verbose:
+        print(
+            "delay_spread_bin_head_label_order="
+            + ",".join(DELAY_SPREAD_BIN_LABELS)
+        )
     print(
         f"delay_spread_bin_head_accuracy="
         f"{float((predicted_labels[valid_mask] == target_labels[valid_mask]).float().mean()):.4f}"
@@ -3187,35 +3457,36 @@ def _print_delay_spread_bin_head_diagnostics(
         f"delay_spread_bin_head_adjacent_accuracy="
         f"{float(adjacent_hits.float().mean()):.4f}"
     )
-    print(
-        f"delay_spread_bin_head_far_miss_fraction="
-        f"{float(far_misses.float().mean()):.4f}"
-    )
-    print(
-        "delay_spread_bin_head_target_histogram="
-        + ",".join(
-            f"{label}:{int((target_labels[valid_mask] == idx).sum().item())}"
-            for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS)
+    if verbose:
+        print(
+            f"delay_spread_bin_head_far_miss_fraction="
+            f"{float(far_misses.float().mean()):.4f}"
         )
-    )
-    print(
-        "delay_spread_bin_head_confusion="
-        + ";".join(
-            f"{DELAY_SPREAD_BIN_LABELS[row]}:"
+        print(
+            "delay_spread_bin_head_target_histogram="
             + ",".join(
-                f"{DELAY_SPREAD_BIN_LABELS[col]}:{int(confusion[row, col].item())}"
-                for col in range(len(DELAY_SPREAD_BIN_LABELS))
+                f"{label}:{int((target_labels[valid_mask] == idx).sum().item())}"
+                for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS)
             )
-            for row in range(len(DELAY_SPREAD_BIN_LABELS))
         )
-    )
-    print(
-        "delay_spread_bin_head_prediction_histogram="
-        + ",".join(
-            f"{label}:{int((predicted_labels[valid_mask] == idx).sum().item())}"
-            for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS)
+        print(
+            "delay_spread_bin_head_confusion="
+            + ";".join(
+                f"{DELAY_SPREAD_BIN_LABELS[row]}:"
+                + ",".join(
+                    f"{DELAY_SPREAD_BIN_LABELS[col]}:{int(confusion[row, col].item())}"
+                    for col in range(len(DELAY_SPREAD_BIN_LABELS))
+                )
+                for row in range(len(DELAY_SPREAD_BIN_LABELS))
+            )
         )
-    )
+        print(
+            "delay_spread_bin_head_prediction_histogram="
+            + ",".join(
+                f"{label}:{int((predicted_labels[valid_mask] == idx).sum().item())}"
+                for idx, label in enumerate(DELAY_SPREAD_BIN_LABELS)
+            )
+        )
     if bin_positions is None:
         print("delay_spread_bin_fused_MAE=nan")
         print("delay_spread_bin_soft_fused_MAE=nan")
@@ -3340,6 +3611,11 @@ def main() -> None:
             "and their structured records."
         ),
     )
+    parser.add_argument(
+        "--verbose-diagnostics",
+        action="store_true",
+        help="Print detailed histograms, confusions, class rows, and extra loss diagnostics.",
+    )
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     evaluate(
@@ -3368,6 +3644,7 @@ def main() -> None:
         attribute_binary_thresholds=parse_attribute_binary_thresholds(args.attribute_binary_threshold),
         physical_caption_examples=args.physical_caption_examples,
         save_signal_descriptions_path=args.save_signal_descriptions,
+        verbose_diagnostics=args.verbose_diagnostics,
     )
 
 

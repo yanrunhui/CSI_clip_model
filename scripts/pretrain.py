@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
+import time
 from collections import Counter
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 
@@ -51,6 +54,13 @@ from models.model import (
 from models.text_encoder import PhysicsTextEncoder
 from training.scheduler import build_lr_scheduler
 from training.trainer import TrainConfig, Trainer
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def load_train_config(path: str | None) -> dict:
@@ -769,6 +779,55 @@ def count_trainable_parameters(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
 
+def count_parameters(model: torch.nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(int(round(seconds)), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def build_runtime_metadata(
+    *,
+    model: torch.nn.Module,
+    device: torch.device,
+    seed: int,
+) -> dict[str, int | str | bool | None]:
+    cuda_available = torch.cuda.is_available()
+    gpu_name = "none"
+    gpu_count = 0
+    cuda_device_capability = "none"
+    if cuda_available:
+        gpu_count = torch.cuda.device_count()
+        device_index = torch.cuda.current_device()
+        gpu_name = torch.cuda.get_device_name(device_index)
+        cuda_device_capability = ".".join(
+            str(part) for part in torch.cuda.get_device_capability(device_index)
+        )
+    return {
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "none",
+        "cudnn_version": torch.backends.cudnn.version(),
+        "cuda_available": cuda_available,
+        "gpu_name": gpu_name,
+        "gpu_count": gpu_count,
+        "cuda_device_capability": cuda_device_capability,
+        "device": str(device),
+        "seed": seed,
+        "amp_enabled": False,
+        "model_parameters": count_parameters(model),
+        "model_trainable_parameters": count_trainable_parameters(model),
+    }
+
+
+def print_runtime_metadata(metadata: dict[str, int | str | bool | None]) -> None:
+    for key, value in metadata.items():
+        print(f"{key}={value}")
+
+
 def load_transfer_checkpoint(path: str | None, device: torch.device) -> dict | None:
     if path is None:
         return None
@@ -1413,6 +1472,7 @@ def run_real_pretrain(
     allow_prototype_mismatch_transfer: bool,
     freeze_csi: bool,
     freeze_text_prototypes: bool,
+    seed: int,
     output_dir: str,
     save_every: int,
 ) -> None:
@@ -1670,6 +1730,11 @@ def run_real_pretrain(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     log_path = output_path / "train_log.jsonl"
+    runtime_metadata = build_runtime_metadata(model=model, device=device, seed=seed)
+    training_start_time = datetime.now().astimezone().isoformat(timespec="seconds")
+    training_start_perf = time.perf_counter()
+    print_runtime_metadata(runtime_metadata)
+    print(f"training_start_time={training_start_time}")
 
     for epoch in range(1, epochs + 1):
         epoch_metrics = []
@@ -2331,9 +2396,23 @@ def run_real_pretrain(
                     "data_path": data_path,
                     "checkpoint": checkpoint_path,
                     "epochs": epochs,
+                    "seed": seed,
                     "lr": lr,
                     "weight_decay": weight_decay,
                     "batch_size": batch_size,
+                    "torch_version": runtime_metadata["torch_version"],
+                    "cuda_version": runtime_metadata["cuda_version"],
+                    "cudnn_version": runtime_metadata["cudnn_version"],
+                    "cuda_available": runtime_metadata["cuda_available"],
+                    "gpu_name": runtime_metadata["gpu_name"],
+                    "gpu_count": runtime_metadata["gpu_count"],
+                    "cuda_device_capability": runtime_metadata["cuda_device_capability"],
+                    "device": runtime_metadata["device"],
+                    "amp_enabled": runtime_metadata["amp_enabled"],
+                    "model_parameters": runtime_metadata["model_parameters"],
+                    "model_trainable_parameters": runtime_metadata["model_trainable_parameters"],
+                    "training_elapsed_seconds": time.perf_counter() - training_start_perf,
+                    "training_elapsed_hms": format_duration(time.perf_counter() - training_start_perf),
                     "temperature": temperature,
                     "token_norm_mode": token_norm_mode,
                     "use_power_branch": use_power_branch,
@@ -2444,6 +2523,26 @@ def run_real_pretrain(
             torch.save(checkpoint, output_path / "checkpoint_last.pt")
             print(f"saved checkpoint to {ckpt_path}")
 
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    training_elapsed_seconds = time.perf_counter() - training_start_perf
+    training_end_time = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(f"training_end_time={training_end_time}")
+    print(f"training_elapsed_seconds={training_elapsed_seconds:.2f}")
+    print(f"training_elapsed_hms={format_duration(training_elapsed_seconds)}")
+    runtime_summary = {
+        **runtime_metadata,
+        "training_start_time": training_start_time,
+        "training_end_time": training_end_time,
+        "training_elapsed_seconds": training_elapsed_seconds,
+        "training_elapsed_hms": format_duration(training_elapsed_seconds),
+    }
+    (output_path / "runtime_metadata.json").write_text(
+        json.dumps(runtime_summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(f"saved_runtime_metadata={output_path / 'runtime_metadata.json'}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -2463,6 +2562,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--config", type=str, default=str(ROOT / "configs" / "train.yaml"))
+    parser.add_argument("--seed", type=int, help="Random seed for reproducible training runs.")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--max-steps-per-epoch", type=int)
     parser.add_argument("--lr", type=float)
@@ -2486,17 +2586,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--use-delay-specific-encoder",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Use a separate convolutional/attention encoder for delay-spread heads.",
     )
     parser.add_argument(
         "--use-los-angle-context-encoder",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Use a beam-aware CSI encoder branch dedicated to the LoS angle head.",
     )
     parser.add_argument(
         "--use-first-path-angle-context-encoder",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Use a first-path selector context branch dedicated to first-path angle prediction.",
     )
     parser.add_argument(
@@ -2940,6 +3040,8 @@ def main() -> None:
     args = parser.parse_args()
 
     train_cfg = load_train_config(args.config)
+    seed = args.seed if args.seed is not None else int(cfg_get(train_cfg, "seed", 0))
+    set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     epochs = args.epochs if args.epochs is not None else int(cfg_get(train_cfg, "epochs", 3))
@@ -2973,17 +3075,20 @@ def main() -> None:
         if args.detach_first_path_delay_features is not None
         else cfg_get(train_cfg, "detach_first_path_delay_features", True)
     )
-    use_delay_specific_encoder = bool(
+    use_delay_specific_encoder = (
         args.use_delay_specific_encoder
-        or cfg_get(train_cfg, "use_delay_specific_encoder", False)
+        if args.use_delay_specific_encoder is not None
+        else bool(cfg_get(train_cfg, "use_delay_specific_encoder", False))
     )
-    use_los_angle_context_encoder = bool(
+    use_los_angle_context_encoder = (
         args.use_los_angle_context_encoder
-        or cfg_get(train_cfg, "use_los_angle_context_encoder", False)
+        if args.use_los_angle_context_encoder is not None
+        else bool(cfg_get(train_cfg, "use_los_angle_context_encoder", False))
     )
-    use_first_path_angle_context_encoder = bool(
+    use_first_path_angle_context_encoder = (
         args.use_first_path_angle_context_encoder
-        or cfg_get(train_cfg, "use_first_path_angle_context_encoder", False)
+        if args.use_first_path_angle_context_encoder is not None
+        else bool(cfg_get(train_cfg, "use_first_path_angle_context_encoder", False))
     )
     use_shared_physics_token = (
         args.use_shared_physics_token
@@ -3644,6 +3749,7 @@ def main() -> None:
             allow_prototype_mismatch_transfer=args.allow_prototype_mismatch_transfer,
             freeze_csi=freeze_csi,
             freeze_text_prototypes=freeze_text_prototypes,
+            seed=seed,
             output_dir=output_dir,
             save_every=save_every,
         )
