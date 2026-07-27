@@ -189,6 +189,52 @@ def _finite_float(value) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _nonnegative_or_nan(value) -> float:
+    finite = _finite_float(value)
+    if finite is None:
+        return math.nan
+    return max(finite, 0.0)
+
+
+def _lower_bounded_or_nan(value, lower_bound: float) -> float:
+    finite = _finite_float(value)
+    if finite is None:
+        return math.nan
+    return max(finite, lower_bound)
+
+
+def _apply_signal_description_correction(
+    record: dict[str, float | str],
+    mode: str,
+) -> dict[str, float | str]:
+    if mode == "none":
+        return record
+    if mode not in {"bounds", "relational"}:
+        raise ValueError(
+            "signal_description_correction must be one of: none, bounds, relational."
+        )
+
+    for field in (
+        "delay_spread_ns",
+        "angle_spread_deg",
+        "reflection_count",
+    ):
+        record[field] = _nonnegative_or_nan(record[field])
+    record["path_count"] = _lower_bounded_or_nan(record["path_count"], 1.0)
+
+    is_los = str(record.get("los_status")) == "los"
+    if is_los:
+        record["los_delay_ns"] = _lower_bounded_or_nan(record["los_delay_ns"], 1e-6)
+
+    if mode == "relational" and is_los:
+        first_path_delay_ns = _finite_float(record["first_path_delay_ns"])
+        los_delay_ns = _finite_float(record["los_delay_ns"])
+        if first_path_delay_ns is not None and los_delay_ns is not None:
+            record["first_path_delay_ns"] = max(first_path_delay_ns, los_delay_ns)
+
+    return record
+
+
 def _format_signal_value(value, unit: str = "", decimals: int = 1) -> str:
     finite = _finite_float(value)
     if finite is None:
@@ -221,6 +267,8 @@ def _signal_description_record(
     los_delay_ns: float = math.nan,
     los_angle_sincos: torch.Tensor | None = None,
     reflection_count: float | None = None,
+    reflection_path_count: float | None = None,
+    signal_description_correction: str = "none",
 ) -> dict[str, float | str]:
     first_angle_sin_idx = _physics_target_index("first_path_aoa_az_sin")
     first_angle_cos_idx = _physics_target_index("first_path_aoa_az_cos")
@@ -233,7 +281,9 @@ def _signal_description_record(
         )
     if reflection_count is None:
         reflection_count = float(raw_values[_physics_target_index("reflection_count")])
-    return {
+    if reflection_path_count is None:
+        reflection_path_count = math.nan
+    record = {
         "environment": str(semantic_key.env_type),
         "los_status": str(semantic_key.los_status),
         "path_count": float(raw_values[_physics_target_index("n_paths")]),
@@ -249,11 +299,21 @@ def _signal_description_record(
         "los_delay_ns": float(los_delay_ns),
         "los_angle_deg": float(los_angle_deg),
         "reflection_count": float(reflection_count),
+        "reflection_path_count": float(reflection_path_count),
     }
+    return _apply_signal_description_correction(record, signal_description_correction)
 
 
 def _render_signal_description(record: dict[str, float | str]) -> str:
-    los_text = "LoS" if str(record["los_status"]) == "los" else "NLoS"
+    is_los = str(record["los_status"]) == "los"
+    los_text = "LoS" if is_los else "NLoS"
+    los_sentence = (
+        "The LoS delay is "
+        f"{_format_signal_value(record['los_delay_ns'], 'ns')}, and the LoS angle is "
+        f"{_format_signal_value(record['los_angle_deg'], 'deg')}."
+        if is_los
+        else "No direct LoS path is detected."
+    )
     return (
         f"This signal is {record['environment']}, {los_text}, with "
         f"{_format_signal_count(record['path_count'])} paths. "
@@ -263,9 +323,9 @@ def _render_signal_description(record: dict[str, float | str]) -> str:
         f"Its K-factor is {_format_signal_value(record['k_factor_db'], 'dB')}, "
         f"delay spread is {_format_signal_value(record['delay_spread_ns'], 'ns')}, "
         f"and azimuth angle spread is {_format_signal_value(record['angle_spread_deg'], 'deg')}. "
-        f"The LoS delay is {_format_signal_value(record['los_delay_ns'], 'ns')}, "
-        f"the LoS angle is {_format_signal_value(record['los_angle_deg'], 'deg')}, "
-        f"and the reflection count is {_format_signal_count(record['reflection_count'])}."
+        f"{los_sentence} "
+        f"The reflection-interaction count is {_format_signal_count(record['reflection_count'])}, "
+        f"and the reflected-path count is {_format_signal_count(record['reflection_path_count'])}."
     )
 
 
@@ -576,6 +636,12 @@ def _infer_reflection_count_regression_weight(checkpoint: dict | None) -> float:
             args.get("interaction_count_regression_weight", 0.0),
         )
     )
+
+
+def _infer_reflection_path_count_regression_weight(checkpoint: dict | None) -> float:
+    if checkpoint is None:
+        return 0.0
+    return float(checkpoint.get("args", {}).get("reflection_path_count_regression_weight", 0.0))
 
 
 def _infer_reflection_count_nlos_weight(checkpoint: dict | None) -> float:
@@ -923,6 +989,7 @@ def evaluate(
     attribute_binary_thresholds: dict[str, float] | None = None,
     physical_caption_examples: int = 3,
     save_signal_descriptions_path: str | None = None,
+    signal_description_correction: str = "bounds",
     verbose_diagnostics: bool = False,
 ) -> None:
     dataset = PreprocessedCSIDataset.from_pt(data_path)
@@ -994,6 +1061,9 @@ def evaluate(
         checkpoint
     )
     reflection_count_regression_weight = _infer_reflection_count_regression_weight(
+        checkpoint
+    )
+    reflection_path_count_regression_weight = _infer_reflection_path_count_regression_weight(
         checkpoint
     )
     reflection_count_nlos_weight = _infer_reflection_count_nlos_weight(checkpoint)
@@ -1179,6 +1249,9 @@ def evaluate(
     all_strong_k_positions = []
     all_reflection_count_logits = []
     all_reflection_count_predictions = []
+    all_reflection_path_count_predictions = []
+    all_reflection_path_count_raw_targets = []
+    all_reflection_path_count_masks = []
     all_physics_targets = []
     all_physics_raw_targets = []
     all_physics_masks = []
@@ -1321,6 +1394,9 @@ def evaluate(
         all_reflection_count_predictions.append(
             physics_outputs["reflection_count_prediction"].cpu()
         )
+        all_reflection_path_count_predictions.append(
+            physics_outputs["reflection_path_count_prediction"].cpu()
+        )
         all_physics_predictions.append(physics_predictions.cpu())
         all_physics_targets.append(batch["physics_targets"].cpu())
         all_physics_raw_targets.append(batch["physics_raw_targets"].cpu())
@@ -1329,6 +1405,12 @@ def evaluate(
         all_los_delay_masks.append(batch["los_delay_target_mask"].cpu())
         all_los_angle_targets.append(batch["los_angle_target"].cpu())
         all_los_angle_masks.append(batch["los_angle_target_mask"].cpu())
+        all_reflection_path_count_raw_targets.append(
+            batch["reflection_path_count_raw_target"].cpu()
+        )
+        all_reflection_path_count_masks.append(
+            batch["reflection_path_count_target_mask"].cpu()
+        )
         all_semantic_keys.extend(batch["semantic_keys"])
         if text_mode in ("instance", "multipositive"):
             instance_text_features = model.encode_text(
@@ -1402,6 +1484,9 @@ def evaluate(
     strong_k_positions = torch.cat(all_strong_k_positions, dim=0)
     reflection_count_logits = torch.cat(all_reflection_count_logits, dim=0)
     reflection_count_predictions = torch.cat(all_reflection_count_predictions, dim=0)
+    reflection_path_count_predictions = torch.cat(all_reflection_path_count_predictions, dim=0)
+    reflection_path_count_raw_targets = torch.cat(all_reflection_path_count_raw_targets, dim=0)
+    reflection_path_count_masks = torch.cat(all_reflection_path_count_masks, dim=0)
     physics_targets = torch.cat(all_physics_targets, dim=0)
     physics_raw_targets = torch.cat(all_physics_raw_targets, dim=0)
     physics_masks = torch.cat(all_physics_masks, dim=0)
@@ -1477,6 +1562,7 @@ def evaluate(
         print(f"los_delay_consistency_weight={los_delay_consistency_weight:.4f}")
         print(f"reflection_count_classifier_weight={reflection_count_classifier_weight:.4f}")
         print(f"reflection_count_regression_weight={reflection_count_regression_weight:.4f}")
+        print(f"reflection_path_count_regression_weight={reflection_path_count_regression_weight:.4f}")
         print(f"reflection_count_nlos_weight={reflection_count_nlos_weight:.4f}")
         print(f"interaction_count_soft_labels={interaction_count_soft_labels}")
         print(f"min_class_size={min_class_size}")
@@ -1616,6 +1702,12 @@ def evaluate(
         semantic_keys=all_semantic_keys,
         verbose=verbose_diagnostics,
     )
+    _print_reflection_path_count_head_diagnostics(
+        reflection_path_count_predictions=reflection_path_count_predictions,
+        reflection_path_count_raw_targets=reflection_path_count_raw_targets,
+        reflection_path_count_masks=reflection_path_count_masks,
+        verbose=verbose_diagnostics,
+    )
     _print_selected_physics_regression_metrics(
         physics_predictions=physics_predictions,
         physics_raw_targets=physics_raw_targets,
@@ -1651,6 +1743,10 @@ def evaluate(
         los_angle_targets=los_angle_targets,
         los_angle_masks=los_angle_masks,
         reflection_count_predictions=reflection_count_predictions,
+        reflection_path_count_predictions=reflection_path_count_predictions,
+        reflection_path_count_raw_targets=reflection_path_count_raw_targets,
+        reflection_path_count_masks=reflection_path_count_masks,
+        signal_description_correction=signal_description_correction,
     )
     _print_signal_description_examples(
         signal_description_payload,
@@ -2336,6 +2432,67 @@ def _print_interaction_count_head_diagnostics(
     )
 
 
+def _count_histogram_text(values: torch.Tensor) -> str:
+    if values.numel() == 0:
+        return "none"
+    counts = Counter(int(value) for value in values.long().tolist())
+    return ",".join(f"{value}:{count}" for value, count in sorted(counts.items()))
+
+
+def _print_reflection_path_count_head_diagnostics(
+    reflection_path_count_predictions: torch.Tensor,
+    reflection_path_count_raw_targets: torch.Tensor,
+    reflection_path_count_masks: torch.Tensor,
+    verbose: bool = False,
+) -> None:
+    raw_predictions = reflection_path_count_predictions * 10.0
+    mask = (
+        reflection_path_count_masks.bool()
+        & torch.isfinite(raw_predictions)
+        & torch.isfinite(reflection_path_count_raw_targets)
+    )
+    count = int(mask.sum().item())
+    print(f"reflection_path_count_head_count={count}")
+    if count == 0:
+        print("reflection_path_count_head_MAE=nan")
+        print("reflection_path_count_head_RMSE=nan")
+        print("reflection_path_count_head_signed_mean=nan")
+        print("reflection_path_count_head_exact_accuracy=nan")
+        print("reflection_path_count_head_within_1_accuracy=nan")
+        print("reflection_path_count_head_pearson=nan")
+        return
+
+    predictions = raw_predictions[mask].float()
+    targets = reflection_path_count_raw_targets[mask].float()
+    errors = predictions - targets
+    rounded_predictions = predictions.round().clamp(min=0).long()
+    rounded_targets = targets.round().clamp(min=0).long()
+    print(f"reflection_path_count_head_MAE={float(errors.abs().mean()):.4f}")
+    print(f"reflection_path_count_head_RMSE={float(torch.sqrt(errors.square().mean())):.4f}")
+    print(f"reflection_path_count_head_signed_mean={float(errors.mean()):.4f}")
+    print(
+        "reflection_path_count_head_exact_accuracy="
+        f"{float((rounded_predictions == rounded_targets).float().mean()):.4f}"
+    )
+    print(
+        "reflection_path_count_head_within_1_accuracy="
+        f"{float(((rounded_predictions - rounded_targets).abs() <= 1).float().mean()):.4f}"
+    )
+    print(
+        "reflection_path_count_head_pearson="
+        f"{_safe_pearson(predictions, targets):.4f}"
+    )
+    if verbose:
+        print(
+            "reflection_path_count_head_target_histogram="
+            f"{_count_histogram_text(rounded_targets)}"
+        )
+        print(
+            "reflection_path_count_head_prediction_histogram="
+            f"{_count_histogram_text(rounded_predictions)}"
+        )
+
+
 def _print_angle_diagnostics(
     prefix: str,
     predictions: torch.Tensor,
@@ -2670,6 +2827,10 @@ def _build_signal_description_payload(
     los_angle_targets: torch.Tensor,
     los_angle_masks: torch.Tensor,
     reflection_count_predictions: torch.Tensor,
+    reflection_path_count_predictions: torch.Tensor,
+    reflection_path_count_raw_targets: torch.Tensor,
+    reflection_path_count_masks: torch.Tensor,
+    signal_description_correction: str,
 ) -> dict:
     raw_predictions = _physics_raw_predictions(physics_predictions).cpu()
     physics_raw_targets = physics_raw_targets.cpu()
@@ -2690,6 +2851,9 @@ def _build_signal_description_payload(
         * PHYSICS_TARGET_SCALES[reflection_idx]
         + PHYSICS_TARGET_OFFSETS[reflection_idx]
     )
+    reflection_path_count_raw_predictions = reflection_path_count_predictions.cpu() * 10.0
+    reflection_path_count_raw_targets = reflection_path_count_raw_targets.cpu()
+    reflection_path_count_masks = reflection_path_count_masks.cpu().bool()
 
     predicted_records = []
     target_records = []
@@ -2705,6 +2869,8 @@ def _build_signal_description_payload(
             los_delay_ns=float(los_delay_raw_predictions[idx]),
             los_angle_sincos=los_angle_predictions[idx],
             reflection_count=float(reflection_raw_predictions[idx]),
+            reflection_path_count=float(reflection_path_count_raw_predictions[idx]),
+            signal_description_correction=signal_description_correction,
         )
         target_record = _signal_description_record(
             target_key,
@@ -2720,6 +2886,11 @@ def _build_signal_description_payload(
                 else None
             ),
             reflection_count=float(physics_raw_targets[idx, reflection_idx]),
+            reflection_path_count=(
+                float(reflection_path_count_raw_targets[idx])
+                if bool(reflection_path_count_masks[idx])
+                else math.nan
+            ),
         )
         predicted_text = _render_signal_description(predicted_record)
         target_text = _render_signal_description(target_record)
@@ -2754,6 +2925,8 @@ def _build_signal_description_payload(
         "los_angle_predictions": los_angle_predictions,
         "los_angle_targets": los_angle_targets,
         "reflection_count_raw_predictions": reflection_raw_predictions,
+        "reflection_path_count_raw_predictions": reflection_path_count_raw_predictions,
+        "reflection_path_count_raw_targets": reflection_path_count_raw_targets,
     }
 
 
@@ -3612,6 +3785,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--signal-description-correction",
+        choices=("none", "bounds", "relational"),
+        default="bounds",
+        help=(
+            "Post-processing applied only to predicted signal-description records. "
+            "none keeps raw predictions; bounds enforces scalar physical bounds; "
+            "relational also enforces first_path_delay_ns>=los_delay_ns."
+        ),
+    )
+    parser.add_argument(
         "--verbose-diagnostics",
         action="store_true",
         help="Print detailed histograms, confusions, class rows, and extra loss diagnostics.",
@@ -3644,6 +3827,7 @@ def main() -> None:
         attribute_binary_thresholds=parse_attribute_binary_thresholds(args.attribute_binary_threshold),
         physical_caption_examples=args.physical_caption_examples,
         save_signal_descriptions_path=args.save_signal_descriptions,
+        signal_description_correction=args.signal_description_correction,
         verbose_diagnostics=args.verbose_diagnostics,
     )
 

@@ -1,0 +1,460 @@
+\documentclass{article}
+\usepackage{iclr2026_conference,times}
+\input{math_commands.tex}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+
+\title{From Channel State Information to Language:\\
+Physics-Grounded Multi-Task Learning for Interpretable Wireless Channel Descriptions}
+
+\author{Anonymous Authors}
+
+% Keep anonymous for submission.
+% \iclrfinalcopy
+
+\newcommand{\model}{\textsc{CSI2Text}}
+\newcommand{\mae}{\operatorname{MAE}}
+\newcommand{\los}{\textsc{LoS}}
+\newcommand{\nlos}{\textsc{NLoS}}
+\newcommand{\etal}{et al.\ }
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Channel state information (CSI) is information-rich but difficult for a human to interpret directly.
+We study the conversion of high-dimensional CSI into concise natural-language descriptions grounded in propagation physics.
+Our approach, \model, combines a configuration-aware Transformer encoder, contrastive alignment between CSI and structured channel descriptions, a shared physics representation, and specialized prediction branches for delay, angle, power, $K$-factor, and reflection statistics.
+The predicted attributes are verbalized through a deterministic, auditable template, followed by a lightweight relational correction that removes contradictions such as a first-path delay preceding the direct line-of-sight delay.
+On a balanced 100k-sample UPA-$8{\times}8$, 128-subcarrier dataset, the full multi-task model obtains a first-path delay MAE of $21.91\pm0.30$ ns, first-path angle MAE of $18.37\pm0.37^\circ$, and reflection-interaction exact accuracy of $70.61\pm0.39\%$ over three seeds.
+On a separately constructed, naturally imbalanced reflected-path extension, the three-seed generated descriptions reach $94.06\pm1.07\%$ composite factuality, $99.97\pm0.01\%$ numeric-slot F1, $0.04\pm0.02\%$ numeric-slot hallucination, and $99.87\pm0.03\%$ physical consistency.
+The extension predicts the number of reflected paths with a text-level MAE of $0.091\pm0.007$.
+These results indicate that structured language can serve as a faithful and inspectable interface to learned wireless channel representations.
+\end{abstract}
+
+\section{Introduction}
+
+CSI describes how a wireless channel transforms a transmitted signal across antennas and frequencies.
+It supports beam management, localization, sensing, and channel modeling, yet its complex-valued tensor form is inaccessible to most users and difficult to audit.
+Existing learning systems typically map CSI to a task label or a small set of regression targets.
+Although useful, such outputs do not provide a unified, human-readable account of the propagation scene.
+
+We instead ask: \emph{can a model translate CSI into a factual language description of the channel?}
+A desired output may state that a signal is indoor and \nlos, followed by the estimated first-path delay and angle, $K$-factor, delay and angular spreads, path richness, and reflection statistics.
+This formulation differs from unconstrained captioning.
+Wireless attributes have units, conditional semantics, and known relations; fluent text is not sufficient if the stated values contradict one another or the reference channel.
+
+We introduce \model, a physics-grounded multi-task framework that learns a common representation for CSI, language prototypes, and propagation attributes.
+The CSI encoder operates on beam-frequency measurements and conditions its tokens on acquisition configuration.
+Three contrastive objectives align CSI, instance descriptions, and semantic prototypes.
+Specialized heads then model heterogeneous targets using appropriate representations: delay-profile features for temporal quantities, power-profile features for received power, and circular sine/cosine targets for angles.
+Finally, an explicit verbalizer renders a structured record into natural language.
+Because every phrase can be traced to a predicted slot, the output remains auditable.
+
+Our contributions are:
+\begin{itemize}
+    \item We formulate CSI-to-language conversion as grounded structured prediction followed by faithful verbalization, rather than unconstrained text generation.
+    \item We develop a configuration-aware, physics-guided multi-task architecture with language alignment, shared physical features, and target-specific branches.
+    \item We define a slot-based factuality protocol that separately measures categorical correctness, slot coverage, tolerance-aware numerical accuracy, hallucination, and physical consistency.
+    \item We provide three-seed comparisons, ablations, a relational-correction analysis, and a reflected-path-count extension while explicitly separating the balanced main dataset from the imbalanced extension dataset.
+\end{itemize}
+
+\section{Related Work}
+
+\paragraph{Learning from CSI.}
+Public ray-tracing resources such as DeepMIMO \citep{alkhateeb2019deepmimo} and RayVerse \citep{rayverse2025} facilitate reproducible learning from channel measurements with path-level annotations.
+Most CSI learning pipelines optimize a single downstream task, whereas our goal is to expose several coupled propagation properties through one readable description.
+Physics-informed wireless modeling has recently emphasized combining physical structure with learned representations to improve interpretability and generalization \citep{zhu2024physicsinformed}.
+
+\paragraph{Cross-modal and language-aligned representation learning.}
+Contrastive language--signal alignment follows the general principle that paired modalities can share a semantic embedding space, as demonstrated at scale for images and text by CLIP \citep{radford2021clip}.
+Our setting differs because CSI has no naturally authored captions and the language is derived from measurable propagation attributes.
+We therefore align CSI not only with instance descriptions but also with semantic prototypes and supervise the latent space using explicit physics targets.
+
+\paragraph{Wireless signals and language.}
+Recent work has connected radio-frequency measurements to language for human-centric semantic tasks.
+WiFi2Cap produces action captions from Wi-Fi CSI \citep{wei2026wifi2cap}, WirelessSenseLLM aligns wireless sensing with language models for activity understanding \citep{keya2026wirelesssensellm}, and RF-GPT maps RF observations to structured semantic outputs \citep{zou2026rfgpt}.
+In contrast, \model focuses on the \emph{propagation channel itself}: the generated description is a factual rendering of channel geometry and statistics rather than an open-ended description of human behavior.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem formulation}
+
+Let $\mathbf{H}\in\mathbb{C}^{B\times F}$ denote beam-domain CSI with $B$ beam tokens and $F$ frequency samples, and let $\mathbf{c}$ contain acquisition metadata such as bandwidth and frequency configuration.
+Each example has a structured physical record
+\begin{equation}
+  \mathbf{y} = (e,\ell,n_p,\tau_1,\theta_1,p_1,K,\sigma_\tau,\sigma_\theta,
+  \tau_{\mathrm{LoS}},\theta_{\mathrm{LoS}},n_r,n_{rp}),
+\end{equation}
+where $e$ is environment, $\ell$ is \los/\nlos\ status, $n_p$ is path count, $\tau_1,\theta_1,p_1$ are first-path delay, angle, and power, $K$ is the Rician $K$-factor, $\sigma_\tau,\sigma_\theta$ are delay and angular spreads, $n_r$ is the \emph{total number of reflection interactions}, and $n_{rp}$ is the \emph{number of paths containing at least one reflection}.
+The last quantity is used only in the reflected-path extension.
+This distinction is important: a single path may undergo several reflections, so $n_r\le n_p$ is not a valid constraint.
+
+The model predicts a record $\hat{\mathbf{y}}=f_\Theta(\mathbf{H},\mathbf{c})$ and a verbalizer $V$ produces the description $\hat{s}=V(\hat{\mathbf{y}})$.
+Our design favors traceability: language quality is determined by the correctness and completeness of $\hat{\mathbf{y}}$, not by surface-form similarity alone.
+
+\subsection{Configuration-aware CSI encoder}
+
+We standardize complex CSI features per example and project each beam's frequency response into a token.
+The input projection combines a linear frequency projection, a depthwise--pointwise convolutional path, and adaptive average/max summaries.
+Configuration metadata modulates the features with a feature-wise affine transformation.
+Beam positional embeddings and encodings of carrier/frequency settings are then added.
+
+A six-layer Transformer encoder \citep{vaswani2017attention} with width 384, six attention heads, and a 1536-dimensional feed-forward block processes the sequence together with a learned \texttt{[CLS]} token.
+The \texttt{[CLS]} representation and the masked token mean are concatenated and projected to a 256-dimensional normalized CSI embedding $\mathbf{z}_c$.
+
+\subsection{Language and prototype alignment}
+
+Descriptions are tokenized with a 300-token vocabulary and maximum length 48.
+A three-layer, four-head Transformer of width 256 produces a normalized text embedding $\mathbf{z}_t$.
+We construct semantic prototypes from coarse channel keys that group examples by environment, \los/\nlos\ state, path richness, delay and angle regimes, $K$-factor bin, and interaction statistics.
+After removing classes with fewer than five training samples, eight prototypes remain.
+
+For a minibatch, we optimize symmetric InfoNCE losses for CSI--text, CSI--prototype, and text--prototype pairs:
+\begin{equation}
+\mathcal{L}_{a,b} =
+ -\frac{1}{2N}\sum_i
+ \left[
+ \log\frac{\exp(\mathbf{z}_a^i{}^\top\mathbf{z}_b^i/T)}
+ {\sum_j\exp(\mathbf{z}_a^i{}^\top\mathbf{z}_b^j/T)}
+ +
+ \log\frac{\exp(\mathbf{z}_b^i{}^\top\mathbf{z}_a^i/T)}
+ {\sum_j\exp(\mathbf{z}_b^i{}^\top\mathbf{z}_a^j/T)}
+ \right],
+\end{equation}
+with initial temperature $T=0.07$.
+A semantic classifier and a balanced $K$-factor attribute classifier further shape the representation.
+
+\section{Physics-Aware Multi-Task Learning}
+\label{sec:physics}
+
+A residual multi-layer perceptron maps $\mathbf{z}_c$ to a shared physics token.
+It feeds an auxiliary head for normalized global targets and a set of specialized branches.
+Temporal targets use a delay-specific encoder and estimated power-delay-profile statistics.
+Power prediction uses a separate power-feature encoder.
+LoS and first-path angles use dedicated contexts and sine/cosine regression to respect angular periodicity.
+First-path delay, delay spread, first-path power, and strong-$K$ regimes combine coarse bin classification with within-bin position regression.
+Reflection interactions use classification and regression heads.
+The path-count extension adds a distinct regressor for $n_{rp}$.
+
+The total objective is
+\begin{align}
+\mathcal{L}={}&
+\lambda_{ct}\mathcal{L}_{c,t}+
+\lambda_{cp}\mathcal{L}_{c,p}+
+\lambda_{tp}\mathcal{L}_{t,p}+
+\lambda_{\mathrm{sem}}\mathcal{L}_{\mathrm{sem}}+
+\lambda_{\mathrm{attr}}\mathcal{L}_{\mathrm{attr}} \nonumber\\
+&+\sum_{q\in\mathcal{Q}}\lambda_q\mathcal{L}_q+
+\lambda_{\mathrm{rel}}\mathcal{L}_{\mathrm{rel}},
+\end{align}
+where $\mathcal{Q}$ contains target-specific regression, bin-classification, and within-bin losses.
+The three alignment losses use weight 1.0; semantic classification, attribute classification, and auxiliary regression use 0.5, 0.1, and 0.005.
+The principal physics weights are 0.08 for first-path delay, 0.05 each for LoS delay and LoS angle, 0.02 for first-path angle, and 0.02/0.01 for reflection classification/regression.
+The complete loss specification is provided in Appendix~\ref{app:weights}.
+
+Relational training penalties impose only relations justified by the label definitions: nonnegative spreads and interaction counts, at least one propagation path, positive LoS delay when LoS is present, and $\tau_1\ge\tau_{\los}$ for LoS examples.
+We deliberately do not impose $n_r\le n_p$.
+
+\section{CSI-to-Text Verbalization}
+\label{sec:verbalization}
+
+The final system does not ask a large language model to invent a caption.
+Instead, it first predicts typed attributes and then realizes them with an explicit template.
+A typical output is:
+\begin{quote}\small
+\emph{This signal is indoor and NLoS, with 5 propagation paths. No direct LoS path is detected. The first-path delay is 82.4 ns, the first-path angle is $-31.7^\circ$, the $K$-factor is 3.2 dB, and 4 paths contain reflection interactions.}
+\end{quote}
+Conditional clauses prevent LoS-only values from being stated for \nlos\ samples.
+This design is less linguistically diverse than open-ended generation, but it makes every statement attributable to one prediction and avoids evaluating harmless paraphrases with exact string match.
+
+\section{Relational Correction}
+\label{sec:correction}
+
+Before verbalization, a bounds correction clamps impossible negative spreads and interaction counts and enforces $n_p\ge1$.
+For LoS samples, a relational correction additionally replaces
+\begin{equation}
+\hat{\tau}_1 \leftarrow \max(\hat{\tau}_1,\hat{\tau}_{\mathrm{LoS}}),
+\end{equation}
+which encodes that the detected direct path cannot arrive after the earliest propagation path.
+This operation changes only inconsistent records and leaves the neural predictions otherwise untouched.
+It is therefore a lightweight semantic safeguard rather than a second learned model.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Data.}
+The main dataset contains 100,000 ray-traced examples with UPA-$8{\times}8$ measurements and 128 frequency samples.
+It is balanced before splitting: 50,000 LoS and 50,000 NLoS examples.
+We use a fixed 80/20 train/test split.
+After removing semantic classes with fewer than five examples and filtering delay spread $\ge400$ ns, 79,429 training and 19,877 test examples remain.
+All main-model, baseline, and ablation comparisons use this same split.
+
+The reflected-path extension is a separate dataset whose path labels were reconstructed and verified.
+It contains 100,000 examples but is naturally imbalanced: 13,628 LoS and 86,372 NLoS.
+Its 80,000/20,000 split contains 10,902/69,098 LoS/NLoS training examples and 2,726/17,274 test examples.
+We report this extension separately and do not reinterpret it as the balanced main dataset.
+
+\paragraph{Optimization and compute.}
+Models are trained for 100 epochs with AdamW, batch size 128, initial learning rate $3{\times}10^{-4}$, weight decay $10^{-2}$, five epochs of linear warmup, and cosine decay to $10^{-5}$.
+Checkpoints are saved every 20 epochs.
+Unless noted otherwise, results are the mean and sample standard deviation over seeds 0, 1, and 2.
+The current implementation has 31.87M trainable parameters.
+Each run uses one NVIDIA GeForce RTX 4090 with 23.6 GB memory; four such GPUs were available for parallel experiments.
+The software stack is PyTorch 2.5.1+cu121 and CUDA 12.1.
+Automatic mixed precision is disabled.
+A representative run takes 5 h 27 min 44 s.
+
+\paragraph{Metrics.}
+For physical regression we report MAE; for reflection interactions we additionally report exact and adjacent-bin accuracy.
+Text evaluation parses predicted and target descriptions into typed slots.
+Categorical fields are measured by accuracy and macro-F1.
+Numeric slot F1 evaluates whether the required values are present, while hallucination is the fraction of predicted numeric slots unsupported by the reference schema.
+Tolerance accuracy measures whether a present predicted value lies within a field-specific tolerance: 50 ns for delays, $15^\circ$ for angles, 5 dB for first-path power, 3 dB for $K$, and one count for path/interaction fields.
+The reported \emph{composite description factuality} is the macro average of categorical accuracies, numeric-slot F1, numeric tolerance accuracy, and $1-$hallucination.
+It is not sentence-level exact match.
+Physical consistency is an auxiliary rule-based diagnostic applied to the predicted record.
+
+\section{Baseline Comparison}
+\label{sec:baselines}
+
+We compare with a flattened-CSI MLP, a convolutional baseline, an inverse-FFT power-delay-profile (PDP/IFFT) MLP, a Transformer without specialized physics branches, and the same CSI encoder trained with independent single-task heads.
+Table~\ref{tab:baselines} reports the common three-seed evaluation.
+
+\begin{table*}[t]
+\centering
+\caption{Physical prediction on the balanced main split (mean $\pm$ sample standard deviation over seeds 0, 1, and 2). Lower is better for MAE; higher is better for accuracy. ``Refl.'' denotes total reflection interactions, not reflected paths. Best results are bold.}
+\label{tab:baselines}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lccccccc}
+\toprule
+Method &
+$\tau_1$ MAE (ns) $\downarrow$ &
+$K$ MAE (dB) $\downarrow$ &
+Refl. MAE $\downarrow$ &
+Exact $\uparrow$ &
+Adjacent $\uparrow$ &
+$\theta_1$ MAE ($^\circ$) $\downarrow$ &
+$p_1$ MAE (dB) $\downarrow$\\
+\midrule
+\model\ full multi-task
+& \textbf{21.911$\pm$0.303}
+& 1.983$\pm$0.263
+& \textbf{0.983$\pm$0.005}
+& \textbf{0.7061$\pm$0.0039}
+& \textbf{0.9742$\pm$0.0007}
+& \textbf{18.372$\pm$0.365}
+& 4.958$\pm$0.269\\
+CSI encoder + single-task head
+& 51.164$\pm$6.248
+& \textbf{1.521$\pm$0.090}
+& 1.222$\pm$0.072
+& 0.5523$\pm$0.0259
+& 0.9594$\pm$0.0126
+& 20.449$\pm$0.431
+& \textbf{3.740$\pm$0.209}\\
+PDP/IFFT + MLP
+& 28.750$\pm$4.611
+& 5.002$\pm$0.275
+& 1.706$\pm$0.032
+& 0.4420$\pm$0.0201
+& 0.9055$\pm$0.0019
+& 40.292$\pm$0.159
+& 12.236$\pm$0.278\\
+Flattened CSI + MLP
+& 114.371$\pm$0.978
+& 5.600$\pm$1.013
+& 1.835$\pm$0.196
+& 0.4237$\pm$0.0999
+& 0.8930$\pm$0.0431
+& 32.782$\pm$0.413
+& 13.315$\pm$1.221\\
+Transformer without branches
+& 268.177$\pm$0.003
+& 22.762$\pm$0.000
+& 3.214$\pm$0.021
+& 0.1808$\pm$0.0000
+& 0.5359$\pm$0.0000
+& 53.111$\pm$0.005
+& 38.090$\pm$0.013\\
+CNN baseline
+& 1608.970$\pm$1202.800
+& 56.869$\pm$34.742
+& 119.488$\pm$185.779
+& 0.1562$\pm$0.1463
+& 0.3107$\pm$0.1804
+& 102.231$\pm$42.561
+& 14591.900$\pm$18581.100\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+The full model is best on five of seven metrics, including the propagation quantities most dependent on coupled temporal and angular structure.
+The single-task system remains stronger for $K$-factor and first-path power, showing that multi-task sharing is not uniformly beneficial.
+Compared with PDP/IFFT+MLP, the full system reduces first-path delay MAE by 23.8\% while also improving angle and reflection predictions.
+
+\section{Three-Seed Text Factuality Results}
+\label{sec:textresults}
+
+\begin{table}[t]
+\centering
+\caption{Description quality on the reflected-path-enabled evaluation (mean $\pm$ sample standard deviation over three seeds).}
+\label{tab:text}
+\begin{tabular}{lc}
+\toprule
+Metric & Result\\
+\midrule
+Composite description factuality $\uparrow$ & 0.9406 $\pm$ 0.0107\\
+Environment accuracy $\uparrow$ & 1.0000 $\pm$ 0.0000\\
+LoS/NLoS accuracy $\uparrow$ & 0.9976 $\pm$ 0.0011\\
+Categorical macro-F1 $\uparrow$ & 0.9975 $\pm$ 0.0011\\
+Numeric-slot F1 $\uparrow$ & 0.9997 $\pm$ 0.0001\\
+Numeric tolerance accuracy $\uparrow$ & 0.7063 $\pm$ 0.0548\\
+Numeric-slot hallucination $\downarrow$ & 0.0004 $\pm$ 0.0002\\
+Physical consistency $\uparrow$ & 0.9987 $\pm$ 0.0003\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:text} shows that the system almost always emits the required slots and rarely introduces an unsupported one.
+Categorical facts are also stable.
+Numerical tolerance accuracy is lower and more seed-sensitive: the individual results are 69.84\%, 65.58\%, and 76.46\%.
+This does not mean that one quarter of all sentences is entirely wrong; rather, it measures the proportion of jointly present numerical fields that fall within their field-specific tolerances.
+
+The largest numerical errors occur for first-path angle (MAE $23.52\pm1.02^\circ$; tolerance accuracy $54.11\pm0.32\%$), first-path power ($9.19\pm1.69$ dB; $37.80\pm7.02\%$), $K$-factor ($3.65\pm1.70$ dB; $53.84\pm32.81\%$), and angle spread ($25.44\pm8.96^\circ$; $35.37\pm18.28\%$).
+By comparison, first-path delay reaches $96.64\pm0.24\%$ accuracy at 50 ns and LoS angle reaches $99.60\pm0.13\%$ accuracy at $15^\circ$.
+
+\section{Reflected-Path Extension}
+\label{sec:pathcount}
+
+The base model predicts the total number of reflection \emph{interactions}.
+To support statements such as ``four paths contain reflection interactions,'' we add a separate reflected-path-count head.
+On the imbalanced extension split, the verbalized reflected-path value attains an MAE of $0.091\pm0.007$, RMSE of $0.234\pm0.008$, and accuracy within one path of $98.82\pm0.06\%$.
+These are text-level metrics computed after record generation and verbalization; they should not be confused with head-level exact classification accuracy.
+The strong result demonstrates that the two reflection concepts can be modeled separately without relying on the invalid assumption that total interactions cannot exceed total paths.
+
+\section{Ablation and Error Analysis}
+\label{sec:ablation}
+
+\paragraph{Architectural ablations.}
+Table~\ref{tab:ablation} compares the full model with removal of the shared physics token or delay-specific encoder.
+Removing the delay encoder degrades first-path delay, delay spread, $K$-factor, power, and reflection prediction, confirming the value of target-aware temporal features.
+The shared token has a mixed effect: it improves LoS angle and reflection exact accuracy, but the no-shared variant is slightly better on several regression metrics.
+We therefore interpret it as a useful coupling mechanism, not a universally superior component.
+
+\begin{table}[t]
+\centering
+\caption{Selected three-seed ablations. Lower is better except reflection exact accuracy.}
+\label{tab:ablation}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lrrrr}
+\toprule
+Model & $\tau_1$ (ns) & $\sigma_\tau$ (ns) & $K$ (dB) & Refl. exact\\
+\midrule
+Full & 21.91$\pm$0.30 & 11.17$\pm$0.11 & 1.98$\pm$0.26 & \textbf{0.7061$\pm$0.0039}\\
+No shared physics token & \textbf{21.62$\pm$0.71} & \textbf{11.15$\pm$0.08} & \textbf{1.74$\pm$0.04} & 0.7013$\pm$0.0041\\
+No delay-specific encoder & 69.02$\pm$1.46 & 29.64$\pm$0.84 & 2.54$\pm$0.12 & 0.6652$\pm$0.0057\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\paragraph{Effect of relational correction.}
+In a representative run, bounds-only correction leaves 1,426 cases in which the predicted first path precedes the predicted LoS path.
+Adding the relational correction reduces this count to zero and raises physical consistency from 92.64\% to 99.86\%.
+Composite factuality changes from 95.6068\% to 95.6051\%, and numerical tolerance accuracy from 78.4292\% to 78.4205\%.
+Thus, the rule removes contradictions at negligible measured accuracy cost.
+We treat this consistency score as a diagnostic, not a substitute for comparison with ground-truth slots.
+
+\paragraph{Failure modes.}
+The remaining difficulty is continuous-value estimation rather than slot omission or category recognition.
+Angle spread and $K$-factor also have large cross-seed variance.
+Moreover, the path-count extension is dominated by NLoS samples, which are harder because their multipath structure is less directly observable.
+Future evaluation should report LoS/NLoS-stratified errors and calibration intervals in addition to aggregate MAE.
+
+\section{Limitations}
+
+First, the output language is template-based and therefore factual and auditable but not stylistically open-ended.
+The work demonstrates CSI-to-natural-language verbalization, not unrestricted dialogue about wireless scenes.
+Second, the experiments use ray-traced data from one principal UPA/frequency configuration; generalization to measured channels, unseen arrays, bandwidths, and environments remains to be established.
+Third, multi-task learning does not dominate single-task learning for every variable, especially $K$-factor and first-path power.
+Fourth, tolerance-based numerical accuracy depends on application-specific thresholds and should always be presented with raw error metrics.
+Finally, the reflected-path extension is strongly NLoS-skewed, so its aggregate score should not be compared directly with balanced main-split results.
+
+\section{Conclusion}
+
+We presented a physics-grounded framework that converts CSI into an interpretable natural-language channel description.
+The system combines configuration-aware CSI encoding, language and prototype alignment, specialized multi-task physics heads, explicit verbalization, and a lightweight relational correction.
+Three-seed experiments show strong physical prediction, near-complete slot realization, very low hallucination, and high post-correction consistency.
+The reflected-path extension further distinguishes reflection interactions from the number of reflected paths.
+The results support structured language as a practical interface for inspecting learned wireless channel models, while identifying continuous-value robustness and cross-configuration validation as the next priorities.
+
+\subsubsection*{Reproducibility statement}
+The anonymous supplementary code includes preprocessing, training, evaluation, signal-description parsing, and metric aggregation scripts.
+Appendix~\ref{app:weights} records the optimization and loss configuration, and Section~\ref{sec:setup} reports data filtering, seeds, compute, and software versions.
+
+\bibliography{references}
+\bibliographystyle{iclr2026_conference}
+
+\appendix
+
+\section{Loss weights}
+\label{app:weights}
+
+\begin{table*}[h]
+\centering
+\caption{Loss configuration used for the main full model.}
+\label{tab:weights}
+\begin{tabular}{lll}
+\toprule
+Group & Term & Weight\\
+\midrule
+Alignment & CSI--text / CSI--prototype / text--prototype & 1.0 / 1.0 / 1.0\\
+Representation & semantic classifier / attribute classifier / auxiliary physics regression & 0.5 / 0.1 / 0.005\\
+$K$-factor & strong-bin classifier / within-bin position & 0.5 / 0.1\\
+First-path delay & normalized / raw / fused raw & 0.08 / 0.001 / 0.02\\
+First-path delay & bin classifier / position / consistency / tail underestimate & 0.02 / 0.01 / 0.01 / 0.01\\
+Delay spread & raw / bin classifier / within-bin position & 0.0005 / 0.03 / 0.008\\
+LoS delay & regression / nonnegative / consistency & 0.05 / 0.005 / 0.005\\
+Angles & LoS / first path / first-path NLoS & 0.05 / 0.02 / 0.01\\
+First-path power & bin classifier / position; NLoS sample multiplier & 0.03 / 0.1; 2.0\\
+Reflection interactions & classifier / regression; NLoS sample multiplier & 0.02 / 0.01; 1.0\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Field-specific text metrics}
+\label{app:textmetrics}
+
+\begin{table*}[h]
+\centering
+\caption{Three-seed numerical text metrics on the reflected-path-enabled evaluation. Accuracy uses the tolerance shown in parentheses.}
+\label{tab:fieldmetrics}
+\begin{tabular}{lcc}
+\toprule
+Field & MAE & Tolerance accuracy\\
+\midrule
+Path count ($\pm1$) & 0.326$\pm$0.056 & 0.8893$\pm$0.0485\\
+First-path delay ($\pm50$ ns) & 13.923$\pm$0.578 ns & 0.9664$\pm$0.0024\\
+First-path angle ($\pm15^\circ$) & 23.517$\pm$1.015$^\circ$ & 0.5411$\pm$0.0032\\
+First-path power ($\pm5$ dB) & 9.186$\pm$1.693 dB & 0.3780$\pm$0.0702\\
+$K$-factor ($\pm3$ dB) & 3.646$\pm$1.699 dB & 0.5384$\pm$0.3281\\
+Delay spread ($\pm50$ ns) & 11.429$\pm$0.076 ns & 0.9741$\pm$0.0015\\
+Angle spread ($\pm15^\circ$) & 25.437$\pm$8.960$^\circ$ & 0.3537$\pm$0.1828\\
+LoS delay ($\pm50$ ns) & 10.954$\pm$0.245 ns & 0.9783$\pm$0.0013\\
+LoS angle ($\pm15^\circ$) & 1.321$\pm$0.148$^\circ$ & 0.9960$\pm$0.0013\\
+Reflection interactions ($\pm1$) & 0.931$\pm$0.017 & 0.6499$\pm$0.0103\\
+Reflected paths ($\pm1$) & 0.091$\pm$0.007 & 0.9882$\pm$0.0006\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\end{document}

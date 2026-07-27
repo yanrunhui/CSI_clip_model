@@ -28,9 +28,11 @@ NUMERIC_FIELDS = (
     "los_delay_ns",
     "los_angle_deg",
     "reflection_count",
+    "reflection_path_count",
 )
 
 ANGLE_FIELDS = {"first_path_angle_deg", "los_angle_deg"}
+LOS_ONLY_NUMERIC_FIELDS = {"los_delay_ns", "los_angle_deg"}
 
 DEFAULT_TOLERANCES = {
     "path_count": 1.0,
@@ -43,6 +45,7 @@ DEFAULT_TOLERANCES = {
     "los_delay_ns": 50.0,
     "los_angle_deg": 15.0,
     "reflection_count": 1.0,
+    "reflection_path_count": 1.0,
 }
 
 
@@ -59,6 +62,12 @@ def numeric_error(field: str, prediction: float, target: float) -> float:
         diff = math.radians(prediction - target)
         return abs(math.degrees(math.atan2(math.sin(diff), math.cos(diff))))
     return abs(prediction - target)
+
+
+def numeric_field_applicable(field: str, record: dict[str, Any]) -> bool:
+    if field in LOS_ONLY_NUMERIC_FIELDS:
+        return str(record.get("los_status", "")).lower() == "los"
+    return True
 
 
 def mean(values: list[float]) -> float:
@@ -160,19 +169,37 @@ def consistency_violations(
 ) -> list[str]:
     violations = []
 
-    for field in ("path_count", "reflection_count"):
-        value = finite_float(record.get(field))
-        if value is not None and value < -0.5:
-            violations.append(f"{field}_negative")
-    for field in ("first_path_delay_ns", "delay_spread_ns", "angle_spread_deg", "los_delay_ns"):
+    reflection_count = finite_float(record.get("reflection_count"))
+    if reflection_count is not None and reflection_count < 0.0:
+        violations.append("reflection_count_negative")
+    reflection_path_count = finite_float(record.get("reflection_path_count"))
+    if reflection_path_count is not None and reflection_path_count < 0.0:
+        violations.append("reflection_path_count_negative")
+
+    path_count = finite_float(record.get("path_count"))
+    if path_count is not None and path_count < 1.0:
+        violations.append("path_count_below_1")
+
+    for field in ("first_path_delay_ns", "delay_spread_ns", "angle_spread_deg"):
         value = finite_float(record.get(field))
         if value is not None and value < 0.0:
             violations.append(f"{field}_negative")
 
+    first_delay = finite_float(record.get("first_path_delay_ns"))
+
     los_status = str(record.get("los_status", "")).lower()
     if los_status == "los":
-        first_delay = finite_float(record.get("first_path_delay_ns"))
         los_delay = finite_float(record.get("los_delay_ns"))
+        if los_delay is not None and los_delay <= 0.0:
+            violations.append("los_delay_ns_nonpositive")
+
+        if (
+            first_delay is not None
+            and los_delay is not None
+            and first_delay < los_delay
+        ):
+            violations.append("first_path_delay_before_los_delay")
+
         if first_delay is None or los_delay is None:
             violations.append("los_missing_delay")
         elif abs(first_delay - los_delay) > los_delay_tolerance_ns:
@@ -262,13 +289,29 @@ def evaluate_payload(
     field_total: dict[str, int] = {field: 0 for field in NUMERIC_FIELDS}
 
     consistency_ok = 0
+    target_consistency_ok = 0
     violation_counts: dict[str, int] = {}
+    target_violation_counts: dict[str, int] = {}
+    prediction_only_violation_counts: dict[str, int] = {}
+    target_only_violation_counts: dict[str, int] = {}
+    shared_violation_counts: dict[str, int] = {}
+    prediction_only_samples = 0
+    target_only_samples = 0
+    shared_violation_samples = 0
 
     for idx, (pred, target) in enumerate(zip(predicted_records, target_records)):
         sample_errors = []
         for field in NUMERIC_FIELDS:
-            pred_value = finite_float(pred.get(field))
-            target_value = finite_float(target.get(field))
+            pred_value = (
+                finite_float(pred.get(field))
+                if numeric_field_applicable(field, pred)
+                else None
+            )
+            target_value = (
+                finite_float(target.get(field))
+                if numeric_field_applicable(field, target)
+                else None
+            )
             pred_present = pred_value is not None
             target_present = target_value is not None
 
@@ -292,10 +335,41 @@ def evaluate_payload(
             los_delay_tolerance_ns=los_delay_tolerance_ns,
             los_angle_tolerance_deg=los_angle_tolerance_deg,
         )
+        target_violations = consistency_violations(
+            target,
+            los_delay_tolerance_ns=los_delay_tolerance_ns,
+            los_angle_tolerance_deg=los_angle_tolerance_deg,
+        )
         if not violations:
             consistency_ok += 1
+        if not target_violations:
+            target_consistency_ok += 1
         for violation in violations:
             violation_counts[violation] = violation_counts.get(violation, 0) + 1
+        for violation in target_violations:
+            target_violation_counts[violation] = target_violation_counts.get(violation, 0) + 1
+
+        predicted_set = set(violations)
+        target_set = set(target_violations)
+        prediction_only_set = predicted_set - target_set
+        target_only_set = target_set - predicted_set
+        shared_set = predicted_set & target_set
+        if prediction_only_set:
+            prediction_only_samples += 1
+        if target_only_set:
+            target_only_samples += 1
+        if shared_set:
+            shared_violation_samples += 1
+        for violation in prediction_only_set:
+            prediction_only_violation_counts[violation] = (
+                prediction_only_violation_counts.get(violation, 0) + 1
+            )
+        for violation in target_only_set:
+            target_only_violation_counts[violation] = (
+                target_only_violation_counts.get(violation, 0) + 1
+            )
+        for violation in shared_set:
+            shared_violation_counts[violation] = shared_violation_counts.get(violation, 0) + 1
 
         categorical_errors = [
             field
@@ -310,6 +384,10 @@ def evaluate_payload(
                     "worst_numeric_error": worst_numeric,
                     "categorical_errors": categorical_errors,
                     "consistency_violations": violations,
+                    "target_consistency_violations": target_violations,
+                    "prediction_only_consistency_violations": sorted(prediction_only_set),
+                    "target_only_consistency_violations": sorted(target_only_set),
+                    "shared_consistency_violations": sorted(shared_set),
                     "predicted_text": predicted_texts[idx],
                     "target_text": target_texts[idx],
                     "predicted_record": pred,
@@ -384,6 +462,41 @@ def evaluate_payload(
                 "value": format_float(1.0 - safe_ratio(consistency_ok, len(predicted_records))),
                 "count": str(len(predicted_records)),
             },
+            {
+                "metric": "physical_consistency_rate",
+                "field": "target_description",
+                "value": format_float(safe_ratio(target_consistency_ok, len(predicted_records))),
+                "count": str(len(predicted_records)),
+                "notes": "Consistency diagnostics applied to target records.",
+            },
+            {
+                "metric": "physical_consistency_violation_rate",
+                "field": "target_description",
+                "value": format_float(1.0 - safe_ratio(target_consistency_ok, len(predicted_records))),
+                "count": str(len(predicted_records)),
+                "notes": "If high, the diagnostic rule is stricter than the target data semantics.",
+            },
+            {
+                "metric": "physical_consistency_violation_sample_rate",
+                "field": "prediction_only",
+                "value": format_float(safe_ratio(prediction_only_samples, len(predicted_records))),
+                "count": str(len(predicted_records)),
+                "notes": "Samples with predicted-record violations not present in the target record.",
+            },
+            {
+                "metric": "physical_consistency_violation_sample_rate",
+                "field": "target_only",
+                "value": format_float(safe_ratio(target_only_samples, len(predicted_records))),
+                "count": str(len(predicted_records)),
+                "notes": "Samples with target-record violations not present in the predicted record.",
+            },
+            {
+                "metric": "physical_consistency_violation_sample_rate",
+                "field": "shared_predicted_and_target",
+                "value": format_float(safe_ratio(shared_violation_samples, len(predicted_records))),
+                "count": str(len(predicted_records)),
+                "notes": "Samples where predicted and target records trigger at least one same consistency rule.",
+            },
         ]
     )
 
@@ -417,10 +530,49 @@ def evaluate_payload(
     for violation, count in sorted(violation_counts.items()):
         rows.append(
             {
-                "metric": "physical_consistency_violation_count",
+                "metric": "physical_consistency_predicted_violation_count",
                 "field": violation,
                 "value": str(count),
                 "count": str(len(predicted_records)),
+            }
+        )
+    for violation, count in sorted(target_violation_counts.items()):
+        rows.append(
+            {
+                "metric": "physical_consistency_target_violation_count",
+                "field": violation,
+                "value": str(count),
+                "count": str(len(predicted_records)),
+            }
+        )
+    for violation, count in sorted(prediction_only_violation_counts.items()):
+        rows.append(
+            {
+                "metric": "physical_consistency_prediction_only_violation_count",
+                "field": violation,
+                "value": str(count),
+                "count": str(len(predicted_records)),
+                "notes": "Violation type appears in prediction but not in target for the same sample.",
+            }
+        )
+    for violation, count in sorted(target_only_violation_counts.items()):
+        rows.append(
+            {
+                "metric": "physical_consistency_target_only_violation_count",
+                "field": violation,
+                "value": str(count),
+                "count": str(len(predicted_records)),
+                "notes": "Violation type appears in target but not in prediction for the same sample.",
+            }
+        )
+    for violation, count in sorted(shared_violation_counts.items()):
+        rows.append(
+            {
+                "metric": "physical_consistency_shared_violation_count",
+                "field": violation,
+                "value": str(count),
+                "count": str(len(predicted_records)),
+                "notes": "Violation type appears in both prediction and target for the same sample.",
             }
         )
 
@@ -460,10 +612,22 @@ def evaluate_payload(
             "type": "physical_consistency",
             "role": "diagnostic",
             "rules": [
-                "counts and delay/spread values must be non-negative when finite",
+                "delay/spread values must be non-negative when finite",
+                "reflection count must be non-negative when finite",
+                "reflected-path count must be non-negative when finite",
+                "path count must be at least one when finite",
+                "LoS delay must be positive when finite",
+                "first-path delay must not be before LoS delay when both are finite",
                 "LoS descriptions must include finite LoS delay/angle",
                 "LoS delay must be close to first-path delay",
                 "LoS angle must be close to first-path angle",
+            ],
+            "breakdown": [
+                "predicted_description: rules applied to predicted records",
+                "target_description: rules applied to target records",
+                "prediction_only: predicted violation type not present in the matching target record",
+                "target_only: target violation type not present in the matching predicted record",
+                "shared_predicted_and_target: same violation type appears in both records",
             ],
         },
         {
@@ -533,7 +697,10 @@ def main() -> None:
         "physical_consistency_violation_rate",
     }
     for row in rows:
-        if row["metric"] not in printed_metrics:
+        if (
+            row["metric"] not in printed_metrics
+            and not row["metric"].startswith("physical_consistency_")
+        ):
             continue
         print(f"{row['role']}_{row['metric']}_{row['field']}={row['value']}")
 

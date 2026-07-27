@@ -108,6 +108,7 @@ train:
   delay_spread_tail_classifier_weight: 0.0
   reflection_count_classifier_weight: 0.02
   reflection_count_regression_weight: 0.01
+  reflection_path_count_regression_weight: 0.0
   reflection_count_nlos_weight: 1.0
   interaction_count_soft_labels: false
   interaction_count_fields:

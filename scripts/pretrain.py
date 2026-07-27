@@ -1232,8 +1232,10 @@ def run_smoke_test(
     interaction_count_regression_weight: float = 0.0,
     reflection_count_classifier_weight: float = 0.0,
     reflection_count_regression_weight: float = 0.0,
+    reflection_path_count_regression_weight: float = 0.0,
     reflection_count_nlos_weight: float = 1.0,
     interaction_count_soft_labels: bool = False,
+    physics_relational_weight: float = 0.0,
     interaction_count_fields: tuple[str, ...] = ("reflection_count",),
     first_path_power_bin_classifier_weight: float = 0.0,
     first_path_power_bin_position_weight: float = 0.0,
@@ -1353,8 +1355,10 @@ def run_smoke_test(
                     interaction_count_regression_weight=interaction_count_regression_weight,
                     reflection_count_classifier_weight=reflection_count_classifier_weight,
                     reflection_count_regression_weight=reflection_count_regression_weight,
+                    reflection_path_count_regression_weight=reflection_path_count_regression_weight,
                     reflection_count_nlos_weight=reflection_count_nlos_weight,
                     interaction_count_soft_labels=interaction_count_soft_labels,
+                    physics_relational_weight=physics_relational_weight,
                     first_path_power_bin_weights=first_path_power_bin_weights,
                     first_path_power_nlos_weight=first_path_power_nlos_weight,
                     first_path_power_gate_mode=first_path_power_gate_mode,
@@ -1452,8 +1456,10 @@ def run_real_pretrain(
     interaction_count_regression_weight: float,
     reflection_count_classifier_weight: float,
     reflection_count_regression_weight: float,
+    reflection_path_count_regression_weight: float,
     reflection_count_nlos_weight: float,
     interaction_count_soft_labels: bool,
+    physics_relational_weight: float,
     interaction_count_fields: tuple[str, ...],
     first_path_power_bin_weights: dict[str, float],
     first_path_power_nlos_weight: float,
@@ -1606,8 +1612,10 @@ def run_real_pretrain(
         interaction_count_regression_weight=interaction_count_regression_weight,
         reflection_count_classifier_weight=reflection_count_classifier_weight,
         reflection_count_regression_weight=reflection_count_regression_weight,
+        reflection_path_count_regression_weight=reflection_path_count_regression_weight,
         reflection_count_nlos_weight=reflection_count_nlos_weight,
         interaction_count_soft_labels=interaction_count_soft_labels,
+        physics_relational_weight=physics_relational_weight,
         first_path_power_bin_weights=first_path_power_bin_weights,
         first_path_power_nlos_weight=first_path_power_nlos_weight,
         first_path_power_gate_mode=first_path_power_gate_mode,
@@ -1704,8 +1712,10 @@ def run_real_pretrain(
         f"delay_spread_tail_classifier_weight={delay_spread_tail_classifier_weight} "
         f"reflection_count_classifier_weight={reflection_count_classifier_weight} "
         f"reflection_count_regression_weight={reflection_count_regression_weight} "
+        f"reflection_path_count_regression_weight={reflection_path_count_regression_weight} "
         f"reflection_count_nlos_weight={reflection_count_nlos_weight} "
         f"interaction_count_soft_labels={interaction_count_soft_labels} "
+        f"physics_relational_weight={physics_relational_weight} "
         f"interaction_count_fields={format_interaction_count_fields(interaction_count_fields)} "
         f"interaction_count_classifier_weight={interaction_count_classifier_weight} "
         f"interaction_count_regression_weight={interaction_count_regression_weight} "
@@ -2059,6 +2069,51 @@ def run_real_pretrain(
             if los_delay_consistency_mae_values
             else 0.0
         )
+        mean_physics_relational = sum(
+            m.get("loss_physics_relational", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_path_count = sum(
+            m.get("loss_physics_relational_path_count", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_delay_spread = sum(
+            m.get("loss_physics_relational_delay_spread", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_reflection_nonnegative = sum(
+            m.get("loss_physics_relational_reflection_nonnegative", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_los_delay_positive = sum(
+            m.get("loss_physics_relational_los_delay_positive", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_first_path_delay_ge_los_delay = sum(
+            m.get("loss_physics_relational_first_path_delay_ge_los_delay", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_reflection_path_count_loss = sum(
+            m.get("loss_reflection_path_count_regression", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        reflection_path_count_mae_values = [
+            m["reflection_path_count_mae"]
+            for m in epoch_metrics
+            if "reflection_path_count_mae" in m
+        ]
+        mean_reflection_path_count_mae = (
+            sum(reflection_path_count_mae_values) / len(reflection_path_count_mae_values)
+            if reflection_path_count_mae_values
+            else 0.0
+        )
+        reflection_path_count_exact_values = [
+            m["reflection_path_count_exact_accuracy"]
+            for m in epoch_metrics
+            if "reflection_path_count_exact_accuracy" in m
+        ]
+        mean_reflection_path_count_exact_accuracy = (
+            sum(reflection_path_count_exact_values) / len(reflection_path_count_exact_values)
+            if reflection_path_count_exact_values
+            else 0.0
+        )
         mean_los_angle = sum(m.get("loss_los_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_first_path_angle = sum(m.get("loss_first_path_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_first_path_angle_nlos = sum(
@@ -2151,6 +2206,7 @@ def run_real_pretrain(
             f"los_nonneg={mean_los_delay_nonnegative:.4f} "
             f"los_cons={mean_los_delay_consistency:.4f} "
             f"los_cons_mae={mean_los_delay_consistency_mae_ns:.2f}ns "
+            f"rel={mean_physics_relational:.4f} "
             f"los_angle_mae={mean_los_angle_mae_deg:.2f}deg "
             f"first_angle_mae={mean_first_path_angle_mae_deg:.2f}deg "
             f"first_angle_nlos_mae={mean_first_path_angle_nlos_mae_deg:.2f}deg "
@@ -2270,6 +2326,15 @@ def run_real_pretrain(
                         "loss_los_delay_nonnegative": mean_los_delay_nonnegative,
                         "loss_los_delay_consistency": mean_los_delay_consistency,
                         "los_delay_consistency_mae_ns": mean_los_delay_consistency_mae_ns,
+                        "loss_physics_relational": mean_physics_relational,
+                        "loss_physics_relational_path_count": mean_physics_relational_path_count,
+                        "loss_physics_relational_delay_spread": mean_physics_relational_delay_spread,
+                        "loss_physics_relational_reflection_nonnegative": mean_physics_relational_reflection_nonnegative,
+                        "loss_physics_relational_los_delay_positive": mean_physics_relational_los_delay_positive,
+                        "loss_physics_relational_first_path_delay_ge_los_delay": mean_physics_relational_first_path_delay_ge_los_delay,
+                        "loss_reflection_path_count_regression": mean_reflection_path_count_loss,
+                        "reflection_path_count_mae": mean_reflection_path_count_mae,
+                        "reflection_path_count_exact_accuracy": mean_reflection_path_count_exact_accuracy,
                         "loss_los_angle": mean_los_angle,
                         "los_angle_mae_deg": mean_los_angle_mae_deg,
                         "loss_first_path_angle": mean_first_path_angle,
@@ -2351,6 +2416,7 @@ def run_real_pretrain(
                         "delay_spread_tail_classifier_weight": delay_spread_tail_classifier_weight,
                         "reflection_count_classifier_weight": reflection_count_classifier_weight,
                         "reflection_count_regression_weight": reflection_count_regression_weight,
+                        "reflection_path_count_regression_weight": reflection_path_count_regression_weight,
                         "reflection_count_nlos_weight": reflection_count_nlos_weight,
                         "interaction_count_soft_labels": interaction_count_soft_labels,
                         "interaction_count_fields": list(interaction_count_fields),
@@ -2489,6 +2555,7 @@ def run_real_pretrain(
                     "delay_spread_tail_classifier_weight": delay_spread_tail_classifier_weight,
                     "reflection_count_classifier_weight": reflection_count_classifier_weight,
                     "reflection_count_regression_weight": reflection_count_regression_weight,
+                    "reflection_path_count_regression_weight": reflection_path_count_regression_weight,
                     "reflection_count_nlos_weight": reflection_count_nlos_weight,
                     "interaction_count_soft_labels": interaction_count_soft_labels,
                     "interaction_count_fields": list(interaction_count_fields),
@@ -2837,6 +2904,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--physics-relational-weight",
+        type=float,
+        help=(
+            "Soft regularization weight for relational physical constraints "
+            "such as path_count>=1, delay_spread>=0, reflection_count>=0, "
+            "and first_path_delay>=los_delay on LoS samples."
+        ),
+    )
+    parser.add_argument(
         "--los-angle-weight",
         type=float,
         help="Supervision weight for LoS azimuth angle sin/cos prediction on LoS samples.",
@@ -2885,6 +2961,14 @@ def main() -> None:
         help=(
             "Auxiliary regression weight for total reflection count "
             "from global CSI, delay context, and power stats."
+        ),
+    )
+    parser.add_argument(
+        "--reflection-path-count-regression-weight",
+        type=float,
+        help=(
+            "Auxiliary regression weight for number of valid paths that contain "
+            "at least one reflection interaction."
         ),
     )
     parser.add_argument(
@@ -3377,6 +3461,13 @@ def main() -> None:
     )
     if los_delay_consistency_weight < 0.0:
         raise ValueError("--los-delay-consistency-weight must be non-negative.")
+    physics_relational_weight = (
+        args.physics_relational_weight
+        if args.physics_relational_weight is not None
+        else float(cfg_get(train_cfg, "physics_relational_weight", 0.0))
+    )
+    if physics_relational_weight < 0.0:
+        raise ValueError("--physics-relational-weight must be non-negative.")
     los_angle_weight = (
         args.los_angle_weight
         if args.los_angle_weight is not None
@@ -3449,6 +3540,15 @@ def main() -> None:
     )
     if reflection_count_regression_weight < 0.0:
         raise ValueError("--reflection-count-regression-weight must be non-negative.")
+    reflection_path_count_regression_weight = (
+        args.reflection_path_count_regression_weight
+        if args.reflection_path_count_regression_weight is not None
+        else float(cfg_get(train_cfg, "reflection_path_count_regression_weight", 0.0))
+    )
+    if reflection_path_count_regression_weight < 0.0:
+        raise ValueError(
+            "--reflection-path-count-regression-weight must be non-negative."
+        )
     reflection_count_nlos_weight = (
         args.reflection_count_nlos_weight
         if args.reflection_count_nlos_weight is not None
@@ -3502,6 +3602,7 @@ def main() -> None:
             or direct_power_weight > 0.0
             or reflection_count_classifier_weight > 0.0
             or reflection_count_regression_weight > 0.0
+            or reflection_path_count_regression_weight > 0.0
         )
         and not use_power_branch
     ):
@@ -3629,8 +3730,10 @@ def main() -> None:
             interaction_count_regression_weight=interaction_count_regression_weight,
             reflection_count_classifier_weight=reflection_count_classifier_weight,
             reflection_count_regression_weight=reflection_count_regression_weight,
+            reflection_path_count_regression_weight=reflection_path_count_regression_weight,
             reflection_count_nlos_weight=reflection_count_nlos_weight,
             interaction_count_soft_labels=interaction_count_soft_labels,
+            physics_relational_weight=physics_relational_weight,
             interaction_count_fields=interaction_count_fields,
             first_path_power_bin_weights=first_path_power_bin_weights,
             first_path_power_nlos_weight=first_path_power_nlos_weight,
@@ -3730,8 +3833,10 @@ def main() -> None:
             interaction_count_regression_weight=interaction_count_regression_weight,
             reflection_count_classifier_weight=reflection_count_classifier_weight,
             reflection_count_regression_weight=reflection_count_regression_weight,
+            reflection_path_count_regression_weight=reflection_path_count_regression_weight,
             reflection_count_nlos_weight=reflection_count_nlos_weight,
             interaction_count_soft_labels=interaction_count_soft_labels,
+            physics_relational_weight=physics_relational_weight,
             interaction_count_fields=interaction_count_fields,
             first_path_power_bin_weights=first_path_power_bin_weights,
             first_path_power_nlos_weight=first_path_power_nlos_weight,

@@ -877,6 +877,12 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.reflection_path_count_regression_head = nn.Sequential(
+            nn.LayerNorm(self.interaction_count_context_dim),
+            nn.Linear(self.interaction_count_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
         self.first_path_power_bin_classifier = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, hidden_dim),
@@ -975,6 +981,7 @@ class CSIClip(nn.Module):
             *self.delay_spread_tail_classifier.modules(),
             *self.reflection_count_classifier.modules(),
             *self.reflection_count_regression_head.modules(),
+            *self.reflection_path_count_regression_head.modules(),
         ):
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=1e-3)
@@ -1374,6 +1381,9 @@ class CSIClip(nn.Module):
         reflection_count_prediction = self.reflection_count_regression_head(
             interaction_count_input
         ).squeeze(-1)
+        reflection_path_count_prediction = self.reflection_path_count_regression_head(
+            interaction_count_input
+        ).squeeze(-1)
         first_path_power_bin_logits = self.first_path_power_bin_classifier(
             physics_features
         )
@@ -1423,6 +1433,7 @@ class CSIClip(nn.Module):
                 "delay_spread_tail_logits": delay_spread_tail_logits,
                 "reflection_count_logits": reflection_count_logits,
                 "reflection_count_prediction": reflection_count_prediction,
+                "reflection_path_count_prediction": reflection_path_count_prediction,
                 "first_path_power_bin_logits": first_path_power_bin_logits,
                 "first_path_power_bin_position": first_path_power_bin_position,
                 "k_factor_strong_bin_logits": k_factor_strong_bin_logits,
@@ -1517,6 +1528,7 @@ class CSIClip(nn.Module):
             "delay_spread_tail_logits": delay_spread_tail_logits,
             "reflection_count_logits": reflection_count_logits,
             "reflection_count_prediction": reflection_count_prediction,
+            "reflection_path_count_prediction": reflection_path_count_prediction,
             "first_path_power_bin_logits": first_path_power_bin_logits,
             "first_path_power_bin_position": first_path_power_bin_position,
             "k_factor_strong_bin_logits": k_factor_strong_bin_logits,

@@ -96,6 +96,9 @@ class PreprocessedSample:
     first_path_aoa_az_deg: float = math.nan
     reflection_count: int = 0
     diffraction_count: int = 0
+    reflection_path_count: int = 0
+    diffraction_path_count: int = 0
+    direct_path_count: int = 0
     delay_power_map: torch.Tensor = field(default_factory=empty_delay_power_map)
     delay_power_profile: torch.Tensor = field(default_factory=empty_delay_power_profile)
 
@@ -113,6 +116,9 @@ def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
         "first_path_aoa_az_deg": math.nan,
         "reflection_count": 0,
         "diffraction_count": 0,
+        "reflection_path_count": 0,
+        "diffraction_path_count": 0,
+        "direct_path_count": 0,
     }
     for field_name, default_value in defaults.items():
         if not hasattr(sample, field_name):
@@ -299,6 +305,9 @@ def collate_fn(
     los_delay_target_mask = torch.zeros(batch_size, dtype=torch.bool)
     los_angle_target = torch.zeros(batch_size, 2, dtype=torch.float32)
     los_angle_target_mask = torch.zeros(batch_size, dtype=torch.bool)
+    reflection_path_count_raw_target = torch.zeros(batch_size, dtype=torch.float32)
+    reflection_path_count_target = torch.zeros(batch_size, dtype=torch.float32)
+    reflection_path_count_target_mask = torch.zeros(batch_size, dtype=torch.bool)
     delay_power_map = torch.zeros(
         batch_size,
         DELAY_POWER_MAP_SHAPE[0],
@@ -338,6 +347,13 @@ def collate_fn(
             los_angle_target[i, 0] = math.sin(los_aoa_az_rad)
             los_angle_target[i, 1] = math.cos(los_aoa_az_rad)
             los_angle_target_mask[i] = True
+        reflection_path_count = _finite_or_nan(
+            getattr(sample, "reflection_path_count", math.nan)
+        )
+        if math.isfinite(reflection_path_count):
+            reflection_path_count_raw_target[i] = float(reflection_path_count)
+            reflection_path_count_target[i] = float(reflection_path_count) / 10.0
+            reflection_path_count_target_mask[i] = True
         delay_power_map[i] = sample.delay_power_map.to(dtype=torch.float32)
         delay_power_profile[i] = sample.delay_power_profile.to(dtype=torch.float32)
 
@@ -363,6 +379,9 @@ def collate_fn(
         "los_delay_raw_target": los_delay_raw_target,
         "los_angle_target": los_angle_target,
         "los_angle_target_mask": los_angle_target_mask,
+        "reflection_path_count_raw_target": reflection_path_count_raw_target,
+        "reflection_path_count_target": reflection_path_count_target,
+        "reflection_path_count_target_mask": reflection_path_count_target_mask,
         "delay_power_map": delay_power_map,
         "delay_power_profile": delay_power_profile,
         "instance_captions": [sample.instance_caption for sample in batch],

@@ -86,8 +86,10 @@ class TrainConfig:
     interaction_count_regression_weight: float = 0.0
     reflection_count_classifier_weight: float = 0.0
     reflection_count_regression_weight: float = 0.0
+    reflection_path_count_regression_weight: float = 0.0
     reflection_count_nlos_weight: float = 1.0
     interaction_count_soft_labels: bool = False
+    physics_relational_weight: float = 0.0
     first_path_power_bin_classifier_weight: float = 0.0
     first_path_power_bin_position_weight: float = 0.0
     first_path_power_bin_weights: dict[str, float] | None = None
@@ -341,7 +343,7 @@ class Trainer:
                 f"out_features={reflection_count_linear.out_features} "
                 f"labels={self.REFLECTION_COUNT_BIN_LABELS}."
             )
-        for name in ("reflection_count_regression_head",):
+        for name in ("reflection_count_regression_head", "reflection_path_count_regression_head"):
             linear = self._last_linear(getattr(model, name, None))
             if linear is not None and linear.out_features != 1:
                 raise ValueError(
@@ -854,6 +856,86 @@ class Trainer:
             )
         return weights
 
+    def _physics_relational_losses(
+        self,
+        physics_outputs: dict[str, torch.Tensor],
+        batch: dict,
+    ) -> dict[str, torch.Tensor]:
+        final = physics_outputs["final"]
+        device = final.device
+        dtype = final.dtype
+        scales = PHYSICS_TARGET_SCALES.to(device=device, dtype=dtype)
+        offsets = PHYSICS_TARGET_OFFSETS.to(device=device, dtype=dtype)
+        raw_final = final * scales + offsets
+        losses: dict[str, torch.Tensor] = {}
+
+        path_count_idx = PHYSICS_TARGET_NAMES.index("n_paths")
+        delay_spread_idx = PHYSICS_TARGET_NAMES.index("delay_spread_ns")
+        first_path_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+        reflection_count_idx = PHYSICS_TARGET_NAMES.index("reflection_count")
+
+        path_count_raw = raw_final[:, path_count_idx]
+        delay_spread_raw = raw_final[:, delay_spread_idx]
+        reflection_count_raw = raw_final[:, reflection_count_idx]
+
+        path_mask = batch["physics_target_mask"][:, path_count_idx].bool() & torch.isfinite(path_count_raw)
+        if bool(path_mask.any()):
+            losses["loss_physics_relational_path_count"] = (
+                torch.relu(1.0 - path_count_raw[path_mask]) / scales[path_count_idx]
+            ).mean()
+
+        delay_spread_mask = (
+            batch["physics_target_mask"][:, delay_spread_idx].bool()
+            & torch.isfinite(delay_spread_raw)
+        )
+        if bool(delay_spread_mask.any()):
+            losses["loss_physics_relational_delay_spread"] = (
+                torch.relu(-delay_spread_raw[delay_spread_mask]) / scales[delay_spread_idx]
+            ).mean()
+
+        reflection_mask = (
+            batch["physics_target_mask"][:, reflection_count_idx].bool()
+            & torch.isfinite(reflection_count_raw)
+        )
+        if bool(reflection_mask.any()):
+            losses["loss_physics_relational_reflection_nonnegative"] = (
+                torch.relu(-reflection_count_raw[reflection_mask]) / scales[reflection_count_idx]
+            ).mean()
+
+        first_path_delay_raw = physics_outputs.get("first_path_delay_bin_soft_fused_raw")
+        if first_path_delay_raw is None:
+            first_path_delay_raw = raw_final[:, first_path_delay_idx]
+        los_delay_raw = physics_outputs["los_delay_context"] * scales[first_path_delay_idx]
+        los_sample_mask = torch.tensor(
+            [getattr(key, "los_status", None) == "los" for key in batch["semantic_keys"]],
+            device=device,
+            dtype=torch.bool,
+        )
+        los_delay_mask = batch["los_delay_target_mask"].bool()
+        relational_mask = (
+            los_sample_mask
+            & los_delay_mask
+            & torch.isfinite(first_path_delay_raw)
+            & torch.isfinite(los_delay_raw)
+        )
+        if bool(relational_mask.any()):
+            eps = torch.tensor(1e-6, device=device, dtype=dtype)
+            losses["loss_physics_relational_los_delay_positive"] = (
+                torch.relu(eps - los_delay_raw[relational_mask]) / scales[first_path_delay_idx]
+            ).mean()
+            losses["loss_physics_relational_first_path_delay_ge_los_delay"] = (
+                torch.relu(
+                    los_delay_raw[relational_mask] - first_path_delay_raw[relational_mask]
+                )
+                / scales[first_path_delay_idx]
+            ).mean()
+
+        if losses:
+            losses["loss_physics_relational"] = torch.stack(
+                list(losses.values())
+            ).mean()
+        return losses
+
     def _first_path_power_bin_class_weight(
         self,
         dtype: torch.dtype,
@@ -1138,6 +1220,12 @@ class Trainer:
                 cfg.interaction_count_regression_weight,
             )
         )
+        effective_reflection_path_count_regression_weight = (
+            0.0 if warmup_active else cfg.reflection_path_count_regression_weight
+        )
+        effective_physics_relational_weight = (
+            0.0 if warmup_active else cfg.physics_relational_weight
+        )
         self.optimizer.zero_grad(set_to_none=True)
         csi_features_raw = self.model.encode_csi(
             batch["tokens"],
@@ -1223,6 +1311,10 @@ class Trainer:
         reflection_count_mae = None
         reflection_count_target_histogram = None
         reflection_count_prediction_histogram = None
+        reflection_path_count_mae = None
+        reflection_path_count_exact_accuracy = None
+        reflection_path_count_target_histogram = None
+        reflection_path_count_prediction_histogram = None
         if (
             effective_aux_regression_weight > 0
             or effective_strong_k_bin_classifier_weight > 0.0
@@ -1250,6 +1342,8 @@ class Trainer:
             or effective_first_path_angle_nlos_weight > 0.0
             or effective_reflection_count_classifier_weight > 0.0
             or effective_reflection_count_regression_weight > 0.0
+            or effective_reflection_path_count_regression_weight > 0.0
+            or effective_physics_relational_weight > 0.0
         ):
             power_context = None
             delay_context = None
@@ -1835,6 +1929,49 @@ class Trainer:
                 ).abs().mean()
                 losses["loss_reflection_count_regression"] = loss
                 losses["loss_interaction_count_regression"] = loss
+        if (
+            physics_outputs is not None
+            and effective_reflection_path_count_regression_weight > 0.0
+        ):
+            prediction = physics_outputs["reflection_path_count_prediction"]
+            target = batch["reflection_path_count_target"]
+            mask = batch["reflection_path_count_target_mask"].bool()
+            if bool(mask.any()):
+                loss = torch.nn.functional.smooth_l1_loss(
+                    prediction[mask],
+                    target[mask],
+                    reduction="mean",
+                )
+                raw_prediction = prediction * 10.0
+                raw_target = batch["reflection_path_count_raw_target"].to(
+                    device=prediction.device,
+                    dtype=prediction.dtype,
+                )
+                valid_raw_prediction = raw_prediction[mask]
+                valid_raw_target = raw_target[mask]
+                rounded_prediction = valid_raw_prediction.round().clamp(min=0).long()
+                rounded_target = valid_raw_target.round().clamp(min=0).long()
+                reflection_path_count_mae = (
+                    valid_raw_prediction - valid_raw_target
+                ).abs().mean()
+                reflection_path_count_exact_accuracy = (
+                    rounded_prediction == rounded_target
+                ).float().mean()
+                max_bin = int(
+                    max(
+                        rounded_prediction.max().item(),
+                        rounded_target.max().item(),
+                    )
+                ) + 1
+                reflection_path_count_target_histogram = self._histogram(
+                    rounded_target,
+                    max_bin,
+                )
+                reflection_path_count_prediction_histogram = self._histogram(
+                    rounded_prediction,
+                    max_bin,
+                )
+                losses["loss_reflection_path_count_regression"] = loss
         if (
             physics_outputs is not None
             and effective_first_path_power_bin_classifier_weight > 0.0
@@ -2712,6 +2849,8 @@ class Trainer:
                         nlos_angle_error.mean() * (180.0 / math.pi)
                     )
                     first_path_angle_nlos_count = first_path_angle_nlos_mask.sum()
+        if physics_outputs is not None and effective_physics_relational_weight > 0.0:
+            losses.update(self._physics_relational_losses(physics_outputs, batch))
         total_loss = (
             effective_csi_to_text_weight * losses["loss_csi_to_text"] +
             effective_prototype_weight * losses["loss_csi_to_prototype"] +
@@ -2728,6 +2867,8 @@ class Trainer:
             effective_delay_spread_tail_classifier_weight * losses.get("loss_delay_spread_tail_classifier", torch.zeros((), device=self.device)) +
             effective_reflection_count_classifier_weight * losses.get("loss_interaction_count_classifier", torch.zeros((), device=self.device)) +
             effective_reflection_count_regression_weight * losses.get("loss_interaction_count_regression", torch.zeros((), device=self.device)) +
+            effective_reflection_path_count_regression_weight * losses.get("loss_reflection_path_count_regression", torch.zeros((), device=self.device)) +
+            effective_physics_relational_weight * losses.get("loss_physics_relational", torch.zeros((), device=self.device)) +
             cfg.direct_power_weight * losses.get("loss_direct_power", torch.zeros((), device=self.device)) +
             effective_delay_spread_weight * losses.get("loss_delay_spread", torch.zeros((), device=self.device)) +
             effective_delay_spread_raw_weight * losses.get("loss_delay_spread_raw", torch.zeros((), device=self.device)) +
@@ -3028,6 +3169,9 @@ class Trainer:
         metrics["reflection_count_regression_weight"] = float(
             effective_reflection_count_regression_weight
         )
+        metrics["reflection_path_count_regression_weight"] = float(
+            effective_reflection_path_count_regression_weight
+        )
         metrics["interaction_count_classifier_weight"] = float(
             effective_reflection_count_classifier_weight
         )
@@ -3038,6 +3182,7 @@ class Trainer:
         metrics["interaction_count_soft_labels"] = float(
             cfg.interaction_count_soft_labels
         )
+        metrics["physics_relational_weight"] = float(effective_physics_relational_weight)
         metrics["reflection_count_bin_label_order"] = ",".join(
             self.REFLECTION_COUNT_BIN_LABELS
         )
@@ -3054,6 +3199,22 @@ class Trainer:
         if reflection_count_prediction_histogram is not None:
             metrics["reflection_count_prediction_histogram"] = self._format_histogram(
                 reflection_count_prediction_histogram
+            )
+        if reflection_path_count_mae is not None:
+            metrics["reflection_path_count_mae"] = float(
+                reflection_path_count_mae.detach()
+            )
+        if reflection_path_count_exact_accuracy is not None:
+            metrics["reflection_path_count_exact_accuracy"] = float(
+                reflection_path_count_exact_accuracy.detach()
+            )
+        if reflection_path_count_target_histogram is not None:
+            metrics["reflection_path_count_target_histogram"] = self._format_histogram(
+                reflection_path_count_target_histogram
+            )
+        if reflection_path_count_prediction_histogram is not None:
+            metrics["reflection_path_count_prediction_histogram"] = self._format_histogram(
+                reflection_path_count_prediction_histogram
             )
         metrics["strong_k_bin_classifier_weight"] = float(
             effective_strong_k_bin_classifier_weight
