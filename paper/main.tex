@@ -35,8 +35,10 @@ We study the conversion of high-dimensional CSI into concise natural-language de
 Our approach, \model, combines a configuration-aware Transformer encoder, contrastive alignment between CSI and structured channel descriptions, a shared physics representation, and specialized prediction branches for delay, angle, power, $K$-factor, and reflection statistics.
 The predicted attributes are verbalized through a deterministic, auditable template, followed by a lightweight relational correction that removes contradictions such as a first-path delay preceding the direct line-of-sight delay.
 On a balanced 100k-sample UPA-$8{\times}8$, 128-subcarrier dataset, the full multi-task model obtains a first-path delay MAE of $21.91\pm0.30$ ns, first-path angle MAE of $18.37\pm0.37^\circ$, and reflection-interaction exact accuracy of $70.61\pm0.39\%$ over three seeds.
-On a separately constructed, naturally imbalanced reflected-path extension, the three-seed generated descriptions reach $94.06\pm1.07\%$ composite factuality, $99.97\pm0.01\%$ numeric-slot F1, $0.04\pm0.02\%$ numeric-slot hallucination, and $99.87\pm0.03\%$ physical consistency.
-The extension predicts the number of reflected paths with a text-level MAE of $0.091\pm0.007$.
+A stratified analysis reveals a pronounced propagation-regime gap: for LoS channels, first-path delay, angle, and power MAEs are $8.17$ ns, $1.68^\circ$, and $2.97$ dB, whereas for NLoS channels they rise to $35.82$ ns, $35.27^\circ$, and $6.97$ dB.
+Thus, the principal remaining bottleneck is not LoS interpretation but robust inference under NLoS multipath.
+On the same balanced split, the corresponding generated descriptions reach $96.43\pm0.12\%$ composite factuality, $99.959\pm0.003\%$ numeric-slot F1, $82.61\pm0.58\%$ numerical tolerance accuracy, and only $0.0737\pm0.0078\%$ numeric-slot hallucination.
+In a separate NLoS-skewed reflected-path extension that is not used for the balanced main comparison, the verbalized number of reflected paths attains a text-level MAE of $0.091\pm0.007$ and accuracy within one path of $98.82\pm0.06\%$.
 These results indicate that structured language can serve as a faithful and inspectable interface to learned wireless channel representations.
 \end{abstract}
 
@@ -64,7 +66,8 @@ Our contributions are:
     \item We formulate CSI-to-language conversion as grounded structured prediction followed by faithful verbalization, rather than unconstrained text generation.
     \item We develop a configuration-aware, physics-guided multi-task architecture with language alignment, shared physical features, and target-specific branches.
     \item We define a slot-based factuality protocol that separately measures categorical correctness, slot coverage, tolerance-aware numerical accuracy, hallucination, and physical consistency.
-    \item We provide three-seed comparisons, ablations, a relational-correction analysis, and a reflected-path-count extension while explicitly separating the balanced main dataset from the imbalanced extension dataset.
+    \item We identify a clear LoS--NLoS performance asymmetry on a balanced split, showing that NLoS multipath inference---especially first-path angle and delay---is the dominant source of remaining physical error.
+    \item We provide three-seed comparisons and ablations, plus a representative single-run relational-correction diagnostic and a reflected-path-count extension, while explicitly separating the balanced main dataset from the imbalanced extension dataset.
 \end{itemize}
 
 \section{Related Work}
@@ -154,16 +157,16 @@ The total objective is
 \lambda_{tp}\mathcal{L}_{t,p}+
 \lambda_{\mathrm{sem}}\mathcal{L}_{\mathrm{sem}}+
 \lambda_{\mathrm{attr}}\mathcal{L}_{\mathrm{attr}} \nonumber\\
-&+\sum_{q\in\mathcal{Q}}\lambda_q\mathcal{L}_q+
-\lambda_{\mathrm{rel}}\mathcal{L}_{\mathrm{rel}},
+&+\sum_{q\in\mathcal{Q}}\lambda_q\mathcal{L}_q,
 \end{align}
 where $\mathcal{Q}$ contains target-specific regression, bin-classification, and within-bin losses.
 The three alignment losses use weight 1.0; semantic classification, attribute classification, and auxiliary regression use 0.5, 0.1, and 0.005.
 The principal physics weights are 0.08 for first-path delay, 0.05 each for LoS delay and LoS angle, 0.02 for first-path angle, and 0.02/0.01 for reflection classification/regression.
 The complete loss specification is provided in Appendix~\ref{app:weights}.
 
-Relational training penalties impose only relations justified by the label definitions: nonnegative spreads and interaction counts, at least one propagation path, positive LoS delay when LoS is present, and $\tau_1\ge\tau_{\los}$ for LoS examples.
-We deliberately do not impose $n_r\le n_p$.
+The implementation supports an optional relational training regularizer, but its weight is zero in all reported main runs and it is therefore not part of the reported training objective.
+The relational-correction results in Section~\ref{sec:correction} instead apply constraints at the record-verbalization stage.
+In either setting, we deliberately do not impose the invalid relation $n_r\le n_p$.
 
 \section{CSI-to-Text Verbalization}
 \label{sec:verbalization}
@@ -208,7 +211,8 @@ We report this extension separately and do not reinterpret it as the balanced ma
 Models are trained for 100 epochs with AdamW, batch size 128, initial learning rate $3{\times}10^{-4}$, weight decay $10^{-2}$, five epochs of linear warmup, and cosine decay to $10^{-5}$.
 Checkpoints are saved every 20 epochs.
 Unless noted otherwise, results are the mean and sample standard deviation over seeds 0, 1, and 2.
-The current implementation has 31.87M trainable parameters.
+The relational training-regularizer weight is zero for these runs; relational correction is applied only during record verbalization in the diagnostic reported in Section~\ref{sec:correction}.
+The model used for the balanced three-seed main experiments has 28,938,178 trainable parameters (28.94M), as recorded independently in all three training logs.
 Each run uses one NVIDIA GeForce RTX 4090 with 23.6 GB memory; four such GPUs were available for parallel experiments.
 The software stack is PyTorch 2.5.1+cu121 and CUDA 12.1.
 Automatic mixed precision is disabled.
@@ -302,44 +306,67 @@ The full model is best on five of seven metrics, including the propagation quant
 The single-task system remains stronger for $K$-factor and first-path power, showing that multi-task sharing is not uniformly beneficial.
 Compared with PDP/IFFT+MLP, the full system reduces first-path delay MAE by 23.8\% while also improving angle and reflection predictions.
 
+\subsection{LoS versus NLoS stratified performance}
+\label{sec:losnlos}
+
+\begin{table}[t]
+\centering
+\caption{Propagation-regime-stratified MAE on the balanced main split (mean $\pm$ sample standard deviation over three seeds). Lower is better. The ratio is NLoS MAE divided by LoS MAE.}
+\label{tab:losnlos}
+\begin{tabular}{lccc}
+\toprule
+Target & LoS MAE & NLoS MAE & Ratio\\
+\midrule
+First-path delay & \textbf{8.174$\pm$0.156 ns} & 35.820$\pm$0.599 ns & 4.38$\times$\\
+First-path angle & \textbf{1.680$\pm$0.043$^\circ$} & 35.272$\pm$0.748$^\circ$ & 21.00$\times$\\
+First-path power & \textbf{2.973$\pm$0.638 dB} & 6.966$\pm$0.122 dB & 2.34$\times$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:losnlos} exposes the central limitation of the current model.
+LoS predictions are highly accurate, particularly for first-path angle, whose MAE is only $1.68^\circ$.
+When the direct path is blocked, delay error increases by $4.38\times$, angle error by $21.00\times$, and power error by $2.34\times$.
+Because the main dataset is balanced before splitting, this gap cannot be attributed to a shortage of NLoS training examples; it instead reflects the intrinsic ambiguity and richer multipath structure of NLoS propagation.
+Accordingly, improvements to NLoS representation learning are the primary technical priority.
+
 \section{Three-Seed Text Factuality Results}
 \label{sec:textresults}
 
 \begin{table}[t]
 \centering
-\caption{Description quality on the reflected-path-enabled evaluation (mean $\pm$ sample standard deviation over three seeds).}
+\caption{Description quality on the balanced main split (mean $\pm$ sample standard deviation over seeds 0, 1, and 2).}
 \label{tab:text}
 \begin{tabular}{lc}
 \toprule
 Metric & Result\\
 \midrule
-Composite description factuality $\uparrow$ & 0.9406 $\pm$ 0.0107\\
-Environment accuracy $\uparrow$ & 1.0000 $\pm$ 0.0000\\
-LoS/NLoS accuracy $\uparrow$ & 0.9976 $\pm$ 0.0011\\
-Categorical macro-F1 $\uparrow$ & 0.9975 $\pm$ 0.0011\\
-Numeric-slot F1 $\uparrow$ & 0.9997 $\pm$ 0.0001\\
-Numeric tolerance accuracy $\uparrow$ & 0.7063 $\pm$ 0.0548\\
-Numeric-slot hallucination $\downarrow$ & 0.0004 $\pm$ 0.0002\\
-Physical consistency $\uparrow$ & 0.9987 $\pm$ 0.0003\\
+Composite description factuality $\uparrow$ & 0.9643 $\pm$ 0.0012\\
+Numeric-slot F1 $\uparrow$ & 0.99959 $\pm$ 0.00003\\
+Numeric tolerance accuracy $\uparrow$ & 0.8261 $\pm$ 0.0058\\
+Numeric-slot hallucination $\downarrow$ & 0.000737 $\pm$ 0.000078\\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:text} shows that the system almost always emits the required slots and rarely introduces an unsupported one.
-Categorical facts are also stable.
-Numerical tolerance accuracy is lower and more seed-sensitive: the individual results are 69.84\%, 65.58\%, and 76.46\%.
-This does not mean that one quarter of all sentences is entirely wrong; rather, it measures the proportion of jointly present numerical fields that fall within their field-specific tolerances.
+Table~\ref{tab:text} shows that, on the balanced main split, the system almost always emits the required slots and rarely introduces an unsupported one.
+The three seed-wise numerical tolerance accuracies are 81.97\%, 82.78\%, and 83.10\%, indicating substantially less seed sensitivity than in the imbalanced reflected-path extension.
+This metric is computed over jointly present numerical fields; it is not the fraction of entire sentences that are exactly correct.
 
-The largest numerical errors occur for first-path angle (MAE $23.52\pm1.02^\circ$; tolerance accuracy $54.11\pm0.32\%$), first-path power ($9.19\pm1.69$ dB; $37.80\pm7.02\%$), $K$-factor ($3.65\pm1.70$ dB; $53.84\pm32.81\%$), and angle spread ($25.44\pm8.96^\circ$; $35.37\pm18.28\%$).
-By comparison, first-path delay reaches $96.64\pm0.24\%$ accuracy at 50 ns and LoS angle reaches $99.60\pm0.13\%$ accuracy at $15^\circ$.
+Field-level results in Appendix~\ref{app:textmetrics} show that LoS delay, LoS angle, delay spread, path count, and first-path delay are the most reliable numerical statements.
+The principal remaining errors are first-path power ($64.36\pm4.30\%$ within 5 dB), reflection-interaction count ($65.62\pm0.31\%$ within one), and first-path angle ($68.41\pm1.02\%$ within $15^\circ$).
+Angle-spread accuracy has the largest cross-seed variation ($79.07\pm7.16\%$).
+The rule-based physical-consistency diagnostic is not used as a primary factuality measure because it depends on the chosen rule set and post-processing; factual claims are evaluated directly against target slots.
 
 \section{Reflected-Path Extension}
 \label{sec:pathcount}
 
 The base model predicts the total number of reflection \emph{interactions}.
 To support statements such as ``four paths contain reflection interactions,'' we add a separate reflected-path-count head.
-On the imbalanced extension split, the verbalized reflected-path value attains an MAE of $0.091\pm0.007$, RMSE of $0.234\pm0.008$, and accuracy within one path of $98.82\pm0.06\%$.
+This extension is strongly NLoS-skewed and is not used for the balanced main comparison.
+On its separate test split, the verbalized reflected-path value attains an MAE of $0.091\pm0.007$, RMSE of $0.234\pm0.008$, and accuracy within one path of $98.82\pm0.06\%$.
 These are text-level metrics computed after record generation and verbalization; they should not be confused with head-level exact classification accuracy.
+Across the complete extension descriptions, composite factuality is $94.06\pm1.07\%$, numeric-slot F1 is $99.974\pm0.012\%$, numeric-slot hallucination is $0.0437\pm0.0200\%$, numerical tolerance accuracy is $70.63\pm5.48\%$, and physical consistency is $99.872\pm0.029\%$.
 The strong result demonstrates that the two reflection concepts can be modeled separately without relying on the invalid assumption that total interactions cannot exceed total paths.
 
 \section{Ablation and Error Analysis}
@@ -375,10 +402,10 @@ Thus, the rule removes contradictions at negligible measured accuracy cost.
 We treat this consistency score as a diagnostic, not a substitute for comparison with ground-truth slots.
 
 \paragraph{Failure modes.}
-The remaining difficulty is continuous-value estimation rather than slot omission or category recognition.
-Angle spread and $K$-factor also have large cross-seed variance.
-Moreover, the path-count extension is dominated by NLoS samples, which are harder because their multipath structure is less directly observable.
-Future evaluation should report LoS/NLoS-stratified errors and calibration intervals in addition to aggregate MAE.
+The dominant failure mode is continuous-value estimation under NLoS propagation rather than slot omission or category recognition.
+As Table~\ref{tab:losnlos} shows, the model is already accurate for key LoS quantities but degrades sharply when the direct path is absent, most notably for first-path angle and delay.
+Angle spread and $K$-factor also have cross-seed variance, and the NLoS-skewed path-count extension further stresses this difficult regime.
+Future work should therefore prioritize NLoS-aware objectives, multipath-structure encoders, hard-example reweighting, and uncertainty calibration, while continuing to report LoS/NLoS-stratified errors instead of relying only on aggregate MAE.
 
 \section{Limitations}
 
@@ -387,15 +414,18 @@ The work demonstrates CSI-to-natural-language verbalization, not unrestricted di
 Second, the experiments use ray-traced data from one principal UPA/frequency configuration; generalization to measured channels, unseen arrays, bandwidths, and environments remains to be established.
 Third, multi-task learning does not dominate single-task learning for every variable, especially $K$-factor and first-path power.
 Fourth, tolerance-based numerical accuracy depends on application-specific thresholds and should always be presented with raw error metrics.
+Fifth, the large LoS--NLoS gap shows that strong LoS performance does not yet translate to robust NLoS inference; improving representation of indirect and higher-order multipath components is the main modeling limitation.
 Finally, the reflected-path extension is strongly NLoS-skewed, so its aggregate score should not be compared directly with balanced main-split results.
 
 \section{Conclusion}
 
 We presented a physics-grounded framework that converts CSI into an interpretable natural-language channel description.
 The system combines configuration-aware CSI encoding, language and prototype alignment, specialized multi-task physics heads, explicit verbalization, and a lightweight relational correction.
-Three-seed experiments show strong physical prediction, near-complete slot realization, very low hallucination, and high post-correction consistency.
-The reflected-path extension further distinguishes reflection interactions from the number of reflected paths.
-The results support structured language as a practical interface for inspecting learned wireless channel models, while identifying continuous-value robustness and cross-configuration validation as the next priorities.
+On the balanced main split, three-seed experiments show strong physical prediction, near-complete slot realization, and very low hallucination.
+The most important empirical finding is the propagation-regime asymmetry: the model is highly accurate in LoS conditions, while NLoS first-path delay, angle, and power remain substantially harder.
+A representative single-run diagnostic shows that relational verbalization correction removes contradictions with negligible factuality change.
+Separately, the NLoS-skewed reflected-path extension distinguishes reflection interactions from the number of reflected paths and is not included in the balanced main comparison.
+The results support structured language as a practical interface for inspecting learned wireless channel models, while identifying NLoS-specific representation learning and cross-configuration validation as the next priorities.
 
 \subsubsection*{Reproducibility statement}
 The anonymous supplementary code includes preprocessing, training, evaluation, signal-description parsing, and metric aggregation scripts.
@@ -436,23 +466,22 @@ Reflection interactions & classifier / regression; NLoS sample multiplier & 0.02
 
 \begin{table*}[h]
 \centering
-\caption{Three-seed numerical text metrics on the reflected-path-enabled evaluation. Accuracy uses the tolerance shown in parentheses.}
+\caption{Three-seed numerical tolerance accuracy on the balanced main split. Reflected-path count is excluded from this table and reported only in the separate path-count extension.}
 \label{tab:fieldmetrics}
-\begin{tabular}{lcc}
+\begin{tabular}{lc}
 \toprule
-Field & MAE & Tolerance accuracy\\
+Field & Tolerance accuracy\\
 \midrule
-Path count ($\pm1$) & 0.326$\pm$0.056 & 0.8893$\pm$0.0485\\
-First-path delay ($\pm50$ ns) & 13.923$\pm$0.578 ns & 0.9664$\pm$0.0024\\
-First-path angle ($\pm15^\circ$) & 23.517$\pm$1.015$^\circ$ & 0.5411$\pm$0.0032\\
-First-path power ($\pm5$ dB) & 9.186$\pm$1.693 dB & 0.3780$\pm$0.0702\\
-$K$-factor ($\pm3$ dB) & 3.646$\pm$1.699 dB & 0.5384$\pm$0.3281\\
-Delay spread ($\pm50$ ns) & 11.429$\pm$0.076 ns & 0.9741$\pm$0.0015\\
-Angle spread ($\pm15^\circ$) & 25.437$\pm$8.960$^\circ$ & 0.3537$\pm$0.1828\\
-LoS delay ($\pm50$ ns) & 10.954$\pm$0.245 ns & 0.9783$\pm$0.0013\\
-LoS angle ($\pm15^\circ$) & 1.321$\pm$0.148$^\circ$ & 0.9960$\pm$0.0013\\
-Reflection interactions ($\pm1$) & 0.931$\pm$0.017 & 0.6499$\pm$0.0103\\
-Reflected paths ($\pm1$) & 0.091$\pm$0.007 & 0.9882$\pm$0.0006\\
+Path count ($\pm1$) & 0.9533$\pm$0.0061\\
+First-path delay ($\pm50$ ns) & 0.9451$\pm$0.0032\\
+First-path angle ($\pm15^\circ$) & 0.6841$\pm$0.0102\\
+First-path power ($\pm5$ dB) & 0.6436$\pm$0.0430\\
+$K$-factor ($\pm3$ dB) & 0.7971$\pm$0.0302\\
+Delay spread ($\pm50$ ns) & 0.9700$\pm$0.0003\\
+Angle spread ($\pm15^\circ$) & 0.7907$\pm$0.0716\\
+LoS delay ($\pm50$ ns) & 0.9915$\pm$0.0012\\
+LoS angle ($\pm15^\circ$) & 0.9972$\pm$0.0007\\
+Reflection interactions ($\pm1$) & 0.6562$\pm$0.0031\\
 \bottomrule
 \end{tabular}
 \end{table*}
