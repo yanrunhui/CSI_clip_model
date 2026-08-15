@@ -23,3 +23,12 @@ The main physical comparison uses the balanced 100k dataset (50k LoS and
 50k NLoS before splitting). The reflected-path extension is reported
 separately because its 100k dataset contains 13,628 LoS and 86,372 NLoS
 examples.
+
+The generalization section reports the complete multi-task model rather than
+the earlier delay-only paired-gate experiment. Frequency-configuration transfer
+is evaluated by training on `nf64`, `nf96`, `nf192`, and `nf256` and holding
+out `nf128`, including end-to-end text factuality. Cross-array evaluation uses
+mixed UPA/ULA training and aligned held-out UPA4x4, UPA16x4, and ULA32 test
+observations, plus a separate reverse ULA32-to-unseen-ULA64 experiment. The
+three source CSV files and all reported statistics are recorded in
+`RESULTS_PROVENANCE.md`.

@@ -30,16 +30,13 @@ Physics-Grounded Multi-Task Learning for Interpretable Wireless Channel Descript
 \maketitle
 
 \begin{abstract}
-Channel state information (CSI) is information-rich but difficult for a human to interpret directly.
-We study the conversion of high-dimensional CSI into concise natural-language descriptions grounded in propagation physics.
-Our approach, \model, combines a configuration-aware Transformer encoder, contrastive alignment between CSI and structured channel descriptions, a shared physics representation, and specialized prediction branches for delay, angle, power, $K$-factor, and reflection statistics.
-The predicted attributes are verbalized through a deterministic, auditable template, followed by a lightweight relational correction that removes contradictions such as a first-path delay preceding the direct line-of-sight delay.
-On a balanced 100k-sample UPA-$8{\times}8$, 128-subcarrier dataset, the full multi-task model obtains a first-path delay MAE of $21.91\pm0.30$ ns, first-path angle MAE of $18.37\pm0.37^\circ$, and reflection-interaction exact accuracy of $70.61\pm0.39\%$ over three seeds.
-A stratified analysis reveals a pronounced propagation-regime gap: for LoS channels, first-path delay, angle, and power MAEs are $8.17$ ns, $1.68^\circ$, and $2.97$ dB, whereas for NLoS channels they rise to $35.82$ ns, $35.27^\circ$, and $6.97$ dB.
-Thus, the principal remaining bottleneck is not LoS interpretation but robust inference under NLoS multipath.
-On the same balanced split, the corresponding generated descriptions reach $96.43\pm0.12\%$ composite factuality, $99.959\pm0.003\%$ numeric-slot F1, $82.61\pm0.58\%$ numerical tolerance accuracy, and only $0.0737\pm0.0078\%$ numeric-slot hallucination.
-In a separate NLoS-skewed reflected-path extension that is not used for the balanced main comparison, the verbalized number of reflected paths attains a text-level MAE of $0.091\pm0.007$ and accuracy within one path of $98.82\pm0.06\%$.
-These results indicate that structured language can serve as a faithful and inspectable interface to learned wireless channel representations.
+Channel state information (CSI) is information-rich but difficult to interpret directly.
+We present \model, a physics-grounded multi-task framework that predicts structured propagation attributes and converts them into auditable natural-language descriptions using deterministic verbalization and relational correction.
+On a balanced 100k-sample UPA-$8{\times}8$ dataset, the model achieves first-path delay and angle MAEs of $21.91\pm0.30$ ns and $18.37\pm0.37^\circ$, while generated descriptions reach $96.43\pm0.12\%$ factuality with only $0.0737\pm0.0078\%$ numeric-slot hallucination.
+The remaining errors are concentrated in NLoS propagation: first-path angle MAE increases from $1.68^\circ$ in LoS to $35.27^\circ$ in NLoS.
+Full-model generalization tests retain $95.67\pm0.18\%$ description factuality on a held-out $N_f=128$ configuration and $94.45\pm0.19\%$ on an unseen ULA-32 array.
+Cross-array results further show that larger-to-smaller ULA transfer is more reliable than extrapolation to a larger unseen aperture.
+These findings establish structured language as a faithful interface to learned wireless-channel representations and identify robust NLoS inference as the main direction for improvement.
 \end{abstract}
 
 \section{Introduction}
@@ -67,6 +64,8 @@ Our contributions are:
     \item We develop a configuration-aware, physics-guided multi-task architecture with language alignment, shared physical features, and target-specific branches.
     \item We define a slot-based factuality protocol that separately measures categorical correctness, slot coverage, tolerance-aware numerical accuracy, hallucination, and physical consistency.
     \item We identify a clear LoS--NLoS performance asymmetry on a balanced split, showing that NLoS multipath inference---especially first-path angle and delay---is the dominant source of remaining physical error.
+    \item We evaluate the complete multi-task model on a strictly held-out $N_f=128$ configuration, including physical attributes and end-to-end text factuality.
+    \item We evaluate mixed-array learning and zero-shot array-size transfer on unseen UPA-$4{\times}4$, UPA-$16{\times}4$, ULA-32, and ULA-64 configurations, exposing an asymmetric ULA aperture-generalization boundary.
     \item We provide three-seed comparisons and ablations, plus a representative single-run relational-correction diagnostic and a reflected-path-count extension, while explicitly separating the balanced main dataset from the imbalanced extension dataset.
 \end{itemize}
 
@@ -207,6 +206,14 @@ It contains 100,000 examples but is naturally imbalanced: 13,628 LoS and 86,372 
 Its 80,000/20,000 split contains 10,902/69,098 LoS/NLoS training examples and 2,726/17,274 test examples.
 We report this extension separately and do not reinterpret it as the balanced main dataset.
 
+\paragraph{Full-model generalization protocols.}
+For frequency-configuration transfer, the complete multi-task model is jointly trained on $N_f\in\{64,96,192,256\}$ and evaluated on $N_f=128$, which is excluded from parameter fitting.
+This test uses the same structured prediction and verbalization pipeline as the main model.
+For array transfer, a mixed-array full model is trained with UPA-$8{\times}8$ and ULA-64 observations and evaluated on the seen arrays and on aligned held-out UPA-$4{\times}4$, UPA-$16{\times}4$, and ULA-32 observations.
+To test the opposite ULA size direction, a separate full model trained with ULA-32 observations is evaluated on held-out ULA-64 observations.
+Held-out array sets are aligned to test-group identifiers not used for fitting, preventing a newly randomized array split from reusing training links.
+All reported frequency and array results use seeds 0, 1, and 2 and the sample standard deviation ($\mathrm{ddof}=1$).
+
 \paragraph{Optimization and compute.}
 Models are trained for 100 epochs with AdamW, batch size 128, initial learning rate $3{\times}10^{-4}$, weight decay $10^{-2}$, five epochs of linear warmup, and cosine decay to $10^{-5}$.
 Checkpoints are saved every 20 epochs.
@@ -330,6 +337,101 @@ When the direct path is blocked, delay error increases by $4.38\times$, angle er
 Because the main dataset is balanced before splitting, this gap cannot be attributed to a shortage of NLoS training examples; it instead reflects the intrinsic ambiguity and richer multipath structure of NLoS propagation.
 Accordingly, improvements to NLoS representation learning are the primary technical priority.
 
+\section{Full-Model Cross-Configuration Generalization}
+\label{sec:generalization}
+
+\subsection{Held-out frequency configuration}
+
+We first hold out $N_f=128$ while jointly training the complete multi-task model on $N_f\in\{64,96,192,256\}$.
+This experiment evaluates the same full prediction and verbalization pipeline used elsewhere in the paper.
+Table~\ref{tab:nf128full} shows stable three-seed transfer to the unseen frequency-sampling configuration.
+
+\begin{table}[t]
+\centering
+\caption{Full-model results on the held-out $N_f=128$ configuration (mean $\pm$ sample standard deviation over seeds 0, 1, and 2).}
+\label{tab:nf128full}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lc}
+\toprule
+Metric & Held-out $N_f=128$\\
+\midrule
+LoS/NLoS accuracy $\uparrow$ & 99.827$\pm$0.006\%\\
+First-path delay MAE $\downarrow$ & 58.752$\pm$1.338 ns\\
+LoS delay MAE $\downarrow$ & 21.801$\pm$1.270 ns\\
+$K$-factor MAE $\downarrow$ & 2.166$\pm$0.037 dB\\
+First-path angle MAE $\downarrow$ & 20.483$\pm$0.146$^\circ$\\
+First-path power MAE $\downarrow$ & 5.998$\pm$0.355 dB\\
+Delay-spread MAE $\downarrow$ & 19.604$\pm$0.253 ns\\
+Azimuth-spread MAE $\downarrow$ & 10.952$\pm$1.399$^\circ$\\
+Reflection-interaction exact accuracy $\uparrow$ & 68.303$\pm$0.268\%\\
+Reflected-path exact accuracy $\uparrow$ & 95.547$\pm$0.064\%\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+The aggregate result again masks a large propagation-regime gap.
+For first-path delay, LoS and NLoS MAEs are $25.123\pm0.419$ and $92.393\pm2.271$ ns; for first-path angle they are $1.756\pm0.197^\circ$ and $39.215\pm0.279^\circ$.
+First-path power is less asymmetric but remains harder in NLoS ($5.079\pm0.507$ versus $6.918\pm0.226$ dB).
+Thus, the excellent LoS geometry transfer and the persistent NLoS bottleneck observed on the main split also hold under an unseen $N_f$.
+
+The held-out-$N_f$ descriptions are generated end to end, without oracle values for non-delay fields.
+They achieve $95.667\pm0.179\%$ composite factuality, $99.883\pm0.008\%$ categorical macro-F1, $99.977\pm0.002\%$ numeric-slot F1, $78.639\pm0.906\%$ numerical tolerance accuracy, and only $0.0455\pm0.0038\%$ numeric-slot hallucination.
+Post-verbalization physical consistency is $99.122\pm0.215\%$ after relational correction.
+These results support full-model transfer to the held-out $N_f=128$ configuration, but do not imply uniform zero-shot performance for arbitrary sampling densities or carrier frequencies.
+
+\subsection{Cross-array and array-size transfer}
+
+Table~\ref{tab:crossarray} evaluates the mixed UPA/ULA full model on seen and held-out array sizes.
+The unseen arrays use aligned held-out link groups rather than newly randomized splits.
+This distinction makes the comparison a test of array configuration transfer rather than memorization of the same physical links.
+
+\begin{table*}[t]
+\centering
+\caption{Full-model cross-array results (mean $\pm$ sample standard deviation over three seeds). UPA-$8{\times}8$ and ULA-64 are seen during mixed-array training; the remaining configurations are held out.}
+\label{tab:crossarray}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{llccccc}
+\toprule
+Array & Status & LoS angle MAE & NLoS first-angle MAE & First-delay MAE & $K$ MAE & Text factuality\\
+\midrule
+UPA-$8{\times}8$ & Seen & 6.106$\pm$1.966$^\circ$ & 42.591$\pm$0.377$^\circ$ & 53.854$\pm$6.213 ns & 4.173$\pm$0.313 dB & 94.316$\pm$0.096\%\\
+ULA-64 & Seen & 14.566$\pm$2.623$^\circ$ & 42.710$\pm$0.562$^\circ$ & 47.449$\pm$2.121 ns & 4.310$\pm$0.249 dB & 94.178$\pm$0.167\%\\
+UPA-$4{\times}4$ & Unseen & 10.257$\pm$3.013$^\circ$ & 45.859$\pm$0.110$^\circ$ & 44.082$\pm$0.786 ns & 5.884$\pm$0.230 dB & 93.556$\pm$0.092\%\\
+UPA-$16{\times}4$ & Unseen & 9.446$\pm$0.913$^\circ$ & 43.237$\pm$0.114$^\circ$ & 54.828$\pm$5.982 ns & 4.758$\pm$0.457 dB & 93.639$\pm$0.136\%\\
+ULA-32 & Unseen & 11.345$\pm$0.566$^\circ$ & 42.919$\pm$0.400$^\circ$ & 43.399$\pm$1.029 ns & 4.282$\pm$0.285 dB & 94.449$\pm$0.193\%\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+The unseen UPA sizes preserve high categorical and textual reliability, while their LoS-angle MAEs remain within $9.45$--$10.26^\circ$.
+The unseen ULA-32 result is similarly stable: LoS/NLoS accuracy is $97.037\pm0.220\%$, reflected-path exact accuracy is $94.340\pm0.165\%$, and numerical tolerance accuracy is $75.881\pm0.957\%$.
+Across every array in Table~\ref{tab:crossarray}, however, NLoS first-path angle remains approximately $42$--$46^\circ$.
+Its weak dependence on array type or size indicates a shared NLoS inference limitation rather than a failure specific to one array geometry.
+
+We additionally reverse the ULA size direction in a separately trained full model.
+Table~\ref{tab:uladirection} shows that ULA-64-to-ULA-32 transfer is substantially easier than ULA-32-to-ULA-64 transfer.
+
+\begin{table}[t]
+\centering
+\caption{Directional ULA size transfer. Each row reports the seen training size and its unseen test size over three seeds.}
+\label{tab:uladirection}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{llccc}
+\toprule
+Direction & Status & LoS angle & First delay & Text factuality\\
+\midrule
+ULA-64 $\rightarrow$ ULA-32 & Seen 64 & 14.566$\pm$2.623$^\circ$ & 47.449$\pm$2.121 ns & 94.178$\pm$0.167\%\\
+ & Unseen 32 & \textbf{11.345$\pm$0.566$^\circ$} & \textbf{43.399$\pm$1.029 ns} & \textbf{94.449$\pm$0.193\%}\\
+ULA-32 $\rightarrow$ ULA-64 & Seen 32 & \textbf{10.730$\pm$0.785$^\circ$} & \textbf{41.619$\pm$0.954 ns} & \textbf{95.092$\pm$0.096\%}\\
+ & Unseen 64 & 17.223$\pm$3.331$^\circ$ & 49.350$\pm$3.524 ns & 94.222$\pm$0.073\%\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+The larger-to-smaller direction exhibits no measurable degradation on these aggregate metrics, whereas the smaller-to-larger direction increases LoS-angle MAE by $6.49^\circ$ and first-path-delay MAE by $7.73$ ns.
+We do not interpret the slightly better unseen ULA-32 numbers as an intrinsic advantage of zero-shot prediction; they indicate that the smaller aperture lies within the representation learned from the larger one.
+Conversely, extrapolating to a larger unseen aperture changes the spatial phase structure and angular resolution, making it the harder direction.
+
 \section{Three-Seed Text Factuality Results}
 \label{sec:textresults}
 
@@ -411,10 +513,12 @@ Future work should therefore prioritize NLoS-aware objectives, multipath-structu
 
 First, the output language is template-based and therefore factual and auditable but not stylistically open-ended.
 The work demonstrates CSI-to-natural-language verbalization, not unrestricted dialogue about wireless scenes.
-Second, the experiments use ray-traced data from one principal UPA/frequency configuration; generalization to measured channels, unseen arrays, bandwidths, and environments remains to be established.
-Third, multi-task learning does not dominate single-task learning for every variable, especially $K$-factor and first-path power.
-Fourth, tolerance-based numerical accuracy depends on application-specific thresholds and should always be presented with raw error metrics.
-Fifth, the large LoS--NLoS gap shows that strong LoS performance does not yet translate to robust NLoS inference; improving representation of indirect and higher-order multipath components is the main modeling limitation.
+Second, the frequency experiment holds out one sampling configuration, $N_f=128$; it does not establish uniform transfer to arbitrary $N_f$, bandwidths, subcarrier spacings, or carrier frequencies.
+Third, the array experiments cover a limited set of simulated UPA and ULA geometries.
+They demonstrate transfer to unseen array sizes, but smaller-to-larger ULA extrapolation remains weaker and the results do not yet establish robustness to element perturbations, calibration errors, noise, or measured channels.
+Fourth, multi-task learning does not dominate single-task learning for every variable, especially $K$-factor and first-path power.
+Fifth, tolerance-based numerical accuracy depends on application-specific thresholds and should always be presented with raw error metrics.
+Sixth, the large LoS--NLoS gap persists under both unseen frequency and unseen array configurations; improving representation of indirect and higher-order multipath components is therefore the main modeling limitation.
 Finally, the reflected-path extension is strongly NLoS-skewed, so its aggregate score should not be compared directly with balanced main-split results.
 
 \section{Conclusion}
@@ -425,6 +529,9 @@ On the balanced main split, three-seed experiments show strong physical predicti
 The most important empirical finding is the propagation-regime asymmetry: the model is highly accurate in LoS conditions, while NLoS first-path delay, angle, and power remain substantially harder.
 A representative single-run diagnostic shows that relational verbalization correction removes contradictions with negligible factuality change.
 Separately, the NLoS-skewed reflected-path extension distinguishes reflection interactions from the number of reflected paths and is not included in the balanced main comparison.
+The complete multi-task model also transfers to a held-out $N_f=128$ configuration, achieving $58.75\pm1.34$ ns first-path-delay MAE, $99.827\pm0.006\%$ LoS/NLoS accuracy, and $95.67\pm0.18\%$ end-to-end description factuality.
+Mixed-array training further supports zero-shot size transfer to UPA-$4{\times}4$, UPA-$16{\times}4$, and ULA-32, while a reverse ULA experiment shows that extrapolating from ULA-32 to unseen ULA-64 is harder than transferring from ULA-64 to ULA-32.
+Across these configuration shifts, LoS geometry remains substantially more reliable than NLoS first-path inference, which remains the dominant generalization bottleneck.
 The results support structured language as a practical interface for inspecting learned wireless channel models, while identifying NLoS-specific representation learning and cross-configuration validation as the next priorities.
 
 \subsubsection*{Reproducibility statement}

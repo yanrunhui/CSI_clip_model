@@ -23,6 +23,7 @@ from data.dataset import (
     DELAY_POWER_MAP_SHAPE,
     DELAY_POWER_PROFILE_BINS,
     PreprocessedSample,
+    regular_array_coordinates,
 )
 from data.preprocess import preprocess_sample
 
@@ -1242,6 +1243,9 @@ def preprocess_deepmimo_dataset(
     bw_bin = derive_bw_bin(n_selected)
     ant_bin = derive_ant_bin(n_tx)
     array_label = 0 if array_type == "ULA" else 1
+    antenna_spacing_wavelengths = float(
+        dataset.ch_params.get("bs_antenna", {}).get("spacing", 0.5)
+    )
     n_samples = int(dataset.channel.shape[0])
     if max_samples is not None:
         n_samples = min(n_samples, max_samples)
@@ -1343,6 +1347,17 @@ def preprocess_deepmimo_dataset(
                 direct_path_count=int(observables["direct_path_count"]),
                 delay_power_map=delay_power_map,
                 delay_power_profile=delay_power_profile,
+                array_type=array_type,
+                array_rows=n_row,
+                array_cols=n_col,
+                antenna_spacing_wavelengths=antenna_spacing_wavelengths,
+                source_n_freq=total_subcarriers,
+                bandwidth_hz=bw_hz,
+                antenna_coordinates_wavelengths=regular_array_coordinates(
+                    n_row,
+                    n_col,
+                    antenna_spacing_wavelengths,
+                ),
             )
         )
     return samples

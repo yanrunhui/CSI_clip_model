@@ -9,13 +9,19 @@ from pathlib import Path
 
 DEFAULT_METRICS = (
     ("description_factual_accuracy", "primary_factual_metrics"),
+    ("description_factual_accuracy", "delay_numeric_slots"),
     ("slot_f1", "all_numeric_slots"),
+    ("slot_f1", "delay_numeric_slots"),
     ("hallucination_rate", "all_numeric_slots"),
+    ("hallucination_rate", "delay_numeric_slots"),
     ("numerical_slot_accuracy", "all_numeric_slots"),
+    ("numerical_slot_accuracy", "delay_numeric_slots"),
     ("physical_consistency_rate", "predicted_description"),
     ("physical_consistency_violation_rate", "predicted_description"),
     ("numerical_mae", "first_path_delay_ns"),
+    ("numerical_accuracy@50", "first_path_delay_ns"),
     ("numerical_mae", "los_delay_ns"),
+    ("numerical_accuracy@50", "los_delay_ns"),
     ("numerical_mae", "reflection_path_count"),
 )
 

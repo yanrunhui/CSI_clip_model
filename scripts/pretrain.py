@@ -633,6 +633,10 @@ def build_components_from_samples(
     detach_delay_spread_features: bool = False,
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
+    use_array_invariant_delay_encoder: bool = False,
+    use_continuous_config_encoding: bool = False,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
@@ -667,7 +671,13 @@ def build_components_from_samples(
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        collate_fn=partial(collate_fn, tokenizer=tokenizer, max_caption_len=48),
+        collate_fn=partial(
+            collate_fn,
+            tokenizer=tokenizer,
+            max_caption_len=48,
+            array_token_dropout=array_token_dropout,
+            array_token_min_tokens=array_token_min_tokens,
+        ),
     )
 
     csi_encoder = CSIEncoder(
@@ -675,6 +685,7 @@ def build_components_from_samples(
         d_model=384,
         d_clip=256,
         token_norm_mode=token_norm_mode,
+        use_continuous_config_encoding=use_continuous_config_encoding,
     )
     text_encoder = PhysicsTextEncoder(vocab_size=max(tokenizer.next_id + 8, 300))
     model = CSIClip(
@@ -692,6 +703,7 @@ def build_components_from_samples(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         los_angle_context_token_norm_mode=token_norm_mode,
@@ -999,6 +1011,10 @@ def build_demo_components(
     detach_delay_spread_features: bool = False,
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
+    use_array_invariant_delay_encoder: bool = False,
+    use_continuous_config_encoding: bool = False,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
@@ -1025,6 +1041,10 @@ def build_demo_components(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+        array_token_dropout=array_token_dropout,
+        array_token_min_tokens=array_token_min_tokens,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         use_shared_physics_token=use_shared_physics_token,
@@ -1037,6 +1057,7 @@ def build_demo_components(
 def build_real_components(
     data_path: str,
     device: torch.device,
+    additional_data_paths: tuple[str, ...] = (),
     batch_size: int = 128,
     temperature: float = 0.07,
     token_norm_mode: str = "std",
@@ -1047,6 +1068,10 @@ def build_real_components(
     detach_delay_spread_features: bool = False,
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
+    use_array_invariant_delay_encoder: bool = False,
+    use_continuous_config_encoding: bool = False,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
@@ -1062,7 +1087,20 @@ def build_real_components(
     max_delay_spread_ns: float | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
 ):
-    dataset = PreprocessedCSIDataset.from_pt(data_path)
+    data_paths = (data_path, *additional_data_paths)
+    source_samples = []
+    for source_path in data_paths:
+        source_dataset = PreprocessedCSIDataset.from_pt(source_path)
+        print(
+            f"joint_training_source={source_path} "
+            f"samples={len(source_dataset.samples)}"
+        )
+        source_samples.extend(source_dataset.samples)
+    dataset = PreprocessedCSIDataset(source_samples)
+    print(
+        f"joint_training_sources={len(data_paths)} "
+        f"combined_samples={len(dataset.samples)}"
+    )
     mode_samples = apply_semantic_key_mode(dataset.samples, semantic_key_mode)
     if semantic_key_mode != "full":
         before_counts = Counter(sample.semantic_key for sample in dataset.samples)
@@ -1173,6 +1211,10 @@ def build_real_components(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+        array_token_dropout=array_token_dropout,
+        array_token_min_tokens=array_token_min_tokens,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         use_shared_physics_token=use_shared_physics_token,
@@ -1255,6 +1297,10 @@ def run_smoke_test(
     detach_delay_spread_features: bool = False,
     detach_first_path_delay_features: bool = True,
     use_delay_specific_encoder: bool = False,
+    use_array_invariant_delay_encoder: bool = False,
+    use_continuous_config_encoding: bool = False,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
@@ -1272,6 +1318,10 @@ def run_smoke_test(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+        array_token_dropout=array_token_dropout,
+        array_token_min_tokens=array_token_min_tokens,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         use_shared_physics_token=use_shared_physics_token,
@@ -1381,6 +1431,7 @@ def run_smoke_test(
 
 def run_real_pretrain(
     data_path: str,
+    additional_data_paths: tuple[str, ...],
     checkpoint_path: str | None,
     device: torch.device,
     epochs: int,
@@ -1394,6 +1445,10 @@ def run_real_pretrain(
     detach_delay_spread_features: bool,
     detach_first_path_delay_features: bool,
     use_delay_specific_encoder: bool,
+    use_array_invariant_delay_encoder: bool,
+    use_continuous_config_encoding: bool,
+    array_token_dropout: float,
+    array_token_min_tokens: int,
     use_los_angle_context_encoder: bool,
     use_first_path_angle_context_encoder: bool,
     use_shared_physics_token: bool,
@@ -1489,6 +1544,7 @@ def run_real_pretrain(
     }
     loader, model, tokenizer, prototype_bank = build_real_components(
         data_path=data_path,
+        additional_data_paths=additional_data_paths,
         device=device,
         batch_size=batch_size,
         temperature=temperature,
@@ -1500,6 +1556,10 @@ def run_real_pretrain(
         detach_delay_spread_features=detach_delay_spread_features,
         detach_first_path_delay_features=detach_first_path_delay_features,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+        array_token_dropout=array_token_dropout,
+        array_token_min_tokens=array_token_min_tokens,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         use_shared_physics_token=use_shared_physics_token,
@@ -1641,6 +1701,7 @@ def run_real_pretrain(
         attribute_remap=attribute_remap,
     )
     print(f"training on {data_path}")
+    print(f"additional_training_data={','.join(additional_data_paths) or 'none'}")
     print(f"checkpoint={checkpoint_path}")
     print(
         f"device={device} epochs={epochs} batch_size={batch_size} "
@@ -1649,6 +1710,10 @@ def run_real_pretrain(
         f"detach_delay_spread_features={detach_delay_spread_features} "
         f"detach_first_path_delay_features={detach_first_path_delay_features} "
         f"use_delay_specific_encoder={use_delay_specific_encoder} "
+        f"use_array_invariant_delay_encoder={use_array_invariant_delay_encoder} "
+        f"use_continuous_config_encoding={use_continuous_config_encoding} "
+        f"array_token_dropout={array_token_dropout:.4f} "
+        f"array_token_min_tokens={array_token_min_tokens} "
         f"use_los_angle_context_encoder={use_los_angle_context_encoder} "
         f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder} "
         f"warmup_epochs={warmup_epochs} min_lr={min_lr}"
@@ -2367,6 +2432,10 @@ def run_real_pretrain(
                         "detach_delay_spread_features": detach_delay_spread_features,
                         "detach_first_path_delay_features": detach_first_path_delay_features,
                         "use_delay_specific_encoder": use_delay_specific_encoder,
+                        "use_array_invariant_delay_encoder": use_array_invariant_delay_encoder,
+                        "use_continuous_config_encoding": use_continuous_config_encoding,
+                        "array_token_dropout": array_token_dropout,
+                        "array_token_min_tokens": array_token_min_tokens,
                         "use_los_angle_context_encoder": use_los_angle_context_encoder,
                         "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
                         "use_shared_physics_token": use_shared_physics_token,
@@ -2460,6 +2529,7 @@ def run_real_pretrain(
                 "prototype_captions": prototype_bank["captions"],
                 "args": {
                     "data_path": data_path,
+                    "additional_data_paths": list(additional_data_paths),
                     "checkpoint": checkpoint_path,
                     "epochs": epochs,
                     "seed": seed,
@@ -2485,6 +2555,10 @@ def run_real_pretrain(
                     "detach_delay_spread_features": detach_delay_spread_features,
                     "detach_first_path_delay_features": detach_first_path_delay_features,
                     "use_delay_specific_encoder": use_delay_specific_encoder,
+                    "use_array_invariant_delay_encoder": use_array_invariant_delay_encoder,
+                    "use_continuous_config_encoding": use_continuous_config_encoding,
+                    "array_token_dropout": array_token_dropout,
+                    "array_token_min_tokens": array_token_min_tokens,
                     "use_los_angle_context_encoder": use_los_angle_context_encoder,
                     "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
                     "use_shared_physics_token": use_shared_physics_token,
@@ -2614,7 +2688,16 @@ def run_real_pretrain(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true", help="Run a synthetic end-to-end training step.")
-    parser.add_argument("--data-path", type=str, help="Path to preprocessed .pt samples.")
+    parser.add_argument("--data-path", type=str, help="Primary preprocessed .pt samples.")
+    parser.add_argument(
+        "--additional-data-path",
+        action="append",
+        default=None,
+        help=(
+            "Additional preprocessed training split. Repeat this option to "
+            "jointly train on multiple array or OFDM configurations."
+        ),
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -2655,6 +2738,32 @@ def main() -> None:
         "--use-delay-specific-encoder",
         action=argparse.BooleanOptionalAction,
         help="Use a separate convolutional/attention encoder for delay-spread heads.",
+    )
+    parser.add_argument(
+        "--use-array-invariant-delay-encoder",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Aggregate frequency power, PDP, and phase-difference features "
+            "across spatial tokens before delay prediction."
+        ),
+    )
+    parser.add_argument(
+        "--use-continuous-config-encoding",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Replace the discrete bandwidth embedding with continuous array, "
+            "bandwidth, nf, antenna-spacing, and SCS features."
+        ),
+    )
+    parser.add_argument(
+        "--array-token-dropout",
+        type=float,
+        help="Training-only fraction of spatial tokens to drop per sample.",
+    )
+    parser.add_argument(
+        "--array-token-min-tokens",
+        type=int,
+        help="Minimum number of spatial tokens retained by array dropout.",
     )
     parser.add_argument(
         "--use-los-angle-context-encoder",
@@ -3164,6 +3273,36 @@ def main() -> None:
         if args.use_delay_specific_encoder is not None
         else bool(cfg_get(train_cfg, "use_delay_specific_encoder", False))
     )
+    use_array_invariant_delay_encoder = (
+        args.use_array_invariant_delay_encoder
+        if args.use_array_invariant_delay_encoder is not None
+        else bool(
+            cfg_get(
+                train_cfg,
+                "use_array_invariant_delay_encoder",
+                False,
+            )
+        )
+    )
+    use_continuous_config_encoding = (
+        args.use_continuous_config_encoding
+        if args.use_continuous_config_encoding is not None
+        else bool(cfg_get(train_cfg, "use_continuous_config_encoding", False))
+    )
+    array_token_dropout = (
+        args.array_token_dropout
+        if args.array_token_dropout is not None
+        else float(cfg_get(train_cfg, "array_token_dropout", 0.0))
+    )
+    array_token_min_tokens = (
+        args.array_token_min_tokens
+        if args.array_token_min_tokens is not None
+        else int(cfg_get(train_cfg, "array_token_min_tokens", 4))
+    )
+    if not 0.0 <= array_token_dropout < 1.0:
+        raise ValueError("--array-token-dropout must be in [0, 1).")
+    if array_token_min_tokens <= 0:
+        raise ValueError("--array-token-min-tokens must be positive.")
     use_los_angle_context_encoder = (
         args.use_los_angle_context_encoder
         if args.use_los_angle_context_encoder is not None
@@ -3746,6 +3885,10 @@ def main() -> None:
             detach_delay_spread_features=detach_delay_spread_features,
             detach_first_path_delay_features=detach_first_path_delay_features,
             use_delay_specific_encoder=use_delay_specific_encoder,
+            use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+            use_continuous_config_encoding=use_continuous_config_encoding,
+            array_token_dropout=array_token_dropout,
+            array_token_min_tokens=array_token_min_tokens,
             use_los_angle_context_encoder=use_los_angle_context_encoder,
             use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
             use_shared_physics_token=use_shared_physics_token,
@@ -3754,9 +3897,22 @@ def main() -> None:
         return
 
     data_path = args.data_path if args.data_path is not None else train_cfg.get("data_path")
+    configured_additional_paths = cfg_get(
+        train_cfg,
+        "additional_data_paths",
+        (),
+    )
+    if isinstance(configured_additional_paths, str):
+        configured_additional_paths = (configured_additional_paths,)
+    additional_data_paths = tuple(
+        args.additional_data_path
+        if args.additional_data_path is not None
+        else configured_additional_paths
+    )
     if data_path:
         run_real_pretrain(
             data_path=data_path,
+            additional_data_paths=additional_data_paths,
             checkpoint_path=checkpoint_path,
             device=device,
             epochs=epochs,
@@ -3770,6 +3926,10 @@ def main() -> None:
             detach_delay_spread_features=detach_delay_spread_features,
             detach_first_path_delay_features=detach_first_path_delay_features,
             use_delay_specific_encoder=use_delay_specific_encoder,
+            use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+            use_continuous_config_encoding=use_continuous_config_encoding,
+            array_token_dropout=array_token_dropout,
+            array_token_min_tokens=array_token_min_tokens,
             use_los_angle_context_encoder=use_los_angle_context_encoder,
             use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
             use_shared_physics_token=use_shared_physics_token,

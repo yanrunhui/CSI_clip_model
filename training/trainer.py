@@ -1235,6 +1235,9 @@ class Trainer:
             batch["bw_bin"],
             batch["subcarrier_spacing"],
             normalize=False,
+            config_features=batch.get("config_features"),
+            antenna_coordinates=batch.get("antenna_coordinates"),
+            antenna_mask=batch.get("antenna_mask"),
         )
         csi_features = torch.nn.functional.normalize(csi_features_raw, dim=-1)
         prototype_features = self.model.encode_prototypes(normalize=True)
@@ -1355,6 +1358,7 @@ class Trainer:
                     batch["tokens"],
                     batch["token_mask"],
                     subcarrier_spacing=batch.get("subcarrier_spacing"),
+                    config_features=batch.get("config_features"),
                 )
             if (
                 (
@@ -1379,6 +1383,7 @@ class Trainer:
                     freq_bin=batch.get("freq_bin"),
                     bw_bin=batch.get("bw_bin"),
                     subcarrier_spacing=batch.get("subcarrier_spacing"),
+                    config_features=batch.get("config_features"),
                 )
             if (
                 (

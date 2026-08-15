@@ -33,6 +33,7 @@ NUMERIC_FIELDS = (
 
 ANGLE_FIELDS = {"first_path_angle_deg", "los_angle_deg"}
 LOS_ONLY_NUMERIC_FIELDS = {"los_delay_ns", "los_angle_deg"}
+DELAY_NUMERIC_FIELDS = {"first_path_delay_ns", "los_delay_ns"}
 
 DEFAULT_TOLERANCES = {
     "path_count": 1.0,
@@ -287,6 +288,8 @@ def evaluate_payload(
     field_errors: dict[str, list[float]] = {field: [] for field in NUMERIC_FIELDS}
     field_correct: dict[str, int] = {field: 0 for field in NUMERIC_FIELDS}
     field_total: dict[str, int] = {field: 0 for field in NUMERIC_FIELDS}
+    delay_slot_tp = delay_slot_fp = delay_slot_fn = 0
+    delay_numeric_correct = delay_numeric_total = 0
 
     consistency_ok = 0
     target_consistency_ok = 0
@@ -329,6 +332,17 @@ def evaluate_payload(
                 slot_fp += 1
             elif target_present and not pred_present:
                 slot_fn += 1
+
+            if field in DELAY_NUMERIC_FIELDS:
+                if pred_present and target_present:
+                    delay_slot_tp += 1
+                    delay_numeric_total += 1
+                    if error <= tolerances[field]:
+                        delay_numeric_correct += 1
+                elif pred_present and not target_present:
+                    delay_slot_fp += 1
+                elif target_present and not pred_present:
+                    delay_slot_fn += 1
 
         violations = consistency_violations(
             pred,
@@ -400,6 +414,24 @@ def evaluate_payload(
     slot_f1_value = f1(slot_precision, slot_recall)
     hallucination_rate = safe_ratio(slot_fp, slot_tp + slot_fp)
     numerical_slot_accuracy = safe_ratio(numeric_correct, numeric_total)
+    delay_slot_precision = safe_ratio(delay_slot_tp, delay_slot_tp + delay_slot_fp)
+    delay_slot_recall = safe_ratio(delay_slot_tp, delay_slot_tp + delay_slot_fn)
+    delay_slot_f1 = f1(delay_slot_precision, delay_slot_recall)
+    delay_hallucination_rate = safe_ratio(delay_slot_fp, delay_slot_tp + delay_slot_fp)
+    delay_numerical_slot_accuracy = safe_ratio(
+        delay_numeric_correct, delay_numeric_total
+    )
+    delay_factual_accuracy = mean_finite(
+        [
+            delay_slot_f1,
+            delay_numerical_slot_accuracy,
+            (
+                1.0 - delay_hallucination_rate
+                if math.isfinite(delay_hallucination_rate)
+                else math.nan
+            ),
+        ]
+    )
     description_factual_accuracy = mean_finite(
         [
             *categorical_accuracies,
@@ -449,6 +481,46 @@ def evaluate_payload(
                 "field": "all_numeric_slots",
                 "value": format_float(numerical_slot_accuracy),
                 "count": str(numeric_total),
+            },
+            {
+                "metric": "description_factual_accuracy",
+                "field": "delay_numeric_slots",
+                "value": format_float(delay_factual_accuracy),
+                "count": str(len(predicted_records)),
+                "notes": (
+                    "Delay-only factuality: mean of delay-slot F1, delay numerical "
+                    "tolerance accuracy, and one minus delay hallucination rate."
+                ),
+            },
+            {
+                "metric": "slot_precision",
+                "field": "delay_numeric_slots",
+                "value": format_float(delay_slot_precision),
+                "count": str(delay_slot_tp + delay_slot_fp),
+            },
+            {
+                "metric": "slot_recall",
+                "field": "delay_numeric_slots",
+                "value": format_float(delay_slot_recall),
+                "count": str(delay_slot_tp + delay_slot_fn),
+            },
+            {
+                "metric": "slot_f1",
+                "field": "delay_numeric_slots",
+                "value": format_float(delay_slot_f1),
+                "count": str(delay_slot_tp + delay_slot_fp + delay_slot_fn),
+            },
+            {
+                "metric": "hallucination_rate",
+                "field": "delay_numeric_slots",
+                "value": format_float(delay_hallucination_rate),
+                "count": str(delay_slot_tp + delay_slot_fp),
+            },
+            {
+                "metric": "numerical_slot_accuracy",
+                "field": "delay_numeric_slots",
+                "value": format_float(delay_numerical_slot_accuracy),
+                "count": str(delay_numeric_total),
             },
             {
                 "metric": "physical_consistency_rate",

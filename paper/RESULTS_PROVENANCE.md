@@ -75,6 +75,69 @@ The reported correction is applied by
 `--signal-description-correction relational` during record verbalization.
 It is not a relational training-loss result.
 
+## Full-model held-out frequency-configuration generalization
+
+- Model: complete multi-task prediction and verbalization system.
+- Training frequency-sample counts: `nf64`, `nf96`, `nf192`, `nf256`.
+- Completely held-out frequency-sample count: `nf128`.
+- Seeds: 0, 1, 2.
+- Standard deviation: sample SD (`ddof=1`).
+- Three-seed physical summary supplied from the frozen full-model evaluation:
+  - LoS/NLoS accuracy: 99.827 +/- 0.006%
+  - first-path delay MAE: 58.752 +/- 1.338 ns
+  - LoS delay MAE: 21.801 +/- 1.270 ns
+  - K-factor MAE: 2.166 +/- 0.037 dB
+  - first-path angle MAE: 20.483 +/- 0.146 deg
+  - first-path power MAE: 5.998 +/- 0.355 dB
+  - delay-spread MAE: 19.604 +/- 0.253 ns
+  - azimuth-spread MAE: 10.952 +/- 1.399 deg
+  - reflection-interaction exact accuracy: 68.303 +/- 0.268%
+  - reflected-path exact accuracy: 95.547 +/- 0.064%
+- LoS/NLoS stratification:
+  - first-path delay: LoS 25.123 +/- 0.419 ns; NLoS 92.393 +/- 2.271 ns
+  - first-path angle: LoS 1.756 +/- 0.197 deg; NLoS 39.215 +/- 0.279 deg
+  - first-path power: LoS 5.079 +/- 0.507 dB; NLoS 6.918 +/- 0.226 dB
+- End-to-end held-out-configuration text results:
+  - composite factuality: 95.667 +/- 0.179%
+  - categorical macro-F1: 99.883 +/- 0.008%
+  - numeric-slot F1: 99.977 +/- 0.002%
+  - numeric-slot hallucination: 0.0455 +/- 0.0038%
+  - numerical tolerance accuracy: 78.639 +/- 0.906%
+  - physical consistency after relational correction: 99.122 +/- 0.215%
+- Scope: evidence for transfer to held-out `nf128`; not evidence for arbitrary
+  frequency sampling, carrier-frequency, bandwidth, or measured-channel
+  generalization.
+
+## Full-model cross-array generalization
+
+- Mixed UPA/ULA three-seed summary:
+  `/Users/yanrunhui/Downloads/joint_upa_ula_cross_array_3seed_summary.csv`
+- ULA64-trained to unseen ULA32 summary:
+  `/Users/yanrunhui/Downloads/unseen_ula32_3seed_summary.csv`
+- ULA32-trained to unseen ULA64 summary:
+  `/Users/yanrunhui/Downloads/ula32_to_unseen_ula64_3seed_summary.csv`
+- Seeds: 0, 1, 2; standard deviation is sample SD.
+- Held-out array observations are aligned to test `group_id` values not used
+  for model fitting.
+- Mixed-array results used in the cross-array table:
+  - unseen UPA4x4: LoS-angle MAE 10.257 +/- 3.013 deg; first-delay
+    MAE 44.082 +/- 0.786 ns; K-factor MAE 5.884 +/- 0.230 dB;
+    description factuality 93.556 +/- 0.092%
+  - unseen UPA16x4: LoS-angle MAE 9.446 +/- 0.913 deg; first-delay
+    MAE 54.828 +/- 5.982 ns; K-factor MAE 4.758 +/- 0.457 dB;
+    description factuality 93.639 +/- 0.136%
+  - unseen ULA32: LoS-angle MAE 11.345 +/- 0.566 deg; first-delay
+    MAE 43.399 +/- 1.029 ns; K-factor MAE 4.282 +/- 0.285 dB;
+    description factuality 94.449 +/- 0.193%
+- Directional ULA transfer:
+  - ULA64 seen to ULA32 unseen: LoS-angle MAE 14.566 -> 11.345 deg;
+    first-delay MAE 47.449 -> 43.399 ns
+  - ULA32 seen to ULA64 unseen: LoS-angle MAE 10.730 -> 17.223 deg;
+    first-delay MAE 41.619 -> 49.350 ns
+- NLoS first-path angle remains about 42--46 deg across configurations,
+  identifying a propagation-regime bottleneck rather than an array-specific
+  failure.
+
 ## Related-work verification
 
 Verified against official arXiv records on 2026-07-29:
@@ -87,6 +150,7 @@ Verified against official arXiv records on 2026-07-29:
 
 1. Confirm the author list, affiliations, acknowledgements, and code/data URL.
 2. Confirm the exact loss weight used for the reflected-path-count extension.
-3. Add measured-channel or unseen-configuration experiments if available.
+3. Add measured-channel, cross-carrier, element-perturbation, or
+   noise-robustness experiments if available.
 4. Replace the reading-preview PDF with a PDF compiled from `main.tex` in a
    LaTeX environment before submission.

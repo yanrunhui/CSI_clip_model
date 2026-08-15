@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
+import re
 
 import torch
 from torch.utils.data import Dataset
@@ -57,6 +58,7 @@ PHYSICS_TARGET_OFFSETS = torch.tensor(
 
 DELAY_POWER_MAP_SHAPE = (32, 32)
 DELAY_POWER_PROFILE_BINS = 64
+CONFIG_FEATURE_DIM = 9
 
 
 def empty_delay_power_map() -> torch.Tensor:
@@ -65,6 +67,10 @@ def empty_delay_power_map() -> torch.Tensor:
 
 def empty_delay_power_profile() -> torch.Tensor:
     return torch.zeros(DELAY_POWER_PROFILE_BINS, dtype=torch.float32)
+
+
+def empty_antenna_coordinates() -> torch.Tensor:
+    return torch.zeros(0, 3, dtype=torch.float32)
 
 
 @dataclass
@@ -101,6 +107,84 @@ class PreprocessedSample:
     direct_path_count: int = 0
     delay_power_map: torch.Tensor = field(default_factory=empty_delay_power_map)
     delay_power_profile: torch.Tensor = field(default_factory=empty_delay_power_profile)
+    array_type: str = ""
+    array_rows: int = 0
+    array_cols: int = 0
+    antenna_spacing_wavelengths: float = math.nan
+    source_n_freq: int = 0
+    bandwidth_hz: float = math.nan
+    antenna_coordinates_wavelengths: torch.Tensor = field(
+        default_factory=empty_antenna_coordinates
+    )
+
+
+def _config_geometry(config_key: str) -> tuple[str, int, int]:
+    upa_match = re.fullmatch(r"UPA-(\d+)x(\d+)", str(config_key))
+    if upa_match:
+        return "UPA", int(upa_match.group(1)), int(upa_match.group(2))
+    ula_match = re.fullmatch(r"ULA-(\d+)", str(config_key))
+    if ula_match:
+        return "ULA", 1, int(ula_match.group(1))
+    return "unknown", 1, 1
+
+
+def regular_array_coordinates(
+    rows: int,
+    cols: int,
+    spacing_wavelengths: float,
+) -> torch.Tensor:
+    row_axis = (
+        torch.arange(rows, dtype=torch.float32) - (rows - 1) / 2.0
+    ) * spacing_wavelengths
+    col_axis = (
+        torch.arange(cols, dtype=torch.float32) - (cols - 1) / 2.0
+    ) * spacing_wavelengths
+    row_grid, col_grid = torch.meshgrid(row_axis, col_axis, indexing="ij")
+    return torch.stack(
+        [
+            row_grid.reshape(-1),
+            col_grid.reshape(-1),
+            torch.zeros(rows * cols, dtype=torch.float32),
+        ],
+        dim=1,
+    )
+
+
+def _sample_configuration_features(sample: PreprocessedSample) -> torch.Tensor:
+    array_type = str(getattr(sample, "array_type", "") or "")
+    rows = int(getattr(sample, "array_rows", 0) or 0)
+    cols = int(getattr(sample, "array_cols", 0) or 0)
+    if array_type not in {"ULA", "UPA"} or rows <= 0 or cols <= 0:
+        array_type, rows, cols = _config_geometry(sample.config_key)
+
+    spacing = _finite_or_nan(
+        getattr(sample, "antenna_spacing_wavelengths", math.nan)
+    )
+    if not math.isfinite(spacing):
+        spacing = 0.5
+    source_n_freq = int(getattr(sample, "source_n_freq", 0) or 0)
+    if source_n_freq <= 0:
+        source_n_freq = int(sample.tokens.shape[-1])
+    bandwidth_hz = _finite_or_nan(getattr(sample, "bandwidth_hz", math.nan))
+    if not math.isfinite(bandwidth_hz) or bandwidth_hz <= 0.0:
+        bandwidth_hz = float(sample.subcarrier_spacing_hz) * source_n_freq
+    subcarrier_spacing_hz = max(float(sample.subcarrier_spacing_hz), 1.0)
+    antenna_count = max(rows * cols, 1)
+
+    return torch.tensor(
+        [
+            1.0 if array_type == "ULA" else 0.0,
+            1.0 if array_type == "UPA" else 0.0,
+            math.log2(rows + 1.0) / 4.0,
+            math.log2(cols + 1.0) / 4.0,
+            math.log2(antenna_count + 1.0) / 7.0,
+            spacing,
+            math.log2(source_n_freq + 1.0) / 8.0,
+            math.log10(max(bandwidth_hz, 1.0)) / 9.0,
+            math.log10(subcarrier_spacing_hz) / 6.0,
+        ],
+        dtype=torch.float32,
+    )
 
 
 def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
@@ -131,6 +215,44 @@ def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
     delay_power_profile = getattr(sample, "delay_power_profile", None)
     if not isinstance(delay_power_profile, torch.Tensor) or delay_power_profile.shape != (DELAY_POWER_PROFILE_BINS,):
         setattr(sample, "delay_power_profile", empty_delay_power_profile())
+    array_type, rows, cols = _config_geometry(getattr(sample, "config_key", ""))
+    if not getattr(sample, "array_type", ""):
+        setattr(sample, "array_type", array_type)
+    if int(getattr(sample, "array_rows", 0) or 0) <= 0:
+        setattr(sample, "array_rows", rows)
+    if int(getattr(sample, "array_cols", 0) or 0) <= 0:
+        setattr(sample, "array_cols", cols)
+    spacing = _finite_or_nan(
+        getattr(sample, "antenna_spacing_wavelengths", math.nan)
+    )
+    if not math.isfinite(spacing):
+        setattr(sample, "antenna_spacing_wavelengths", 0.5)
+    if int(getattr(sample, "source_n_freq", 0) or 0) <= 0:
+        setattr(sample, "source_n_freq", int(sample.tokens.shape[-1]))
+    bandwidth_hz = _finite_or_nan(getattr(sample, "bandwidth_hz", math.nan))
+    if not math.isfinite(bandwidth_hz) or bandwidth_hz <= 0.0:
+        setattr(
+            sample,
+            "bandwidth_hz",
+            float(sample.subcarrier_spacing_hz)
+            * int(getattr(sample, "source_n_freq", sample.tokens.shape[-1])),
+        )
+    coordinates = getattr(sample, "antenna_coordinates_wavelengths", None)
+    expected_count = int(sample.array_rows) * int(sample.array_cols)
+    if (
+        not isinstance(coordinates, torch.Tensor)
+        or coordinates.ndim != 2
+        or coordinates.shape != (expected_count, 3)
+    ):
+        setattr(
+            sample,
+            "antenna_coordinates_wavelengths",
+            regular_array_coordinates(
+                int(sample.array_rows),
+                int(sample.array_cols),
+                float(sample.antenna_spacing_wavelengths),
+            ),
+        )
     return sample
 
 
@@ -283,7 +405,14 @@ def collate_fn(
     batch: list[PreprocessedSample],
     tokenizer: CaptionTokenizer,
     max_caption_len: int = 48,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
 ) -> dict[str, torch.Tensor | list[str] | list[SemanticKey]]:
+    if not 0.0 <= array_token_dropout < 1.0:
+        raise ValueError("array_token_dropout must be in [0, 1).")
+    if array_token_min_tokens <= 0:
+        raise ValueError("array_token_min_tokens must be positive.")
+    batch = [_ensure_continuous_fields(sample) for sample in batch]
     k_max = max(sample.n_tokens for sample in batch)
     batch_size = len(batch)
     d_token = batch[0].tokens.shape[1]
@@ -319,12 +448,47 @@ def collate_fn(
         DELAY_POWER_PROFILE_BINS,
         dtype=torch.float32,
     )
+    config_features = torch.zeros(
+        batch_size,
+        CONFIG_FEATURE_DIM,
+        dtype=torch.float32,
+    )
+    max_antennas = max(
+        int(sample.array_rows) * int(sample.array_cols)
+        for sample in batch
+    )
+    antenna_coordinates = torch.zeros(
+        batch_size,
+        max_antennas,
+        3,
+        dtype=torch.float32,
+    )
+    antenna_mask = torch.zeros(
+        batch_size,
+        max_antennas,
+        dtype=torch.bool,
+    )
 
     for i, sample in enumerate(batch):
         n_tokens = sample.n_tokens
         tokens[i, :n_tokens] = sample.tokens
         beam_pos[i, :n_tokens] = sample.beam_positions
-        token_mask[i, :n_tokens] = True
+        if array_token_dropout > 0.0 and n_tokens > array_token_min_tokens:
+            keep_count = max(
+                array_token_min_tokens,
+                int(round(n_tokens * (1.0 - array_token_dropout))),
+            )
+            keep_indices = torch.randperm(n_tokens)[:keep_count]
+            token_mask[i, keep_indices] = True
+        else:
+            token_mask[i, :n_tokens] = True
+        config_features[i] = _sample_configuration_features(sample)
+        coordinates = sample.antenna_coordinates_wavelengths.to(
+            dtype=torch.float32
+        )
+        antenna_count = coordinates.shape[0]
+        antenna_coordinates[i, :antenna_count] = coordinates
+        antenna_mask[i, :antenna_count] = True
         encoded = tokenizer.encode(sample.prop_caption, max_len=max_caption_len)
         t_prop_ids[i] = encoded.ids
         t_prop_mask[i] = encoded.mask
@@ -367,6 +531,9 @@ def collate_fn(
             [sample.subcarrier_spacing_hz for sample in batch],
             dtype=torch.float32,
         ),
+        "config_features": config_features,
+        "antenna_coordinates": antenna_coordinates,
+        "antenna_mask": antenna_mask,
         "t_prop_ids": t_prop_ids,
         "t_prop_mask": t_prop_mask,
         "t_instance_ids": t_instance_ids,

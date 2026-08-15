@@ -8,6 +8,7 @@ from torch import nn
 
 from data.semantic_key import FIRST_POWER_DBW_BIN_LABELS
 from .encoder import CSIEncoder
+from .positional import normalized_subcarrier_spacing
 
 K_FACTOR_STRONG_BIN_LABELS = ("low", "mid", "high", "very_high")
 DELAY_SPREAD_BIN_LABELS = ("0_25", "25_50", "50_100", "100_200", "200_400", "400_plus")
@@ -530,9 +531,11 @@ class CSIDelaySpecificEncoder(nn.Module):
         out_dim: int = CSI_DELAY_CONTEXT_DIM,
         hidden_dim: int = 96,
         eps: float = 1e-6,
+        continuous_spacing_encoding: bool = False,
     ):
         super().__init__()
         self.eps = eps
+        self.continuous_spacing_encoding = bool(continuous_spacing_encoding)
         self.input_norm = nn.LayerNorm(8)
         self.initial_conv = nn.Sequential(
             nn.Conv1d(8, hidden_dim, kernel_size=3, padding=1),
@@ -593,7 +596,10 @@ class CSIDelaySpecificEncoder(nn.Module):
         sequence = self.input_norm(sequence).transpose(1, 2)
         features = self.initial_conv(sequence)
         if subcarrier_spacing is not None:
-            spacing = (subcarrier_spacing.to(device=tokens.device, dtype=tokens.dtype) / 480e3).clamp(0.0, 1.0)
+            spacing = normalized_subcarrier_spacing(
+                subcarrier_spacing.to(device=tokens.device, dtype=tokens.dtype),
+                continuous=self.continuous_spacing_encoding,
+            )
             gamma = self.spacing_film_gamma(spacing.unsqueeze(-1)).unsqueeze(-1)
             beta = self.spacing_film_beta(spacing.unsqueeze(-1)).unsqueeze(-1)
             gamma = gamma.repeat_interleave(beam_count, dim=0)
@@ -621,6 +627,187 @@ class CSIDelaySpecificEncoder(nn.Module):
         return self.out_proj(torch.cat([pooled_attention, pooled_mean, pooled_max], dim=-1))
 
 
+class CSIArrayInvariantDelayEncoder(nn.Module):
+    """Delay encoder based on array-aggregated PDP and phase-difference features."""
+
+    def __init__(
+        self,
+        out_dim: int = CSI_DELAY_CONTEXT_DIM,
+        hidden_dim: int = 96,
+        config_feature_dim: int = 9,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.input_norm = nn.LayerNorm(6)
+        self.initial_conv = nn.Sequential(
+            nn.Conv1d(6, hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.GELU(),
+        )
+        self.config_gamma = nn.Linear(config_feature_dim, hidden_dim)
+        self.config_beta = nn.Linear(config_feature_dim, hidden_dim)
+        self.multi_scale_convs = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv1d(
+                        hidden_dim,
+                        hidden_dim,
+                        kernel_size=kernel_size,
+                        padding=kernel_size // 2,
+                    ),
+                    nn.GELU(),
+                    nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+                    nn.GELU(),
+                )
+                for kernel_size in (3, 5, 9)
+            ]
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv1d(hidden_dim * 3, hidden_dim, kernel_size=1),
+            nn.GELU(),
+        )
+        self.attention = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 3),
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def _complex_tokens(
+        self,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if tokens.shape[2] % 2 != 0:
+            raise ValueError(
+                "Array-invariant delay encoding requires paired real/imaginary "
+                f"channels, got d_token={tokens.shape[2]}."
+            )
+        weights = token_mask.to(dtype=tokens.dtype).unsqueeze(-1).unsqueeze(-1)
+        element_count = (
+            token_mask.sum(dim=1, keepdim=True).to(dtype=tokens.dtype)
+            * tokens.shape[2]
+            * tokens.shape[3]
+        ).clamp(min=1.0)
+        mean = (tokens * weights).sum(dim=(1, 2, 3), keepdim=True)
+        mean = mean / element_count[:, :, None, None]
+        centered = (tokens - mean) * weights
+        std = torch.sqrt(
+            (
+                centered.square().sum(dim=(1, 2, 3), keepdim=True)
+                / element_count[:, :, None, None]
+            ).clamp(min=self.eps ** 2)
+        )
+        normalized = centered / std
+        half = normalized.shape[2] // 2
+        return torch.complex(
+            normalized[:, :, :half, :],
+            normalized[:, :, half:, :],
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+        subcarrier_spacing: torch.Tensor | None = None,
+        config_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        complex_tokens = self._complex_tokens(tokens, token_mask)
+        mask = token_mask.bool().unsqueeze(-1).unsqueeze(-1)
+        weight = mask.to(dtype=complex_tokens.real.dtype)
+        valid_count = (
+            token_mask.sum(dim=1, keepdim=True).to(dtype=complex_tokens.real.dtype)
+            * complex_tokens.shape[2]
+        ).clamp(min=1.0)
+
+        power = complex_tokens.abs().square() * weight
+        frequency_power = power.sum(dim=(1, 2)) / valid_count
+        masked_power = power.masked_fill(~mask, 0.0)
+        frequency_power_max = masked_power.amax(dim=(1, 2))
+
+        delay_response = torch.fft.ifft(
+            torch.fft.ifftshift(complex_tokens, dim=-1),
+            dim=-1,
+        )
+        delay_power = (delay_response.abs().square() * weight).sum(dim=(1, 2))
+        delay_power = delay_power / valid_count
+        delay_distribution = delay_power / delay_power.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp(min=self.eps)
+
+        adjacent = complex_tokens[..., 1:] * complex_tokens[..., :-1].conj()
+        adjacent_unit = adjacent / adjacent.abs().clamp(min=self.eps)
+        phase_mean = (adjacent_unit * weight).sum(dim=(1, 2)) / valid_count
+        phase_real = F.pad(phase_mean.real, (1, 0), value=1.0)
+        phase_imag = F.pad(phase_mean.imag, (1, 0), value=0.0)
+        phase_confidence = F.pad(phase_mean.abs(), (1, 0), value=1.0)
+
+        frequency_power = frequency_power / frequency_power.mean(
+            dim=-1,
+            keepdim=True,
+        ).clamp(min=self.eps)
+        frequency_power_max = frequency_power_max / frequency_power_max.mean(
+            dim=-1,
+            keepdim=True,
+        ).clamp(min=self.eps)
+        sequence = torch.stack(
+            [
+                torch.log1p(frequency_power),
+                torch.log1p(frequency_power_max),
+                delay_distribution,
+                phase_real,
+                phase_imag,
+                phase_confidence,
+            ],
+            dim=-1,
+        )
+        sequence = torch.nan_to_num(
+            sequence,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        features = self.initial_conv(self.input_norm(sequence).transpose(1, 2))
+
+        if config_features is None:
+            config_features = torch.zeros(
+                tokens.shape[0],
+                self.config_gamma.in_features,
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+            if subcarrier_spacing is not None:
+                config_features[:, -1] = normalized_subcarrier_spacing(
+                    subcarrier_spacing.to(device=tokens.device, dtype=tokens.dtype),
+                    continuous=True,
+                )
+        else:
+            config_features = config_features.to(
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+        gamma = self.config_gamma(config_features).unsqueeze(-1)
+        beta = self.config_beta(config_features).unsqueeze(-1)
+        features = features * (1.0 + gamma) + beta
+
+        multi_scale = torch.cat(
+            [conv(features) for conv in self.multi_scale_convs],
+            dim=1,
+        )
+        features = self.fuse(multi_scale)
+        attention = torch.softmax(self.attention(features), dim=-1)
+        pooled_attention = (features * attention).sum(dim=-1)
+        pooled_mean = features.mean(dim=-1)
+        pooled_max = features.amax(dim=-1)
+        return self.out_proj(
+            torch.cat([pooled_attention, pooled_mean, pooled_max], dim=-1)
+        )
+
+
 class CSIClip(nn.Module):
     def __init__(
         self,
@@ -639,6 +826,7 @@ class CSIClip(nn.Module):
         detach_delay_spread_features: bool = False,
         detach_first_path_delay_features: bool = True,
         use_delay_specific_encoder: bool = False,
+        use_array_invariant_delay_encoder: bool = False,
         use_los_angle_context_encoder: bool = False,
         use_first_path_angle_context_encoder: bool = False,
         los_angle_context_token_norm_mode: str = "std",
@@ -665,6 +853,9 @@ class CSIClip(nn.Module):
         self.detach_delay_spread_features = detach_delay_spread_features
         self.detach_first_path_delay_features = detach_first_path_delay_features
         self.use_delay_specific_encoder = use_delay_specific_encoder
+        self.use_array_invariant_delay_encoder = bool(
+            use_array_invariant_delay_encoder
+        )
         self.use_los_angle_context_encoder = use_los_angle_context_encoder
         self.use_first_path_angle_context_encoder = use_first_path_angle_context_encoder
         self.use_pdp_latent_aux = use_pdp_latent_aux
@@ -689,16 +880,22 @@ class CSIClip(nn.Module):
                 nn.init.zeros_(final_linear.weight)
                 nn.init.zeros_(final_linear.bias)
         self.power_feature_encoder = PowerFeatureEncoder()
-        self.csi_delay_context_encoder = (
-            CSIDelaySpecificEncoder()
-            if use_delay_specific_encoder
-            else CSIDelayContextEncoder()
+        continuous_spacing_encoding = bool(
+            getattr(csi_encoder, "use_continuous_config_encoding", False)
         )
-        self.first_path_delay_context_encoder = (
-            CSIDelaySpecificEncoder()
-            if use_delay_specific_encoder
-            else CSIDelayContextEncoder()
-        )
+        if self.use_array_invariant_delay_encoder:
+            self.csi_delay_context_encoder = CSIArrayInvariantDelayEncoder()
+            self.first_path_delay_context_encoder = CSIArrayInvariantDelayEncoder()
+        elif use_delay_specific_encoder:
+            self.csi_delay_context_encoder = CSIDelaySpecificEncoder(
+                continuous_spacing_encoding=continuous_spacing_encoding,
+            )
+            self.first_path_delay_context_encoder = CSIDelaySpecificEncoder(
+                continuous_spacing_encoding=continuous_spacing_encoding,
+            )
+        else:
+            self.csi_delay_context_encoder = CSIDelayContextEncoder()
+            self.first_path_delay_context_encoder = CSIDelayContextEncoder()
         self.los_angle_context_encoder = (
             CSIAngleContextEncoder(token_norm_mode=los_angle_context_token_norm_mode)
             if use_los_angle_context_encoder
@@ -1027,6 +1224,9 @@ class CSIClip(nn.Module):
         bw_bin: torch.Tensor,
         subcarrier_spacing: torch.Tensor,
         normalize: bool = False,
+        config_features: torch.Tensor | None = None,
+        antenna_coordinates: torch.Tensor | None = None,
+        antenna_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         features = self.csi(
             tokens,
@@ -1035,6 +1235,9 @@ class CSIClip(nn.Module):
             freq_bin,
             bw_bin,
             subcarrier_spacing,
+            config_features=config_features,
+            antenna_coordinates=antenna_coordinates,
+            antenna_mask=antenna_mask,
         )
         return F.normalize(features, dim=-1) if normalize else features
 
@@ -1094,12 +1297,12 @@ class CSIClip(nn.Module):
         tokens: torch.Tensor,
         token_mask: torch.Tensor,
         subcarrier_spacing: torch.Tensor | None = None,
+        config_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.csi_delay_context_encoder(
-            tokens,
-            token_mask,
-            subcarrier_spacing=subcarrier_spacing,
-        )
+        kwargs = {"subcarrier_spacing": subcarrier_spacing}
+        if self.use_array_invariant_delay_encoder:
+            kwargs["config_features"] = config_features
+        return self.csi_delay_context_encoder(tokens, token_mask, **kwargs)
 
     def encode_first_path_delay_context(
         self,
@@ -1109,12 +1312,12 @@ class CSIClip(nn.Module):
         freq_bin: torch.Tensor | None = None,
         bw_bin: torch.Tensor | None = None,
         subcarrier_spacing: torch.Tensor | None = None,
+        config_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        context = self.first_path_delay_context_encoder(
-            tokens,
-            token_mask,
-            subcarrier_spacing=subcarrier_spacing,
-        )
+        kwargs = {"subcarrier_spacing": subcarrier_spacing}
+        if self.use_array_invariant_delay_encoder:
+            kwargs["config_features"] = config_features
+        context = self.first_path_delay_context_encoder(tokens, token_mask, **kwargs)
         if not self.use_pdp_latent_aux:
             return context
         if (
@@ -1558,6 +1761,9 @@ class CSIClip(nn.Module):
             batch["bw_bin"],
             batch["subcarrier_spacing"],
             normalize=True,
+            config_features=batch.get("config_features"),
+            antenna_coordinates=batch.get("antenna_coordinates"),
+            antenna_mask=batch.get("antenna_mask"),
         )
         text_features = self.encode_text(
             batch["t_prop_ids"],

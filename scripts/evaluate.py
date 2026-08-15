@@ -545,6 +545,28 @@ def _infer_use_delay_specific_encoder(checkpoint: dict | None) -> bool:
     )
 
 
+def _infer_use_array_invariant_delay_encoder(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    return bool(
+        checkpoint.get("args", {}).get(
+            "use_array_invariant_delay_encoder",
+            False,
+        )
+    )
+
+
+def _infer_use_continuous_config_encoding(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    return bool(
+        checkpoint.get("args", {}).get(
+            "use_continuous_config_encoding",
+            False,
+        )
+    )
+
+
 def _infer_use_los_angle_context_encoder(checkpoint: dict | None) -> bool:
     if checkpoint is None:
         return False
@@ -1026,6 +1048,12 @@ def evaluate(
     use_delay_spread_bin_head = _infer_use_delay_spread_bin_head(checkpoint)
     use_first_path_delay_bin_head = _infer_use_first_path_delay_bin_head(checkpoint)
     use_delay_specific_encoder = _infer_use_delay_specific_encoder(checkpoint)
+    use_array_invariant_delay_encoder = (
+        _infer_use_array_invariant_delay_encoder(checkpoint)
+    )
+    use_continuous_config_encoding = _infer_use_continuous_config_encoding(
+        checkpoint
+    )
     use_los_angle_context_encoder = _infer_use_los_angle_context_encoder(checkpoint)
     use_first_path_angle_context_encoder = (
         _infer_use_first_path_angle_context_encoder(checkpoint)
@@ -1192,6 +1220,7 @@ def evaluate(
             d_model=384,
             d_clip=256,
             token_norm_mode=token_norm_mode,
+            use_continuous_config_encoding=use_continuous_config_encoding,
         ),
         PhysicsTextEncoder(vocab_size=max(tokenizer.next_id + 8, 300)),
         num_prototypes=len(prototype_keys),
@@ -1203,6 +1232,7 @@ def evaluate(
         first_path_power_use_internal_gate=first_path_power_use_internal_gate,
         use_delay_spread_head=use_delay_spread_head,
         use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
         los_angle_context_token_norm_mode=token_norm_mode,
@@ -1277,6 +1307,9 @@ def evaluate(
             batch["bw_bin"],
             batch["subcarrier_spacing"],
             normalize=False,
+            config_features=batch.get("config_features"),
+            antenna_coordinates=batch.get("antenna_coordinates"),
+            antenna_mask=batch.get("antenna_mask"),
         )
         csi_features = F.normalize(csi_features_raw, dim=-1)
         all_csi_features.append(csi_features.cpu())
@@ -1300,6 +1333,7 @@ def evaluate(
                 batch["tokens"],
                 batch["token_mask"],
                 subcarrier_spacing=batch.get("subcarrier_spacing"),
+                config_features=batch.get("config_features"),
             )
         if hasattr(model, "encode_first_path_delay_context"):
             first_path_delay_context = model.encode_first_path_delay_context(
@@ -1309,6 +1343,7 @@ def evaluate(
                 freq_bin=batch.get("freq_bin"),
                 bw_bin=batch.get("bw_bin"),
                 subcarrier_spacing=batch.get("subcarrier_spacing"),
+                config_features=batch.get("config_features"),
             )
         if hasattr(model, "encode_los_angle_context"):
             los_angle_context = model.encode_los_angle_context(
@@ -1553,6 +1588,14 @@ def evaluate(
         print(f"first_path_power_use_internal_gate={first_path_power_use_internal_gate}")
         print(f"use_delay_spread_head={use_delay_spread_head}")
         print(f"use_delay_specific_encoder={use_delay_specific_encoder}")
+        print(
+            "use_array_invariant_delay_encoder="
+            f"{use_array_invariant_delay_encoder}"
+        )
+        print(
+            "use_continuous_config_encoding="
+            f"{use_continuous_config_encoding}"
+        )
         print(f"use_los_angle_context_encoder={use_los_angle_context_encoder}")
         print(f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder}")
         print(f"use_shared_physics_token={use_shared_physics_token}")

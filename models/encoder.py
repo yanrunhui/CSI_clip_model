@@ -4,7 +4,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .positional import BeamPositionEncoding, FrequencyBandEncoding
+from .positional import (
+    BeamPositionEncoding,
+    ContinuousConfigurationEncoding,
+    FrequencyBandEncoding,
+    normalized_subcarrier_spacing,
+)
 
 
 class InputProjection(nn.Module):
@@ -14,9 +19,11 @@ class InputProjection(nn.Module):
         d_spatial: int = 64,
         d_freq_pool: int = 16,
         d_model: int = 384,
+        continuous_spacing_encoding: bool = False,
     ):
         super().__init__()
         self.d_freq_pool = d_freq_pool
+        self.continuous_spacing_encoding = bool(continuous_spacing_encoding)
         self.spatial_linear = nn.Linear(d_token, d_spatial)
         self.film_gamma = nn.Linear(1, d_spatial)
         self.film_beta = nn.Linear(1, d_spatial)
@@ -52,7 +59,10 @@ class InputProjection(nn.Module):
         x = x.reshape(B * K, D, Nf).transpose(-1, -2)
         x = self.spatial_linear(x)
 
-        sc_norm = (subcarrier_spacing / 480e3).clamp(0, 1)
+        sc_norm = normalized_subcarrier_spacing(
+            subcarrier_spacing,
+            continuous=self.continuous_spacing_encoding,
+        )
         gamma = self.film_gamma(sc_norm.unsqueeze(-1)).unsqueeze(1).expand(-1, K, -1)
         beta = self.film_beta(sc_norm.unsqueeze(-1)).unsqueeze(1).expand(-1, K, -1)
         gamma = gamma.reshape(B * K, 1, -1)
@@ -81,6 +91,8 @@ class CSIEncoder(nn.Module):
         n_bw_bins: int = 3,
         token_norm_mode: str = "std",
         token_norm_eps: float = 1e-6,
+        use_continuous_config_encoding: bool = False,
+        config_feature_dim: int = 9,
     ):
         super().__init__()
         if token_norm_mode not in {"none", "rms", "std"}:
@@ -88,11 +100,21 @@ class CSIEncoder(nn.Module):
                 "token_norm_mode must be one of: none, rms, std, "
                 f"got {token_norm_mode!r}."
             )
-        self.input_proj = InputProjection(d_token=d_token, d_model=d_model)
+        self.use_continuous_config_encoding = bool(use_continuous_config_encoding)
+        self.input_proj = InputProjection(
+            d_token=d_token,
+            d_model=d_model,
+            continuous_spacing_encoding=self.use_continuous_config_encoding,
+        )
         self.token_norm_mode = token_norm_mode
         self.token_norm_eps = token_norm_eps
         self.beam_pe = BeamPositionEncoding(d_model)
         self.freq_enc = FrequencyBandEncoding(d_model, n_freq_bins=n_freq_bins, n_bw_bins=n_bw_bins)
+        self.config_enc = (
+            ContinuousConfigurationEncoding(d_model, input_dim=config_feature_dim)
+            if self.use_continuous_config_encoding
+            else None
+        )
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -145,10 +167,29 @@ class CSIEncoder(nn.Module):
         freq_bin: torch.Tensor,
         bw_bin: torch.Tensor,
         subcarrier_spacing: torch.Tensor,
+        config_features: torch.Tensor | None = None,
+        antenna_coordinates: torch.Tensor | None = None,
+        antenna_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = self._normalize_tokens(tokens, token_mask)
         x = self.input_proj(tokens, subcarrier_spacing)
-        x = x + self.beam_pe(beam_positions) + self.freq_enc(freq_bin, bw_bin)
+        if self.config_enc is None:
+            metadata_encoding = self.freq_enc(freq_bin, bw_bin)
+        else:
+            if config_features is None:
+                raise ValueError(
+                    "config_features are required when continuous configuration "
+                    "encoding is enabled."
+                )
+            metadata_encoding = (
+                self.freq_enc.frequency_only(freq_bin)
+                + self.config_enc(
+                    config_features,
+                    antenna_coordinates=antenna_coordinates,
+                    antenna_mask=antenna_mask,
+                )
+            )
+        x = x + self.beam_pe(beam_positions) + metadata_encoding
 
         B = x.shape[0]
         cls = self.cls_token.expand(B, -1, -1)

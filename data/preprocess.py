@@ -8,11 +8,29 @@ import torch.nn.functional as F
 
 
 def sinc_resample_freq(H: torch.Tensor, target_nf: int = 128) -> torch.Tensor:
+    """Resample a uniformly spaced complex frequency response at fixed bandwidth.
+
+    The conversion goes through the delay domain so the complex phase slope is
+    preserved. Frequency samples are stored in negative-to-positive order.
+    """
     if H.shape[-1] == target_nf:
         return H
-    real = F.interpolate(H.real.float(), size=target_nf, mode="linear", align_corners=False)
-    imag = F.interpolate(H.imag.float(), size=target_nf, mode="linear", align_corners=False)
-    return torch.complex(real, imag)
+    if target_nf <= 0:
+        raise ValueError("target_nf must be positive.")
+
+    source_nf = H.shape[-1]
+    delay_response = torch.fft.ifft(
+        torch.fft.ifftshift(H.to(torch.complex64), dim=-1),
+        dim=-1,
+    )
+    if target_nf > source_nf:
+        delay_response = F.pad(delay_response, (0, target_nf - source_nf))
+    else:
+        delay_response = delay_response[..., :target_nf]
+    return torch.fft.fftshift(
+        torch.fft.fft(delay_response, n=target_nf, dim=-1),
+        dim=-1,
+    )
 
 
 def select_single_rx(raw_csi: torch.Tensor, rx_index: int = 0) -> torch.Tensor:
