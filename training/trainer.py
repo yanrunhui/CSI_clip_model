@@ -923,9 +923,10 @@ class Trainer:
             losses["loss_physics_relational_los_delay_positive"] = (
                 torch.relu(eps - los_delay_raw[relational_mask]) / scales[first_path_delay_idx]
             ).mean()
-            losses["loss_physics_relational_first_path_delay_ge_los_delay"] = (
-                torch.relu(
-                    los_delay_raw[relational_mask] - first_path_delay_raw[relational_mask]
+            losses["loss_physics_relational_first_path_delay_eq_los_delay"] = (
+                torch.abs(
+                    first_path_delay_raw[relational_mask]
+                    - los_delay_raw[relational_mask]
                 )
                 / scales[first_path_delay_idx]
             ).mean()
@@ -1240,12 +1241,6 @@ class Trainer:
             antenna_mask=batch.get("antenna_mask"),
         )
         csi_features = torch.nn.functional.normalize(csi_features_raw, dim=-1)
-        prototype_features = self.model.encode_prototypes(normalize=True)
-        prototype_text_features = self.model.encode_text(
-            self.prototype_token_ids,
-            self.prototype_token_mask,
-            normalize=True,
-        )
         labels = torch.tensor(
             [self.prototype_label_map[key] for key in batch["semantic_keys"]],
             device=self.device,
@@ -1253,7 +1248,22 @@ class Trainer:
         )
         self._assert_semantic_label_roundtrip(batch["semantic_keys"], labels)
         label_histogram = self._histogram(labels, len(self.prototype_keys_by_index))
-        logit_scale = self.model.logit_scale.exp()
+        language_alignment_active = (
+            effective_csi_to_text_weight > 0.0
+            or effective_prototype_weight > 0.0
+            or cfg.text_prototype_weight > 0.0
+        )
+        prototype_features = None
+        prototype_text_features = None
+        logit_scale = None
+        if language_alignment_active:
+            prototype_features = self.model.encode_prototypes(normalize=True)
+            prototype_text_features = self.model.encode_text(
+                self.prototype_token_ids,
+                self.prototype_token_mask,
+                normalize=True,
+            )
+            logit_scale = self.model.logit_scale.exp()
         positive_mask = None
         physics_predictions = None
         semantic_predictions = None
@@ -1439,7 +1449,17 @@ class Trainer:
                     f"{cfg.first_path_power_gate_mode!r}. Choose from: none, base."
                 )
 
-        if cfg.text_mode == "prototype":
+        if not language_alignment_active:
+            zero = torch.zeros((), device=self.device)
+            losses = {
+                "loss_csi_to_text": zero,
+                "loss_csi_to_prototype": zero,
+                "loss_text_to_prototype": zero,
+            }
+        elif cfg.text_mode == "prototype":
+            assert prototype_text_features is not None
+            assert prototype_features is not None
+            assert logit_scale is not None
             losses = self.loss(
                 csi_features=csi_features,
                 text_features=prototype_text_features,
@@ -1449,6 +1469,9 @@ class Trainer:
                 output_dict=True,
             )
         elif cfg.text_mode in ("instance", "multipositive"):
+            assert prototype_text_features is not None
+            assert prototype_features is not None
+            assert logit_scale is not None
             instance_text_features = self.model.encode_text(
                 batch["t_instance_ids"],
                 batch["t_instance_mask"],
@@ -1486,7 +1509,14 @@ class Trainer:
             }
         else:
             raise ValueError(f"Unsupported text_mode={cfg.text_mode!r}")
-        if warmup_active and cfg.text_mode in {"instance", "multipositive"}:
+        if (
+            language_alignment_active
+            and warmup_active
+            and cfg.text_mode in {"instance", "multipositive"}
+        ):
+            assert prototype_text_features is not None
+            assert prototype_features is not None
+            assert logit_scale is not None
             losses["loss_text_to_prototype"] = paired_contrastive_loss(
                 prototype_text_features,
                 prototype_features,
@@ -2856,10 +2886,13 @@ class Trainer:
                     first_path_angle_nlos_count = first_path_angle_nlos_mask.sum()
         if physics_outputs is not None and effective_physics_relational_weight > 0.0:
             losses.update(self._physics_relational_losses(physics_outputs, batch))
+        alignment_loss = (
+            effective_csi_to_text_weight * losses["loss_csi_to_text"]
+            + effective_prototype_weight * losses["loss_csi_to_prototype"]
+            + cfg.text_prototype_weight * losses["loss_text_to_prototype"]
+        )
         total_loss = (
-            effective_csi_to_text_weight * losses["loss_csi_to_text"] +
-            effective_prototype_weight * losses["loss_csi_to_prototype"] +
-            cfg.text_prototype_weight * losses["loss_text_to_prototype"] +
+            alignment_loss +
             effective_semantic_classifier_weight * losses.get("loss_semantic_classifier", torch.zeros((), device=self.device)) +
             effective_attribute_classifier_weight * losses.get("loss_attribute_classifier", torch.zeros((), device=self.device)) +
             effective_aux_regression_weight * losses.get("loss_aux_regression", torch.zeros((), device=self.device)) +
@@ -3367,7 +3400,8 @@ class Trainer:
             metrics["semantic_head_bias_max"] = float(semantic_head_bias.float().max())
             metrics["semantic_head_bias_argmax"] = float(semantic_head_bias.argmax().item())
             metrics["semantic_head_bias_values"] = self._format_float_vector(semantic_head_bias)
-        metrics["contrastive_loss"] = float(total_loss.detach())
+        metrics["alignment_loss"] = float(alignment_loss.detach())
+        metrics["contrastive_loss"] = float(alignment_loss.detach())
         metrics["loss_total"] = float(total_loss.detach())
-        metrics["logit_scale"] = float(logit_scale.detach())
+        metrics["logit_scale"] = float(self.model.logit_scale.exp().detach())
         return metrics

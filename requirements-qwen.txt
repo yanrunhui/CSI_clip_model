@@ -1,0 +1,7 @@
+# Install in a separate environment from the main CSI training environment.
+# Qwen3.5 support landed in the Transformers 5.x line.
+transformers>=5.6.2,<6
+accelerate>=1.2
+peft>=0.15
+bitsandbytes>=0.45
+safetensors>=0.4

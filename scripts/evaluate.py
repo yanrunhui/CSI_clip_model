@@ -151,7 +151,15 @@ def _physics_target_index(name: str) -> int:
 
 
 def _physics_raw_predictions(physics_predictions: torch.Tensor) -> torch.Tensor:
-    return physics_predictions * PHYSICS_TARGET_SCALES + PHYSICS_TARGET_OFFSETS
+    scales = PHYSICS_TARGET_SCALES.to(
+        device=physics_predictions.device,
+        dtype=physics_predictions.dtype,
+    )
+    offsets = PHYSICS_TARGET_OFFSETS.to(
+        device=physics_predictions.device,
+        dtype=physics_predictions.dtype,
+    )
+    return physics_predictions * scales + offsets
 
 
 def _format_scalar(value: float, decimals: int = 1) -> str:
@@ -230,7 +238,14 @@ def _apply_signal_description_correction(
         first_path_delay_ns = _finite_float(record["first_path_delay_ns"])
         los_delay_ns = _finite_float(record["los_delay_ns"])
         if first_path_delay_ns is not None and los_delay_ns is not None:
-            record["first_path_delay_ns"] = max(first_path_delay_ns, los_delay_ns)
+            # For a LoS record, preprocessing defines first_path_delay_ns as
+            # the minimum delay over all valid paths and los_delay_ns as the
+            # delay of the zero-interaction direct path.  The direct path is
+            # therefore the first path, so these are two estimates of the same
+            # physical quantity rather than lower/upper bounds.  Use the
+            # dedicated LoS-delay estimate as the canonical emitted value.
+            record["first_path_delay_ns"] = los_delay_ns
+            record["los_delay_ns"] = los_delay_ns
 
     return record
 
@@ -3834,7 +3849,8 @@ def main() -> None:
         help=(
             "Post-processing applied only to predicted signal-description records. "
             "none keeps raw predictions; bounds enforces scalar physical bounds; "
-            "relational also enforces first_path_delay_ns>=los_delay_ns."
+            "relational makes first_path_delay_ns equal los_delay_ns for LoS records, "
+            "using the dedicated LoS-delay estimate as the common value."
         ),
     )
     parser.add_argument(

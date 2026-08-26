@@ -35,6 +35,11 @@ ANGLE_FIELDS = {"first_path_angle_deg", "los_angle_deg"}
 LOS_ONLY_NUMERIC_FIELDS = {"los_delay_ns", "los_angle_deg"}
 DELAY_NUMERIC_FIELDS = {"first_path_delay_ns", "los_delay_ns"}
 
+# Labels that represent the same physical delay can differ slightly after
+# floating-point serialization. Keep the ordering diagnostic insensitive to
+# sub-picosecond numerical noise.
+RELATIONAL_DELAY_EPSILON_NS = 1.0e-3
+
 DEFAULT_TOLERANCES = {
     "path_count": 1.0,
     "first_path_delay_ns": 50.0,
@@ -100,7 +105,8 @@ def categorical_macro_f1(predictions: list[str], targets: list[str]) -> float:
         tp = sum(pred == label and target == label for pred, target in zip(predictions, targets))
         fp = sum(pred == label and target != label for pred, target in zip(predictions, targets))
         fn = sum(pred != label and target == label for pred, target in zip(predictions, targets))
-        values.append(f1(safe_ratio(tp, tp + fp), safe_ratio(tp, tp + fn)))
+        denominator = 2 * tp + fp + fn
+        values.append(2.0 * tp / denominator if denominator else 0.0)
     return mean(values)
 
 
@@ -129,7 +135,10 @@ def metric_aspect(metric: str) -> str:
         return "information_completeness"
     if metric == "hallucination_rate":
         return "unsupported_facts"
-    if metric == "description_factual_accuracy":
+    if metric in {
+        "description_factual_accuracy",
+        "entire_record_factual_accuracy",
+    }:
         return "overall_factuality"
     if metric.startswith("physical_consistency"):
         return "physical_consistency_diagnostic"
@@ -194,17 +203,14 @@ def consistency_violations(
         if los_delay is not None and los_delay <= 0.0:
             violations.append("los_delay_ns_nonpositive")
 
-        if (
-            first_delay is not None
-            and los_delay is not None
-            and first_delay < los_delay
-        ):
-            violations.append("first_path_delay_before_los_delay")
-
         if first_delay is None or los_delay is None:
             violations.append("los_missing_delay")
-        elif abs(first_delay - los_delay) > los_delay_tolerance_ns:
-            violations.append("los_first_delay_inconsistent")
+        else:
+            delay_difference = abs(first_delay - los_delay)
+            if delay_difference > RELATIONAL_DELAY_EPSILON_NS:
+                violations.append("los_first_delay_unequal")
+            if delay_difference > los_delay_tolerance_ns:
+                violations.append("los_first_delay_outside_tolerance")
 
         first_angle = finite_float(record.get("first_path_angle_deg"))
         los_angle = finite_float(record.get("los_angle_deg"))
@@ -290,6 +296,7 @@ def evaluate_payload(
     field_total: dict[str, int] = {field: 0 for field in NUMERIC_FIELDS}
     delay_slot_tp = delay_slot_fp = delay_slot_fn = 0
     delay_numeric_correct = delay_numeric_total = 0
+    entire_record_correct = 0
 
     consistency_ok = 0
     target_consistency_ok = 0
@@ -304,6 +311,7 @@ def evaluate_payload(
 
     for idx, (pred, target) in enumerate(zip(predicted_records, target_records)):
         sample_errors = []
+        sample_numeric_correct = True
         for field in NUMERIC_FIELDS:
             pred_value = (
                 finite_float(pred.get(field))
@@ -327,11 +335,15 @@ def evaluate_payload(
                 if error <= tolerances[field]:
                     field_correct[field] += 1
                     numeric_correct += 1
+                else:
+                    sample_numeric_correct = False
                 sample_errors.append((field, error))
             elif pred_present and not target_present:
                 slot_fp += 1
+                sample_numeric_correct = False
             elif target_present and not pred_present:
                 slot_fn += 1
+                sample_numeric_correct = False
 
             if field in DELAY_NUMERIC_FIELDS:
                 if pred_present and target_present:
@@ -343,6 +355,13 @@ def evaluate_payload(
                     delay_slot_fp += 1
                 elif target_present and not pred_present:
                     delay_slot_fn += 1
+
+        sample_categorical_correct = all(
+            str(pred.get(field)) == str(target.get(field))
+            for field in CATEGORICAL_FIELDS
+        )
+        if sample_categorical_correct and sample_numeric_correct:
+            entire_record_correct += 1
 
         violations = consistency_violations(
             pred,
@@ -450,6 +469,19 @@ def evaluate_payload(
                 "notes": (
                     "Mean of categorical accuracies, slot F1, numerical slot accuracy, "
                     "and 1-hallucination rate."
+                ),
+            },
+            {
+                "metric": "entire_record_factual_accuracy",
+                "field": "all_factual_fields",
+                "value": format_float(
+                    safe_ratio(entire_record_correct, len(predicted_records))
+                ),
+                "count": str(len(predicted_records)),
+                "notes": (
+                    "Fraction of samples with every categorical field correct, exact "
+                    "numeric-slot presence, and every applicable numeric value within "
+                    "its field tolerance."
                 ),
             },
             {
@@ -667,6 +699,15 @@ def evaluate_payload(
             ),
         },
         {
+            "type": "entire_record_factuality",
+            "role": "primary",
+            "metric": "entire_record_factual_accuracy",
+            "definition": (
+                "All categorical fields must match, numeric-slot presence must match, "
+                "and all applicable numeric errors must be within field tolerances."
+            ),
+        },
+        {
             "type": "categorical_attribute",
             "role": "primary",
             "fields": list(CATEGORICAL_FIELDS),
@@ -759,6 +800,7 @@ def main() -> None:
     print(f"saved_eval_spec_json={spec_json}")
     printed_metrics = {
         "description_factual_accuracy",
+        "entire_record_factual_accuracy",
         "attribute_accuracy",
         "categorical_macro_f1",
         "slot_f1",

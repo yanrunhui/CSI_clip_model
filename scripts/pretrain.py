@@ -1229,6 +1229,8 @@ def run_smoke_test(
     device: torch.device,
     text_mode: str = "prototype",
     csi_to_text_weight: float = 1.0,
+    prototype_weight: float = 1.0,
+    text_prototype_weight: float = 1.0,
     semantic_classifier_weight: float = 0.0,
     semantic_classifier_class_weight: str = "none",
     semantic_classifier_logit_adjustment: float = 0.0,
@@ -1359,6 +1361,8 @@ def run_smoke_test(
                     epochs=2,
                     text_mode=text_mode,
                     csi_to_text_weight=csi_to_text_weight,
+                    prototype_weight=prototype_weight,
+                    text_prototype_weight=text_prototype_weight,
                     semantic_classifier_weight=semantic_classifier_weight,
                     semantic_classifier_class_weight=semantic_classifier_class_weight,
                     semantic_classifier_logit_adjustment=semantic_classifier_logit_adjustment,
@@ -1415,7 +1419,15 @@ def run_smoke_test(
                     first_path_power_mode=first_path_power_mode,
                     first_path_power_use_internal_gate=first_path_power_use_internal_gate,
                     nlos_enhanced_power_loss=nlos_enhanced_power_loss,
-                    prototype_warmup_epochs=1,
+                    prototype_warmup_epochs=(
+                        0
+                        if (
+                            csi_to_text_weight == 0.0
+                            and prototype_weight == 0.0
+                            and text_prototype_weight == 0.0
+                        )
+                        else 1
+                    ),
                     multipositive_distance_threshold=multipositive_distance_threshold,
                     multipositive_positive_mode=multipositive_positive_mode,
                     min_class_size_for_multipositive=min_class_size_for_multipositive,
@@ -2151,8 +2163,8 @@ def run_real_pretrain(
             m.get("loss_physics_relational_los_delay_positive", 0.0)
             for m in epoch_metrics
         ) / len(epoch_metrics)
-        mean_physics_relational_first_path_delay_ge_los_delay = sum(
-            m.get("loss_physics_relational_first_path_delay_ge_los_delay", 0.0)
+        mean_physics_relational_first_path_delay_eq_los_delay = sum(
+            m.get("loss_physics_relational_first_path_delay_eq_los_delay", 0.0)
             for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_reflection_path_count_loss = sum(
@@ -2396,7 +2408,7 @@ def run_real_pretrain(
                         "loss_physics_relational_delay_spread": mean_physics_relational_delay_spread,
                         "loss_physics_relational_reflection_nonnegative": mean_physics_relational_reflection_nonnegative,
                         "loss_physics_relational_los_delay_positive": mean_physics_relational_los_delay_positive,
-                        "loss_physics_relational_first_path_delay_ge_los_delay": mean_physics_relational_first_path_delay_ge_los_delay,
+                        "loss_physics_relational_first_path_delay_eq_los_delay": mean_physics_relational_first_path_delay_eq_los_delay,
                         "loss_reflection_path_count_regression": mean_reflection_path_count_loss,
                         "reflection_path_count_mae": mean_reflection_path_count_mae,
                         "reflection_path_count_exact_accuracy": mean_reflection_path_count_exact_accuracy,
@@ -3816,6 +3828,8 @@ def main() -> None:
             device,
             text_mode=text_mode,
             csi_to_text_weight=csi_to_text_weight,
+            prototype_weight=prototype_weight,
+            text_prototype_weight=text_prototype_weight,
             semantic_classifier_weight=semantic_classifier_weight,
             semantic_classifier_class_weight=semantic_classifier_class_weight,
             semantic_classifier_logit_adjustment=semantic_classifier_logit_adjustment,

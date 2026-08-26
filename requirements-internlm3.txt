@@ -1,0 +1,7 @@
+# InternLM3 local remote-code checkpoint compatibility environment.
+transformers==4.47.1
+accelerate>=1.2,<2
+peft>=0.14,<0.21
+bitsandbytes>=0.45,<0.51
+sentencepiece>=0.2,<1
+safetensors>=0.4
