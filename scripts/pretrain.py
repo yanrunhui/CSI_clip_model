@@ -1307,6 +1307,15 @@ def run_smoke_test(
     use_first_path_angle_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
     shared_physics_token_residual_scale: float = 1.0,
+    noise_augmentation_enabled: bool = False,
+    noise_augmentation_probability: float = 0.0,
+    noise_snr_min_db: float = 10.0,
+    noise_snr_max_db: float = 30.0,
+    noise_augmented_main_weight: float = 0.0,
+    noise_delay_consistency_weight: float = 0.0,
+    noise_k_consistency_weight: float = 0.0,
+    noise_clean_k_supervised_weight: float = 0.0,
+    noise_noisy_k_supervised_weight: float = 0.0,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> None:
     loader, model, _, prototype_bank = build_demo_components(
@@ -1431,6 +1440,15 @@ def run_smoke_test(
                     multipositive_distance_threshold=multipositive_distance_threshold,
                     multipositive_positive_mode=multipositive_positive_mode,
                     min_class_size_for_multipositive=min_class_size_for_multipositive,
+                    noise_augmentation_enabled=noise_augmentation_enabled,
+                    noise_augmentation_probability=noise_augmentation_probability,
+                    noise_snr_min_db=noise_snr_min_db,
+                    noise_snr_max_db=noise_snr_max_db,
+                    noise_augmented_main_weight=noise_augmented_main_weight,
+                    noise_delay_consistency_weight=noise_delay_consistency_weight,
+                    noise_k_consistency_weight=noise_k_consistency_weight,
+                    noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
+                    noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
                 ),
             )
             print(
@@ -1534,6 +1552,15 @@ def run_real_pretrain(
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
     min_class_size_for_multipositive: int,
+    noise_augmentation_enabled: bool,
+    noise_augmentation_probability: float,
+    noise_snr_min_db: float,
+    noise_snr_max_db: float,
+    noise_augmented_main_weight: float,
+    noise_delay_consistency_weight: float,
+    noise_k_consistency_weight: float,
+    noise_clean_k_supervised_weight: float,
+    noise_noisy_k_supervised_weight: float,
     min_class_size: int,
     semantic_key_mode: str,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]],
@@ -1699,6 +1726,15 @@ def run_real_pretrain(
         multipositive_distance_threshold=multipositive_distance_threshold,
         multipositive_positive_mode=multipositive_positive_mode,
         min_class_size_for_multipositive=min_class_size_for_multipositive,
+        noise_augmentation_enabled=noise_augmentation_enabled,
+        noise_augmentation_probability=noise_augmentation_probability,
+        noise_snr_min_db=noise_snr_min_db,
+        noise_snr_max_db=noise_snr_max_db,
+        noise_augmented_main_weight=noise_augmented_main_weight,
+        noise_delay_consistency_weight=noise_delay_consistency_weight,
+        noise_k_consistency_weight=noise_k_consistency_weight,
+        noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
+        noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
     )
     trainer = Trainer(
         model,
@@ -1805,6 +1841,14 @@ def run_real_pretrain(
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
         f"min_class_size_for_multipositive={min_class_size_for_multipositive} "
+        f"noise_augmentation_enabled={noise_augmentation_enabled} "
+        f"noise_augmentation_probability={noise_augmentation_probability} "
+        f"noise_snr_db=[{noise_snr_min_db},{noise_snr_max_db}] "
+        f"noise_augmented_main_weight={noise_augmented_main_weight} "
+        f"noise_delay_consistency_weight={noise_delay_consistency_weight} "
+        f"noise_k_consistency_weight={noise_k_consistency_weight} "
+        f"noise_clean_k_supervised_weight={noise_clean_k_supervised_weight} "
+        f"noise_noisy_k_supervised_weight={noise_noisy_k_supervised_weight} "
         f"min_class_size={min_class_size} semantic_key_mode={semantic_key_mode} "
         f"filter_attribute_values={format_attribute_value_filters(effective_filter_attribute_values)} "
         f"limit_samples={limit_samples} "
@@ -2238,6 +2282,48 @@ def run_real_pretrain(
         mean_positive_count = sum(m.get("multipositive_positive_count_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_logit_scale = sum(m["logit_scale"] for m in epoch_metrics) / len(epoch_metrics)
         mean_prototype_warmup_active = sum(m.get("prototype_warmup_active", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        noise_epoch_metrics = [
+            m for m in epoch_metrics if m.get("noise_augmentation_applied", 0.0) > 0.0
+        ]
+        mean_noise_augmentation_applied = len(noise_epoch_metrics) / len(epoch_metrics)
+
+        def mean_noise_metric(name: str) -> float:
+            values = [m[name] for m in noise_epoch_metrics if name in m]
+            return sum(values) / len(values) if values else 0.0
+
+        clean_k_values = [
+            m["loss_noise_clean_k_supervised"]
+            for m in epoch_metrics
+            if "loss_noise_clean_k_supervised" in m
+        ]
+        mean_noise_clean_k_supervised = (
+            sum(clean_k_values) / len(clean_k_values) if clean_k_values else 0.0
+        )
+        clean_k_mae_values = [
+            m["noise_clean_k_mae_db"]
+            for m in epoch_metrics
+            if "noise_clean_k_mae_db" in m
+        ]
+        mean_noise_clean_k_mae_db = (
+            sum(clean_k_mae_values) / len(clean_k_mae_values)
+            if clean_k_mae_values
+            else 0.0
+        )
+        mean_noise_sampled_snr_db = mean_noise_metric("noise_sampled_snr_db")
+        mean_noise_actual_snr_db = mean_noise_metric("noise_actual_snr_db")
+        mean_noise_augmented_main = mean_noise_metric("loss_noise_augmented_main")
+        mean_noise_delay_supervised = mean_noise_metric("loss_noise_delay_supervised")
+        mean_noise_k_supervised = mean_noise_metric("loss_noise_k_supervised")
+        mean_noise_delay_consistency = mean_noise_metric("loss_noise_delay_consistency")
+        mean_noise_k_consistency = mean_noise_metric("loss_noise_k_consistency")
+        mean_noise_delay_mae_ns = mean_noise_metric("noise_delay_mae_ns")
+        mean_noise_k_mae_db = mean_noise_metric("noise_k_mae_db")
+        mean_noise_delay_consistency_mae_ns = mean_noise_metric(
+            "noise_delay_consistency_mae_ns"
+        )
+        mean_noise_k_consistency_mae_db = mean_noise_metric(
+            "noise_k_consistency_mae_db"
+        )
         last_batch_label_histogram = epoch_metrics[-1].get("batch_label_histogram", "")
         last_batch_semantic_argmax_histogram = epoch_metrics[-1].get("batch_semantic_argmax_histogram", "")
         last_batch_semantic_head_bias_values = epoch_metrics[-1].get("semantic_head_bias_values", "")
@@ -2290,6 +2376,11 @@ def run_real_pretrain(
             f"nlos_power_base_mae={mean_nlos_first_path_power_base_mae_db:.2f}dB "
             f"nlos_power_enh_mae={mean_nlos_first_path_power_enhanced_mae_db:.2f}dB "
             f"power_delta_sat={mean_first_path_power_delta_saturation:.4f} "
+            f"noise_frac={mean_noise_augmentation_applied:.3f} "
+            f"noise_snr={mean_noise_actual_snr_db:.2f}dB "
+            f"clean_k_mae={mean_noise_clean_k_mae_db:.2f}dB "
+            f"noise_delay_mae={mean_noise_delay_mae_ns:.2f}ns "
+            f"noise_k_mae={mean_noise_k_mae_db:.2f}dB "
             f"aux={mean_aux_regression:.4f} grad_csi={mean_grad_csi_encoder:.2e} "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
@@ -2300,6 +2391,20 @@ def run_real_pretrain(
                         "epoch": epoch,
                         "steps": len(epoch_metrics),
                         "loss_total": mean_total,
+                        "noise_augmentation_applied_fraction": mean_noise_augmentation_applied,
+                        "noise_sampled_snr_db": mean_noise_sampled_snr_db,
+                        "noise_actual_snr_db": mean_noise_actual_snr_db,
+                        "loss_noise_clean_k_supervised": mean_noise_clean_k_supervised,
+                        "noise_clean_k_mae_db": mean_noise_clean_k_mae_db,
+                        "loss_noise_augmented_main": mean_noise_augmented_main,
+                        "loss_noise_delay_supervised": mean_noise_delay_supervised,
+                        "loss_noise_k_supervised": mean_noise_k_supervised,
+                        "loss_noise_delay_consistency": mean_noise_delay_consistency,
+                        "loss_noise_k_consistency": mean_noise_k_consistency,
+                        "noise_delay_mae_ns": mean_noise_delay_mae_ns,
+                        "noise_k_mae_db": mean_noise_k_mae_db,
+                        "noise_delay_consistency_mae_ns": mean_noise_delay_consistency_mae_ns,
+                        "noise_k_consistency_mae_db": mean_noise_k_consistency_mae_db,
                         "contrastive_loss": mean_contrastive,
                         "checkpoint": checkpoint_path,
                         "csi_to_text_weight": csi_to_text_weight,
@@ -2425,6 +2530,15 @@ def run_real_pretrain(
                         "text_mode": text_mode,
                         "prototype_warmup_epochs": prototype_warmup_epochs,
                         "prototype_warmup_active": mean_prototype_warmup_active,
+                        "noise_augmentation_enabled": noise_augmentation_enabled,
+                        "noise_augmentation_probability": noise_augmentation_probability,
+                        "noise_snr_min_db": noise_snr_min_db,
+                        "noise_snr_max_db": noise_snr_max_db,
+                        "noise_augmented_main_weight": noise_augmented_main_weight,
+                        "noise_delay_consistency_weight": noise_delay_consistency_weight,
+                        "noise_k_consistency_weight": noise_k_consistency_weight,
+                        "noise_clean_k_supervised_weight": noise_clean_k_supervised_weight,
+                        "noise_noisy_k_supervised_weight": noise_noisy_k_supervised_weight,
                         "semantic_classifier_weight": semantic_classifier_weight,
                         "semantic_classifier_class_weight": semantic_classifier_class_weight,
                         "semantic_classifier_logit_adjustment": semantic_classifier_logit_adjustment,
@@ -2582,6 +2696,15 @@ def run_real_pretrain(
                     "text_prototype_weight": text_prototype_weight,
                     "text_mode": text_mode,
                     "prototype_warmup_epochs": prototype_warmup_epochs,
+                    "noise_augmentation_enabled": noise_augmentation_enabled,
+                    "noise_augmentation_probability": noise_augmentation_probability,
+                    "noise_snr_min_db": noise_snr_min_db,
+                    "noise_snr_max_db": noise_snr_max_db,
+                    "noise_augmented_main_weight": noise_augmented_main_weight,
+                    "noise_delay_consistency_weight": noise_delay_consistency_weight,
+                    "noise_k_consistency_weight": noise_k_consistency_weight,
+                    "noise_clean_k_supervised_weight": noise_clean_k_supervised_weight,
+                    "noise_noisy_k_supervised_weight": noise_noisy_k_supervised_weight,
                     "semantic_classifier_weight": semantic_classifier_weight,
                     "semantic_classifier_class_weight": semantic_classifier_class_weight,
                     "semantic_classifier_logit_adjustment": semantic_classifier_logit_adjustment,
@@ -2733,6 +2856,14 @@ def main() -> None:
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--token-norm-mode", choices=["std", "rms", "none"])
     parser.add_argument("--enable-power-branch", action="store_true")
+    parser.add_argument(
+        "--disable-power-branch",
+        action="store_true",
+        help=(
+            "Force the power-specific context branch off, even when it is enabled "
+            "by the config or power/reflection auxiliary losses."
+        ),
+    )
     parser.add_argument(
         "--detach-delay-spread-features",
         action="store_true",
@@ -3240,6 +3371,58 @@ def main() -> None:
         help="Freeze the text encoder and learnable prototypes.",
     )
     parser.add_argument("--min-class-size-for-multipositive", type=int)
+    parser.add_argument(
+        "--noise-augmentation",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Enable the additional noisy CSI training branch. The default is "
+            "disabled; use --noise-augmentation to enable it and "
+            "--no-noise-augmentation to force clean-only training."
+        ),
+    )
+    parser.add_argument(
+        "--noise-augmentation-probability",
+        type=float,
+        help=(
+            "Probability that a training batch receives an additional noisy CSI "
+            "branch. Use 0.8 for 20%% clean-only and 80%% clean+noisy batches."
+        ),
+    )
+    parser.add_argument(
+        "--noise-snr-min-db",
+        type=float,
+        help="Minimum uniformly sampled training SNR in dB.",
+    )
+    parser.add_argument(
+        "--noise-snr-max-db",
+        type=float,
+        help="Maximum uniformly sampled training SNR in dB.",
+    )
+    parser.add_argument(
+        "--noise-augmented-main-weight",
+        type=float,
+        help="Weight for noisy first-delay and K-factor supervised loss.",
+    )
+    parser.add_argument(
+        "--noise-delay-consistency-weight",
+        type=float,
+        help="Weight for clean/noisy first-delay prediction consistency.",
+    )
+    parser.add_argument(
+        "--noise-k-consistency-weight",
+        type=float,
+        help="Weight for clean/noisy K-factor prediction consistency.",
+    )
+    parser.add_argument(
+        "--noise-clean-k-supervised-weight",
+        type=float,
+        help="Extra weight for clean-CSI K-factor supervision when noise training is enabled.",
+    )
+    parser.add_argument(
+        "--noise-noisy-k-supervised-weight",
+        type=float,
+        help="Extra weight for noisy-CSI K-factor supervision.",
+    )
     parser.add_argument("--output-dir", type=str)
     parser.add_argument("--save-every", type=int)
     args = parser.parse_args()
@@ -3267,9 +3450,16 @@ def main() -> None:
         if args.token_norm_mode is not None
         else str(cfg_get(train_cfg, "token_norm_mode", "std"))
     )
+    if args.enable_power_branch and args.disable_power_branch:
+        raise ValueError(
+            "--enable-power-branch and --disable-power-branch cannot be used together."
+        )
     use_power_branch = bool(
-        args.enable_power_branch
-        or cfg_get(train_cfg, "use_power_branch", False)
+        not args.disable_power_branch
+        and (
+            args.enable_power_branch
+            or cfg_get(train_cfg, "use_power_branch", False)
+        )
     )
     detach_delay_spread_features = bool(
         args.detach_delay_spread_features
@@ -3756,6 +3946,7 @@ def main() -> None:
             or reflection_path_count_regression_weight > 0.0
         )
         and not use_power_branch
+        and not args.disable_power_branch
     ):
         use_power_branch = True
     aux_regression_targets = parse_aux_regression_targets(
@@ -3778,6 +3969,68 @@ def main() -> None:
         if args.min_class_size_for_multipositive is not None
         else int(cfg_get(train_cfg, "min_class_size_for_multipositive", 2))
     )
+    noise_augmentation_enabled = (
+        args.noise_augmentation
+        if args.noise_augmentation is not None
+        else bool(cfg_get(train_cfg, "noise_augmentation_enabled", False))
+    )
+    noise_augmentation_probability = (
+        args.noise_augmentation_probability
+        if args.noise_augmentation_probability is not None
+        else float(cfg_get(train_cfg, "noise_augmentation_probability", 0.0))
+    )
+    noise_snr_min_db = (
+        args.noise_snr_min_db
+        if args.noise_snr_min_db is not None
+        else float(cfg_get(train_cfg, "noise_snr_min_db", 10.0))
+    )
+    noise_snr_max_db = (
+        args.noise_snr_max_db
+        if args.noise_snr_max_db is not None
+        else float(cfg_get(train_cfg, "noise_snr_max_db", 30.0))
+    )
+    noise_augmented_main_weight = (
+        args.noise_augmented_main_weight
+        if args.noise_augmented_main_weight is not None
+        else float(cfg_get(train_cfg, "noise_augmented_main_weight", 0.0))
+    )
+    noise_delay_consistency_weight = (
+        args.noise_delay_consistency_weight
+        if args.noise_delay_consistency_weight is not None
+        else float(cfg_get(train_cfg, "noise_delay_consistency_weight", 0.0))
+    )
+    noise_k_consistency_weight = (
+        args.noise_k_consistency_weight
+        if args.noise_k_consistency_weight is not None
+        else float(cfg_get(train_cfg, "noise_k_consistency_weight", 0.0))
+    )
+    noise_clean_k_supervised_weight = (
+        args.noise_clean_k_supervised_weight
+        if args.noise_clean_k_supervised_weight is not None
+        else float(cfg_get(train_cfg, "noise_clean_k_supervised_weight", 0.0))
+    )
+    noise_noisy_k_supervised_weight = (
+        args.noise_noisy_k_supervised_weight
+        if args.noise_noisy_k_supervised_weight is not None
+        else float(cfg_get(train_cfg, "noise_noisy_k_supervised_weight", 0.0))
+    )
+    if not 0.0 <= noise_augmentation_probability <= 1.0:
+        raise ValueError("--noise-augmentation-probability must be in [0, 1].")
+    if noise_snr_min_db > noise_snr_max_db:
+        raise ValueError("--noise-snr-min-db must not exceed --noise-snr-max-db.")
+    if not all(
+        math.isfinite(value)
+        for value in (noise_snr_min_db, noise_snr_max_db)
+    ):
+        raise ValueError("Noise SNR bounds must be finite.")
+    if min(
+        noise_augmented_main_weight,
+        noise_delay_consistency_weight,
+        noise_k_consistency_weight,
+        noise_clean_k_supervised_weight,
+        noise_noisy_k_supervised_weight,
+    ) < 0.0:
+        raise ValueError("Noise-augmentation loss weights must be non-negative.")
     min_class_size = (
         args.min_class_size
         if args.min_class_size is not None
@@ -3907,6 +4160,15 @@ def main() -> None:
             use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
             use_shared_physics_token=use_shared_physics_token,
             shared_physics_token_residual_scale=shared_physics_token_residual_scale,
+            noise_augmentation_enabled=noise_augmentation_enabled,
+            noise_augmentation_probability=noise_augmentation_probability,
+            noise_snr_min_db=noise_snr_min_db,
+            noise_snr_max_db=noise_snr_max_db,
+            noise_augmented_main_weight=noise_augmented_main_weight,
+            noise_delay_consistency_weight=noise_delay_consistency_weight,
+            noise_k_consistency_weight=noise_k_consistency_weight,
+            noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
+            noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
         )
         return
 
@@ -4017,6 +4279,15 @@ def main() -> None:
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
+            noise_augmentation_enabled=noise_augmentation_enabled,
+            noise_augmentation_probability=noise_augmentation_probability,
+            noise_snr_min_db=noise_snr_min_db,
+            noise_snr_max_db=noise_snr_max_db,
+            noise_augmented_main_weight=noise_augmented_main_weight,
+            noise_delay_consistency_weight=noise_delay_consistency_weight,
+            noise_k_consistency_weight=noise_k_consistency_weight,
+            noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
+            noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
             min_class_size=min_class_size,
             semantic_key_mode=semantic_key_mode,
             attribute_remap=attribute_remap,

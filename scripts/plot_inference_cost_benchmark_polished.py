@@ -16,7 +16,7 @@ class Style:
 
 
 STYLES = {
-    "Full model": Style("Full model", "#1F4E79", "star"),
+    "CSI2Text-PGMT-cost-benchmark": Style("CSI2Text-PGMT-cost-benchmark", "#1F4E79", "star"),
     "CSI encoder + single-task": Style("CSI encoder + single-task", "#4C78A8", "square"),
     "PDP/IFFT + MLP": Style("PDP/IFFT + MLP", "#2A9D8F", "square"),
     "Flattened CSI + MLP": Style("Flattened CSI + MLP", "#6C757D", "square"),
@@ -29,7 +29,7 @@ STYLES = {
 }
 
 PANEL_A_OFFSETS = {
-    "Full model": (12, -17),
+    "CSI2Text-PGMT-cost-benchmark": (12, -17),
     "CSI encoder + single-task": (12, 25),
     "PDP/IFFT + MLP": (12, -14),
     "Flattened CSI + MLP": (12, 29),
@@ -42,7 +42,7 @@ PANEL_A_OFFSETS = {
 }
 
 PANEL_B_OFFSETS = {
-    "Full model": (15, 4),
+    "CSI2Text-PGMT-cost-benchmark": (15, 4),
     "Qwen3-1.7B": (-122, 30),
     "Qwen3.5-2B updated direct decoder": (-122, -19),
     "DeepSeek-R1-Qwen3-8B": (16, -2),
@@ -225,7 +225,7 @@ def main() -> None:
 
     legend_y = 835
     legend_items = [
-        (Style("Full model", "#1F4E79", "star"), "Full model"),
+        (Style("CSI2Text-PGMT", "#1F4E79", "star"), "CSI2Text-PGMT"),
         (Style("Physics baseline", "#6C757D", "square"), "Physics baseline"),
         (Style("Direct decoder", "#E69F00", "circle"), "Direct decoder"),
     ]
@@ -245,8 +245,8 @@ def main() -> None:
         svg.append(text(x + radius + 8, legend_y + 5, label, 13))
         x += 140
 
-    svg.append(text(105, 915, "Deployment settings: Full/physics models use FP32; direct decoders use 4-bit NF4 with BF16 compute.", 13, fill="#555555"))
-    svg.append(text(105, 944, "Direct decoders have one training seed. Full-model Panel-B score uses three seeds and the verified structural/text components.", 13, fill="#555555"))
+    svg.append(text(105, 915, "Deployment settings: CSI2Text-PGMT/physics models use FP32; direct decoders use 4-bit NF4 with BF16 compute.", 13, fill="#555555"))
+    svg.append(text(105, 944, "Direct decoders have one training seed. CSI2Text-PGMT Panel-B score uses three seeds and verified structural/text components.", 13, fill="#555555"))
     svg.extend(["</g>", "</svg>"])
 
     output = Path(args.output)

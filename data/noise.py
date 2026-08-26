@@ -69,6 +69,97 @@ def add_complex_awgn(
     return h + noise, float(actual_snr_db)
 
 
+def add_complex_awgn_to_token_batch(
+    tokens: torch.Tensor,
+    token_mask: torch.Tensor,
+    snr_db: float | torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Add per-sample complex AWGN to a collated CSI-token batch.
+
+    Args:
+        tokens: Real/imag token layout ``[B, K, 2*C, N_f]``.
+        token_mask: Valid-token mask ``[B, K]``.
+        snr_db: One SNR shared by the batch or one value per sample.
+
+    Returns:
+        Noisy tokens in the original real layout and realized SNR ``[B]``.
+
+    Token padding and all-zero channels inside an incomplete beam patch are
+    excluded from signal-power estimation and remain exactly zero.
+    """
+    if tokens.ndim != 4 or tokens.shape[2] % 2 != 0:
+        raise ValueError(
+            "tokens must have shape [batch, tokens, 2*complex_channels, frequency], "
+            f"got {tuple(tokens.shape)}"
+        )
+    if token_mask.shape != tokens.shape[:2]:
+        raise ValueError(
+            f"token_mask shape {tuple(token_mask.shape)} does not match "
+            f"token batch shape {tuple(tokens.shape[:2])}"
+        )
+
+    complex_channels = tokens.shape[2] // 2
+    h = torch.complex(
+        tokens[:, :, :complex_channels],
+        tokens[:, :, complex_channels:],
+    )
+    physical_channel_mask = h.abs().sum(dim=-1, keepdim=True) > 0.0
+    valid_mask = token_mask.to(device=h.device, dtype=torch.bool)[:, :, None, None]
+    valid_mask = valid_mask & physical_channel_mask
+    valid_counts = valid_mask.expand_as(h).sum(dim=(1, 2, 3))
+    if bool((valid_counts == 0).any()):
+        raise ValueError("At least one sample has no valid complex CSI coefficients")
+
+    signal_energy = torch.where(
+        valid_mask,
+        h.abs().square(),
+        torch.zeros_like(h.real),
+    ).sum(dim=(1, 2, 3))
+    signal_power = signal_energy / valid_counts.to(dtype=signal_energy.dtype)
+    if not bool(torch.isfinite(signal_power).all()) or bool((signal_power <= 0.0).any()):
+        raise ValueError("Every CSI sample must have finite positive signal power")
+
+    snr = torch.as_tensor(snr_db, device=h.device, dtype=h.real.dtype)
+    if snr.ndim == 0:
+        snr = snr.expand(tokens.shape[0])
+    if snr.shape != (tokens.shape[0],):
+        raise ValueError(
+            f"snr_db must be scalar or shape ({tokens.shape[0]},), got {tuple(snr.shape)}"
+        )
+    if not bool(torch.isfinite(snr).all()):
+        raise ValueError("snr_db must be finite")
+    noise_power = signal_power / torch.pow(10.0, snr / 10.0)
+
+    noise_real = torch.randn(
+        h.shape,
+        dtype=h.real.dtype,
+        device=h.device,
+        generator=generator,
+    )
+    noise_imag = torch.randn(
+        h.shape,
+        dtype=h.real.dtype,
+        device=h.device,
+        generator=generator,
+    )
+    noise = torch.complex(noise_real, noise_imag)
+    noise = noise * torch.sqrt(noise_power[:, None, None, None] / 2.0)
+    noise = torch.where(valid_mask, noise, torch.zeros_like(noise))
+
+    realized_noise_energy = noise.abs().square().sum(dim=(1, 2, 3))
+    realized_noise_power = realized_noise_energy / valid_counts.to(
+        dtype=realized_noise_energy.dtype
+    )
+    actual_snr_db = 10.0 * torch.log10(signal_power / realized_noise_power)
+    noisy_h = h + noise
+    noisy_tokens = torch.cat([noisy_h.real, noisy_h.imag], dim=2).to(
+        dtype=tokens.dtype
+    )
+    return noisy_tokens, actual_snr_db
+
+
 def _valid_patch_mask(
     sample: PreprocessedSample,
     *,

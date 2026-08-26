@@ -50,6 +50,9 @@ from scripts.evaluate_signal_descriptions import (  # noqa: E402
 )
 from scripts.pretrain import deserialize_prototype_keys  # noqa: E402
 from scripts.qwen_csi_text_common import target_response  # noqa: E402
+from scripts.summarize_noise_robustness_by_model_seed import (  # noqa: E402
+    aggregate_by_model_seed,
+)
 
 
 PRIMARY_METRICS = (
@@ -694,8 +697,17 @@ def main() -> None:
         del checkpoint
 
     aggregate = aggregate_runs(runs)
+    model_seed_means, model_seed_summary = aggregate_by_model_seed(runs)
     write_csv(args.output_dir / "noise_robustness_runs.csv", runs)
     write_csv(args.output_dir / "noise_robustness_summary.csv", aggregate)
+    write_csv(
+        args.output_dir / "noise_robustness_model_seed_means.csv",
+        model_seed_means,
+    )
+    write_csv(
+        args.output_dir / "noise_robustness_model_seed_summary.csv",
+        model_seed_summary,
+    )
     manifest = {
         "method": (
             "Per-sample circular complex AWGN on unnormalized beamspace CSI; "
@@ -720,6 +732,8 @@ def main() -> None:
         "signal_description_correction": args.signal_description_correction,
         "runs": runs,
         "aggregate": aggregate,
+        "model_seed_means": model_seed_means,
+        "model_seed_summary": model_seed_summary,
     }
     (args.output_dir / "noise_robustness_results.json").write_text(
         json.dumps(json_safe(manifest), indent=2, ensure_ascii=False, allow_nan=False)

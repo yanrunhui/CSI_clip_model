@@ -122,6 +122,28 @@ ABLATIONS = (
         train_overrides=("--no-use-delay-specific-encoder",),
     ),
     AblationSpec(
+        name="no_power_branch",
+        purpose=(
+            "Disable the power-specific context branch while retaining the common "
+            "physics prediction heads and their supervision."
+        ),
+        train_overrides=("--disable-power-branch",),
+    ),
+    AblationSpec(
+        name="no_los_angle_context_encoder",
+        purpose=(
+            "Disable the beam-aware context encoder dedicated to LoS-angle prediction."
+        ),
+        train_overrides=("--no-use-los-angle-context-encoder",),
+    ),
+    AblationSpec(
+        name="no_first_path_angle_context_encoder",
+        purpose=(
+            "Disable the selector context encoder dedicated to first-path-angle prediction."
+        ),
+        train_overrides=("--no-use-first-path-angle-context-encoder",),
+    ),
+    AblationSpec(
         name="no_los_consistency",
         purpose="Verify LoS first-path-delay/LoS-delay consistency supervision.",
         train_overrides=(
@@ -137,6 +159,8 @@ ABLATIONS = (
             "--reflection-count-classifier-weight",
             "0",
             "--reflection-count-regression-weight",
+            "0",
+            "--reflection-path-count-regression-weight",
             "0",
             "--interaction-count-classifier-weight",
             "0",
@@ -165,9 +189,19 @@ ABLATION_GROUPS = {
         "full_multitask",
         "no_shared_physics_token",
         "no_delay_specific_encoder",
+        "no_power_branch",
+        "no_los_angle_context_encoder",
+        "no_first_path_angle_context_encoder",
         "no_los_consistency",
         "no_reflection_aux_head",
         "single_task_csi_encoder",
+    ),
+    "physical_branches": (
+        "no_power_branch",
+        "no_los_angle_context_encoder",
+        "no_first_path_angle_context_encoder",
+        "no_reflection_aux_head",
+        "no_los_consistency",
     ),
 }
 
@@ -550,7 +584,8 @@ def main() -> None:
         nargs="+",
         default=("all",),
         help=(
-            "Ablations to include, or a group: language, architecture, all. "
+            "Ablations to include, or a group: language, architecture, "
+            "physical_branches, all. "
             "Use --list to print names."
         ),
     )

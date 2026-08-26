@@ -6,6 +6,7 @@ import math
 import torch
 
 from data.dataset import PHYSICS_TARGET_NAMES, PHYSICS_TARGET_OFFSETS, PHYSICS_TARGET_SCALES
+from data.noise import add_complex_awgn_to_token_batch
 from data.semantic_key import (
     FIRST_POWER_DBW_BIN_LABELS,
     FIRST_POWER_DBW_BINS,
@@ -104,6 +105,15 @@ class TrainConfig:
     multipositive_distance_threshold: float = 0.25
     multipositive_positive_mode: str = "semantic_and_physics"
     min_class_size_for_multipositive: int = 2
+    noise_augmentation_enabled: bool = False
+    noise_augmentation_probability: float = 0.0
+    noise_snr_min_db: float = 10.0
+    noise_snr_max_db: float = 30.0
+    noise_augmented_main_weight: float = 0.0
+    noise_delay_consistency_weight: float = 0.0
+    noise_k_consistency_weight: float = 0.0
+    noise_clean_k_supervised_weight: float = 0.0
+    noise_noisy_k_supervised_weight: float = 0.0
 
 
 class Trainer:
@@ -1121,6 +1131,38 @@ class Trainer:
         final[:, first_path_power_idx] = physics_outputs["base"][:, first_path_power_idx]
         return final
 
+    def _noise_augmented_physics_outputs(
+        self,
+        batch: dict,
+        noisy_tokens: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Run the noisy CSI branch needed by delay/K robustness objectives."""
+        noisy_features = self.model.encode_csi(
+            noisy_tokens,
+            batch["beam_positions"],
+            batch["token_mask"],
+            batch["freq_bin"],
+            batch["bw_bin"],
+            batch["subcarrier_spacing"],
+            normalize=False,
+            config_features=batch.get("config_features"),
+            antenna_coordinates=batch.get("antenna_coordinates"),
+            antenna_mask=batch.get("antenna_mask"),
+        )
+        noisy_first_path_delay_context = self.model.encode_first_path_delay_context(
+            noisy_tokens,
+            batch["token_mask"],
+            beam_positions=batch.get("beam_positions"),
+            freq_bin=batch.get("freq_bin"),
+            bw_bin=batch.get("bw_bin"),
+            subcarrier_spacing=batch.get("subcarrier_spacing"),
+            config_features=batch.get("config_features"),
+        )
+        return self.model.predict_physics_components(
+            noisy_features,
+            first_path_delay_context=noisy_first_path_delay_context,
+        )
+
     def train_step(self, batch: dict, epoch: int, cfg: TrainConfig) -> dict[str, float]:
         batch = self._move_batch(batch)
         self.model.train()
@@ -1227,6 +1269,30 @@ class Trainer:
         effective_physics_relational_weight = (
             0.0 if warmup_active else cfg.physics_relational_weight
         )
+        noise_branch_weight = (
+            cfg.noise_augmented_main_weight
+            + cfg.noise_delay_consistency_weight
+            + cfg.noise_k_consistency_weight
+            + cfg.noise_noisy_k_supervised_weight
+        )
+        clean_k_supervision_active = (
+            not warmup_active
+            and cfg.noise_augmentation_enabled
+            and cfg.noise_clean_k_supervised_weight > 0.0
+        )
+        noise_objective_active = (
+            not warmup_active
+            and cfg.noise_augmentation_enabled
+            and cfg.noise_augmentation_probability > 0.0
+            and noise_branch_weight > 0.0
+        )
+        noise_augmentation_applied = bool(
+            noise_objective_active
+            and float(torch.rand((), device=self.device))
+            < cfg.noise_augmentation_probability
+        )
+        sampled_noise_snr_db = math.nan
+        actual_noise_snr_db = math.nan
         self.optimizer.zero_grad(set_to_none=True)
         csi_features_raw = self.model.encode_csi(
             batch["tokens"],
@@ -1357,6 +1423,8 @@ class Trainer:
             or effective_reflection_count_regression_weight > 0.0
             or effective_reflection_path_count_regression_weight > 0.0
             or effective_physics_relational_weight > 0.0
+            or clean_k_supervision_active
+            or noise_augmentation_applied
         ):
             power_context = None
             delay_context = None
@@ -1383,6 +1451,7 @@ class Trainer:
                     or effective_los_angle_weight > 0.0
                     or effective_first_path_angle_weight > 0.0
                     or effective_first_path_angle_nlos_weight > 0.0
+                    or noise_augmentation_applied
                 )
                 and hasattr(self.model, "encode_first_path_delay_context")
             ):
@@ -2884,6 +2953,144 @@ class Trainer:
                         nlos_angle_error.mean() * (180.0 / math.pi)
                     )
                     first_path_angle_nlos_count = first_path_angle_nlos_mask.sum()
+        if clean_k_supervision_active:
+            if physics_outputs is None:
+                raise RuntimeError(
+                    "Clean physics outputs are required for clean K-factor supervision."
+                )
+            clean_k_idx = PHYSICS_TARGET_NAMES.index("k_factor_db")
+            clean_k_mask = batch["physics_target_mask"][:, clean_k_idx].bool()
+            if bool(clean_k_mask.any()):
+                clean_k = physics_outputs["final"][:, clean_k_idx]
+                clean_k_target = batch["physics_targets"][:, clean_k_idx]
+                clean_k_beta = 1.0 / float(PHYSICS_TARGET_SCALES[clean_k_idx])
+                losses["loss_noise_clean_k_supervised"] = (
+                    torch.nn.functional.smooth_l1_loss(
+                        clean_k[clean_k_mask],
+                        clean_k_target[clean_k_mask],
+                        beta=clean_k_beta,
+                    )
+                )
+                clean_k_scale = float(PHYSICS_TARGET_SCALES[clean_k_idx])
+                losses["noise_clean_k_mae_db"] = (
+                    (clean_k[clean_k_mask] - clean_k_target[clean_k_mask])
+                    .abs()
+                    .mean()
+                    * clean_k_scale
+                )
+
+        if noise_augmentation_applied:
+            if physics_outputs is None:
+                raise RuntimeError(
+                    "Clean physics outputs are required for noise augmentation."
+                )
+            sampled_noise_snr_db = float(
+                torch.empty((), device=self.device).uniform_(
+                    cfg.noise_snr_min_db,
+                    cfg.noise_snr_max_db,
+                )
+            )
+            noisy_tokens, actual_snr = add_complex_awgn_to_token_batch(
+                batch["tokens"],
+                batch["token_mask"],
+                sampled_noise_snr_db,
+            )
+            actual_noise_snr_db = float(actual_snr.detach().mean())
+            noisy_physics_outputs = self._noise_augmented_physics_outputs(
+                batch,
+                noisy_tokens,
+            )
+
+            first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
+            k_factor_idx = PHYSICS_TARGET_NAMES.index("k_factor_db")
+            noisy_predictions = noisy_physics_outputs["final"].clone()
+            if cfg.first_path_power_gate_mode == "base":
+                noisy_predictions = self._apply_first_path_power_base(
+                    noisy_physics_outputs
+                )
+            noisy_predictions[:, first_delay_idx] = noisy_physics_outputs[
+                "first_path_delay_context"
+            ]
+            physics_mask = batch["physics_target_mask"].bool()
+            if bool(physics_mask.any()):
+                per_target_noisy_loss = torch.nn.functional.smooth_l1_loss(
+                    noisy_predictions,
+                    batch["physics_targets"],
+                    beta=0.05,
+                    reduction="none",
+                )
+                losses["loss_noise_augmented_main"] = per_target_noisy_loss[
+                    physics_mask
+                ].mean()
+
+            first_delay_mask = batch["physics_target_mask"][:, first_delay_idx].bool()
+            k_factor_mask = batch["physics_target_mask"][:, k_factor_idx].bool()
+
+            if bool(first_delay_mask.any()):
+                noisy_delay = noisy_physics_outputs["first_path_delay_context"]
+                clean_delay = physics_outputs["first_path_delay_context"]
+                delay_target = batch["physics_targets"][:, first_delay_idx]
+                delay_beta = max(
+                    cfg.first_path_delay_raw_beta_ns
+                    / float(PHYSICS_TARGET_SCALES[first_delay_idx]),
+                    1e-6,
+                )
+                noisy_delay_loss = torch.nn.functional.smooth_l1_loss(
+                    noisy_delay[first_delay_mask],
+                    delay_target[first_delay_mask],
+                    beta=delay_beta,
+                )
+                losses["loss_noise_delay_supervised"] = noisy_delay_loss
+                losses["loss_noise_delay_consistency"] = torch.nn.functional.l1_loss(
+                    noisy_delay[first_delay_mask],
+                    clean_delay.detach()[first_delay_mask],
+                )
+                delay_scale = float(PHYSICS_TARGET_SCALES[first_delay_idx])
+                losses["noise_delay_mae_ns"] = (
+                    (noisy_delay[first_delay_mask] - delay_target[first_delay_mask])
+                    .abs()
+                    .mean()
+                    * delay_scale
+                )
+                losses["noise_delay_consistency_mae_ns"] = (
+                    (
+                        noisy_delay[first_delay_mask]
+                        - clean_delay.detach()[first_delay_mask]
+                    )
+                    .abs()
+                    .mean()
+                    * delay_scale
+                )
+
+            if bool(k_factor_mask.any()):
+                noisy_k = noisy_physics_outputs["final"][:, k_factor_idx]
+                clean_k = physics_outputs["final"][:, k_factor_idx]
+                k_target = batch["physics_targets"][:, k_factor_idx]
+                k_beta = 1.0 / float(PHYSICS_TARGET_SCALES[k_factor_idx])
+                noisy_k_loss = torch.nn.functional.smooth_l1_loss(
+                    noisy_k[k_factor_mask],
+                    k_target[k_factor_mask],
+                    beta=k_beta,
+                )
+                losses["loss_noise_k_supervised"] = noisy_k_loss
+                losses["loss_noise_k_consistency"] = torch.nn.functional.l1_loss(
+                    noisy_k[k_factor_mask],
+                    clean_k.detach()[k_factor_mask],
+                )
+                k_scale = float(PHYSICS_TARGET_SCALES[k_factor_idx])
+                losses["noise_k_mae_db"] = (
+                    (noisy_k[k_factor_mask] - k_target[k_factor_mask])
+                    .abs()
+                    .mean()
+                    * k_scale
+                )
+                losses["noise_k_consistency_mae_db"] = (
+                    (noisy_k[k_factor_mask] - clean_k.detach()[k_factor_mask])
+                    .abs()
+                    .mean()
+                    * k_scale
+                )
+
         if physics_outputs is not None and effective_physics_relational_weight > 0.0:
             losses.update(self._physics_relational_losses(physics_outputs, batch))
         alignment_loss = (
@@ -2923,7 +3130,12 @@ class Trainer:
             effective_los_delay_consistency_weight * losses.get("loss_los_delay_consistency", torch.zeros((), device=self.device)) +
             effective_los_angle_weight * losses.get("loss_los_angle", torch.zeros((), device=self.device)) +
             effective_first_path_angle_weight * losses.get("loss_first_path_angle", torch.zeros((), device=self.device)) +
-            effective_first_path_angle_nlos_weight * losses.get("loss_first_path_angle_nlos", torch.zeros((), device=self.device))
+            effective_first_path_angle_nlos_weight * losses.get("loss_first_path_angle_nlos", torch.zeros((), device=self.device)) +
+            cfg.noise_augmented_main_weight * losses.get("loss_noise_augmented_main", torch.zeros((), device=self.device)) +
+            cfg.noise_delay_consistency_weight * losses.get("loss_noise_delay_consistency", torch.zeros((), device=self.device)) +
+            cfg.noise_k_consistency_weight * losses.get("loss_noise_k_consistency", torch.zeros((), device=self.device)) +
+            cfg.noise_clean_k_supervised_weight * losses.get("loss_noise_clean_k_supervised", torch.zeros((), device=self.device)) +
+            cfg.noise_noisy_k_supervised_weight * losses.get("loss_noise_k_supervised", torch.zeros((), device=self.device))
         )
         total_loss.backward()
         grad_metrics = {
@@ -3367,6 +3579,9 @@ class Trainer:
                     ).detach().float().mean()
                 )
         metrics["prototype_warmup_active"] = float(warmup_active)
+        metrics["noise_augmentation_applied"] = float(noise_augmentation_applied)
+        metrics["noise_sampled_snr_db"] = sampled_noise_snr_db
+        metrics["noise_actual_snr_db"] = actual_noise_snr_db
         metrics["prototype_warmup_epochs"] = float(cfg.prototype_warmup_epochs)
         metrics["min_class_size_for_multipositive"] = float(cfg.min_class_size_for_multipositive)
         metrics["batch_label_unique_classes"] = float((label_histogram > 0).sum().item())
