@@ -1327,6 +1327,8 @@ def run_smoke_test(
     noise_snr_max_db: float = 30.0,
     noise_augmented_main_weight: float = 0.0,
     noise_delay_consistency_weight: float = 0.0,
+    noise_delay_spread_supervised_weight: float = 0.0,
+    noise_delay_spread_consistency_weight: float = 0.0,
     noise_k_consistency_weight: float = 0.0,
     noise_clean_k_supervised_weight: float = 0.0,
     noise_noisy_k_supervised_weight: float = 0.0,
@@ -1460,6 +1462,8 @@ def run_smoke_test(
                     noise_snr_max_db=noise_snr_max_db,
                     noise_augmented_main_weight=noise_augmented_main_weight,
                     noise_delay_consistency_weight=noise_delay_consistency_weight,
+                    noise_delay_spread_supervised_weight=noise_delay_spread_supervised_weight,
+                    noise_delay_spread_consistency_weight=noise_delay_spread_consistency_weight,
                     noise_k_consistency_weight=noise_k_consistency_weight,
                     noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
                     noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
@@ -1572,6 +1576,8 @@ def run_real_pretrain(
     noise_snr_max_db: float,
     noise_augmented_main_weight: float,
     noise_delay_consistency_weight: float,
+    noise_delay_spread_supervised_weight: float,
+    noise_delay_spread_consistency_weight: float,
     noise_k_consistency_weight: float,
     noise_clean_k_supervised_weight: float,
     noise_noisy_k_supervised_weight: float,
@@ -1746,6 +1752,8 @@ def run_real_pretrain(
         noise_snr_max_db=noise_snr_max_db,
         noise_augmented_main_weight=noise_augmented_main_weight,
         noise_delay_consistency_weight=noise_delay_consistency_weight,
+        noise_delay_spread_supervised_weight=noise_delay_spread_supervised_weight,
+        noise_delay_spread_consistency_weight=noise_delay_spread_consistency_weight,
         noise_k_consistency_weight=noise_k_consistency_weight,
         noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
         noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
@@ -1860,6 +1868,8 @@ def run_real_pretrain(
         f"noise_snr_db=[{noise_snr_min_db},{noise_snr_max_db}] "
         f"noise_augmented_main_weight={noise_augmented_main_weight} "
         f"noise_delay_consistency_weight={noise_delay_consistency_weight} "
+        f"noise_delay_spread_supervised_weight={noise_delay_spread_supervised_weight} "
+        f"noise_delay_spread_consistency_weight={noise_delay_spread_consistency_weight} "
         f"noise_k_consistency_weight={noise_k_consistency_weight} "
         f"noise_clean_k_supervised_weight={noise_clean_k_supervised_weight} "
         f"noise_noisy_k_supervised_weight={noise_noisy_k_supervised_weight} "
@@ -2327,13 +2337,25 @@ def run_real_pretrain(
         mean_noise_actual_snr_db = mean_noise_metric("noise_actual_snr_db")
         mean_noise_augmented_main = mean_noise_metric("loss_noise_augmented_main")
         mean_noise_delay_supervised = mean_noise_metric("loss_noise_delay_supervised")
+        mean_noise_delay_spread_supervised = mean_noise_metric(
+            "loss_noise_delay_spread_supervised"
+        )
         mean_noise_k_supervised = mean_noise_metric("loss_noise_k_supervised")
         mean_noise_delay_consistency = mean_noise_metric("loss_noise_delay_consistency")
+        mean_noise_delay_spread_consistency = mean_noise_metric(
+            "loss_noise_delay_spread_consistency"
+        )
         mean_noise_k_consistency = mean_noise_metric("loss_noise_k_consistency")
         mean_noise_delay_mae_ns = mean_noise_metric("noise_delay_mae_ns")
+        mean_noise_delay_spread_mae_ns = mean_noise_metric(
+            "noise_delay_spread_mae_ns"
+        )
         mean_noise_k_mae_db = mean_noise_metric("noise_k_mae_db")
         mean_noise_delay_consistency_mae_ns = mean_noise_metric(
             "noise_delay_consistency_mae_ns"
+        )
+        mean_noise_delay_spread_consistency_mae_ns = mean_noise_metric(
+            "noise_delay_spread_consistency_mae_ns"
         )
         mean_noise_k_consistency_mae_db = mean_noise_metric(
             "noise_k_consistency_mae_db"
@@ -2394,6 +2416,7 @@ def run_real_pretrain(
             f"noise_snr={mean_noise_actual_snr_db:.2f}dB "
             f"clean_k_mae={mean_noise_clean_k_mae_db:.2f}dB "
             f"noise_delay_mae={mean_noise_delay_mae_ns:.2f}ns "
+            f"noise_delay_spread_mae={mean_noise_delay_spread_mae_ns:.2f}ns "
             f"noise_k_mae={mean_noise_k_mae_db:.2f}dB "
             f"aux={mean_aux_regression:.4f} grad_csi={mean_grad_csi_encoder:.2e} "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
@@ -2412,12 +2435,16 @@ def run_real_pretrain(
                         "noise_clean_k_mae_db": mean_noise_clean_k_mae_db,
                         "loss_noise_augmented_main": mean_noise_augmented_main,
                         "loss_noise_delay_supervised": mean_noise_delay_supervised,
+                        "loss_noise_delay_spread_supervised": mean_noise_delay_spread_supervised,
                         "loss_noise_k_supervised": mean_noise_k_supervised,
                         "loss_noise_delay_consistency": mean_noise_delay_consistency,
+                        "loss_noise_delay_spread_consistency": mean_noise_delay_spread_consistency,
                         "loss_noise_k_consistency": mean_noise_k_consistency,
                         "noise_delay_mae_ns": mean_noise_delay_mae_ns,
+                        "noise_delay_spread_mae_ns": mean_noise_delay_spread_mae_ns,
                         "noise_k_mae_db": mean_noise_k_mae_db,
                         "noise_delay_consistency_mae_ns": mean_noise_delay_consistency_mae_ns,
+                        "noise_delay_spread_consistency_mae_ns": mean_noise_delay_spread_consistency_mae_ns,
                         "noise_k_consistency_mae_db": mean_noise_k_consistency_mae_db,
                         "contrastive_loss": mean_contrastive,
                         "checkpoint": checkpoint_path,
@@ -2550,6 +2577,8 @@ def run_real_pretrain(
                         "noise_snr_max_db": noise_snr_max_db,
                         "noise_augmented_main_weight": noise_augmented_main_weight,
                         "noise_delay_consistency_weight": noise_delay_consistency_weight,
+                        "noise_delay_spread_supervised_weight": noise_delay_spread_supervised_weight,
+                        "noise_delay_spread_consistency_weight": noise_delay_spread_consistency_weight,
                         "noise_k_consistency_weight": noise_k_consistency_weight,
                         "noise_clean_k_supervised_weight": noise_clean_k_supervised_weight,
                         "noise_noisy_k_supervised_weight": noise_noisy_k_supervised_weight,
@@ -2716,6 +2745,8 @@ def run_real_pretrain(
                     "noise_snr_max_db": noise_snr_max_db,
                     "noise_augmented_main_weight": noise_augmented_main_weight,
                     "noise_delay_consistency_weight": noise_delay_consistency_weight,
+                    "noise_delay_spread_supervised_weight": noise_delay_spread_supervised_weight,
+                    "noise_delay_spread_consistency_weight": noise_delay_spread_consistency_weight,
                     "noise_k_consistency_weight": noise_k_consistency_weight,
                     "noise_clean_k_supervised_weight": noise_clean_k_supervised_weight,
                     "noise_noisy_k_supervised_weight": noise_noisy_k_supervised_weight,
@@ -3415,12 +3446,22 @@ def main() -> None:
     parser.add_argument(
         "--noise-augmented-main-weight",
         type=float,
-        help="Weight for noisy first-delay and K-factor supervised loss.",
+        help="Weight for the masked multi-target physics loss on noisy CSI.",
     )
     parser.add_argument(
         "--noise-delay-consistency-weight",
         type=float,
         help="Weight for clean/noisy first-delay prediction consistency.",
+    )
+    parser.add_argument(
+        "--noise-delay-spread-supervised-weight",
+        type=float,
+        help="Weight for supervised delay-spread loss on noisy CSI.",
+    )
+    parser.add_argument(
+        "--noise-delay-spread-consistency-weight",
+        type=float,
+        help="Weight for clean/noisy delay-spread prediction consistency.",
     )
     parser.add_argument(
         "--noise-k-consistency-weight",
@@ -4013,6 +4054,20 @@ def main() -> None:
         if args.noise_delay_consistency_weight is not None
         else float(cfg_get(train_cfg, "noise_delay_consistency_weight", 0.0))
     )
+    noise_delay_spread_supervised_weight = (
+        args.noise_delay_spread_supervised_weight
+        if args.noise_delay_spread_supervised_weight is not None
+        else float(
+            cfg_get(train_cfg, "noise_delay_spread_supervised_weight", 0.0)
+        )
+    )
+    noise_delay_spread_consistency_weight = (
+        args.noise_delay_spread_consistency_weight
+        if args.noise_delay_spread_consistency_weight is not None
+        else float(
+            cfg_get(train_cfg, "noise_delay_spread_consistency_weight", 0.0)
+        )
+    )
     noise_k_consistency_weight = (
         args.noise_k_consistency_weight
         if args.noise_k_consistency_weight is not None
@@ -4040,6 +4095,8 @@ def main() -> None:
     if min(
         noise_augmented_main_weight,
         noise_delay_consistency_weight,
+        noise_delay_spread_supervised_weight,
+        noise_delay_spread_consistency_weight,
         noise_k_consistency_weight,
         noise_clean_k_supervised_weight,
         noise_noisy_k_supervised_weight,
@@ -4180,6 +4237,8 @@ def main() -> None:
             noise_snr_max_db=noise_snr_max_db,
             noise_augmented_main_weight=noise_augmented_main_weight,
             noise_delay_consistency_weight=noise_delay_consistency_weight,
+            noise_delay_spread_supervised_weight=noise_delay_spread_supervised_weight,
+            noise_delay_spread_consistency_weight=noise_delay_spread_consistency_weight,
             noise_k_consistency_weight=noise_k_consistency_weight,
             noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
             noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
@@ -4299,6 +4358,8 @@ def main() -> None:
             noise_snr_max_db=noise_snr_max_db,
             noise_augmented_main_weight=noise_augmented_main_weight,
             noise_delay_consistency_weight=noise_delay_consistency_weight,
+            noise_delay_spread_supervised_weight=noise_delay_spread_supervised_weight,
+            noise_delay_spread_consistency_weight=noise_delay_spread_consistency_weight,
             noise_k_consistency_weight=noise_k_consistency_weight,
             noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
             noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,

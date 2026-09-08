@@ -111,6 +111,8 @@ class TrainConfig:
     noise_snr_max_db: float = 30.0
     noise_augmented_main_weight: float = 0.0
     noise_delay_consistency_weight: float = 0.0
+    noise_delay_spread_supervised_weight: float = 0.0
+    noise_delay_spread_consistency_weight: float = 0.0
     noise_k_consistency_weight: float = 0.0
     noise_clean_k_supervised_weight: float = 0.0
     noise_noisy_k_supervised_weight: float = 0.0
@@ -1149,6 +1151,12 @@ class Trainer:
             antenna_coordinates=batch.get("antenna_coordinates"),
             antenna_mask=batch.get("antenna_mask"),
         )
+        noisy_delay_context = self.model.encode_csi_delay_context(
+            noisy_tokens,
+            batch["token_mask"],
+            subcarrier_spacing=batch.get("subcarrier_spacing"),
+            config_features=batch.get("config_features"),
+        )
         noisy_first_path_delay_context = self.model.encode_first_path_delay_context(
             noisy_tokens,
             batch["token_mask"],
@@ -1160,6 +1168,7 @@ class Trainer:
         )
         return self.model.predict_physics_components(
             noisy_features,
+            delay_context=noisy_delay_context,
             first_path_delay_context=noisy_first_path_delay_context,
         )
 
@@ -1272,6 +1281,8 @@ class Trainer:
         noise_branch_weight = (
             cfg.noise_augmented_main_weight
             + cfg.noise_delay_consistency_weight
+            + cfg.noise_delay_spread_supervised_weight
+            + cfg.noise_delay_spread_consistency_weight
             + cfg.noise_k_consistency_weight
             + cfg.noise_noisy_k_supervised_weight
         )
@@ -2429,6 +2440,7 @@ class Trainer:
             physics_outputs is not None
             and effective_first_path_delay_weight > 0.0
         ):
+            delay_spread_idx = PHYSICS_TARGET_NAMES.index("delay_spread_ns")
             first_delay_idx = PHYSICS_TARGET_NAMES.index("first_path_delay_ns")
             first_delay_prediction = physics_outputs["first_path_delay_context"]
             first_delay_target = batch["physics_targets"][:, first_delay_idx]
@@ -3023,8 +3035,54 @@ class Trainer:
                     physics_mask
                 ].mean()
 
+            delay_spread_mask = batch["physics_target_mask"][:, delay_spread_idx].bool()
             first_delay_mask = batch["physics_target_mask"][:, first_delay_idx].bool()
             k_factor_mask = batch["physics_target_mask"][:, k_factor_idx].bool()
+
+            if bool(delay_spread_mask.any()):
+                noisy_delay_spread = noisy_physics_outputs["final"][
+                    :, delay_spread_idx
+                ]
+                clean_delay_spread = physics_outputs["final"][:, delay_spread_idx]
+                delay_spread_target = batch["physics_targets"][:, delay_spread_idx]
+                delay_spread_scale = float(
+                    PHYSICS_TARGET_SCALES[delay_spread_idx]
+                )
+                delay_spread_beta = max(
+                    cfg.delay_spread_raw_beta_ns / delay_spread_scale,
+                    1e-6,
+                )
+                losses["loss_noise_delay_spread_supervised"] = (
+                    torch.nn.functional.smooth_l1_loss(
+                        noisy_delay_spread[delay_spread_mask],
+                        delay_spread_target[delay_spread_mask],
+                        beta=delay_spread_beta,
+                    )
+                )
+                losses["loss_noise_delay_spread_consistency"] = (
+                    torch.nn.functional.l1_loss(
+                        noisy_delay_spread[delay_spread_mask],
+                        clean_delay_spread.detach()[delay_spread_mask],
+                    )
+                )
+                losses["noise_delay_spread_mae_ns"] = (
+                    (
+                        noisy_delay_spread[delay_spread_mask]
+                        - delay_spread_target[delay_spread_mask]
+                    )
+                    .abs()
+                    .mean()
+                    * delay_spread_scale
+                )
+                losses["noise_delay_spread_consistency_mae_ns"] = (
+                    (
+                        noisy_delay_spread[delay_spread_mask]
+                        - clean_delay_spread.detach()[delay_spread_mask]
+                    )
+                    .abs()
+                    .mean()
+                    * delay_spread_scale
+                )
 
             if bool(first_delay_mask.any()):
                 noisy_delay = noisy_physics_outputs["first_path_delay_context"]
@@ -3133,6 +3191,8 @@ class Trainer:
             effective_first_path_angle_nlos_weight * losses.get("loss_first_path_angle_nlos", torch.zeros((), device=self.device)) +
             cfg.noise_augmented_main_weight * losses.get("loss_noise_augmented_main", torch.zeros((), device=self.device)) +
             cfg.noise_delay_consistency_weight * losses.get("loss_noise_delay_consistency", torch.zeros((), device=self.device)) +
+            cfg.noise_delay_spread_supervised_weight * losses.get("loss_noise_delay_spread_supervised", torch.zeros((), device=self.device)) +
+            cfg.noise_delay_spread_consistency_weight * losses.get("loss_noise_delay_spread_consistency", torch.zeros((), device=self.device)) +
             cfg.noise_k_consistency_weight * losses.get("loss_noise_k_consistency", torch.zeros((), device=self.device)) +
             cfg.noise_clean_k_supervised_weight * losses.get("loss_noise_clean_k_supervised", torch.zeros((), device=self.device)) +
             cfg.noise_noisy_k_supervised_weight * losses.get("loss_noise_k_supervised", torch.zeros((), device=self.device))
