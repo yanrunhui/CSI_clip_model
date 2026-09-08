@@ -83,6 +83,67 @@ def split_random_stratified(
     return train, test
 
 
+def subsample_stratified(
+    indices: Sequence[int],
+    statuses: Sequence[str],
+    target_count: int | None,
+    seed: int,
+) -> list[int]:
+    """Select an exact-size subset while approximately preserving LoS/NLoS ratio."""
+    selected = list(indices)
+    if target_count is None or target_count == len(selected):
+        return selected
+    if target_count <= 0:
+        raise ValueError("Requested subset count must be positive.")
+    if target_count > len(selected):
+        raise ValueError(
+            f"Requested {target_count} samples from a pool containing only {len(selected)}."
+        )
+
+    by_status: dict[str, list[int]] = defaultdict(list)
+    for index in selected:
+        by_status[statuses[index]].append(index)
+    exact = {
+        status: target_count * len(status_indices) / len(selected)
+        for status, status_indices in by_status.items()
+    }
+    allocations = {
+        status: min(int(math.floor(exact[status])), len(status_indices))
+        for status, status_indices in by_status.items()
+    }
+    remaining = target_count - sum(allocations.values())
+    allocation_order = sorted(
+        by_status,
+        key=lambda status: (
+            exact[status] - allocations[status],
+            len(by_status[status]) - allocations[status],
+            status,
+        ),
+        reverse=True,
+    )
+    while remaining:
+        progressed = False
+        for status in allocation_order:
+            if allocations[status] >= len(by_status[status]):
+                continue
+            allocations[status] += 1
+            remaining -= 1
+            progressed = True
+            if not remaining:
+                break
+        if not progressed:
+            raise RuntimeError("Unable to allocate the requested stratified subset.")
+
+    rng = random.Random(seed)
+    result: list[int] = []
+    for status in sorted(by_status):
+        status_indices = by_status[status][:]
+        rng.shuffle(status_indices)
+        result.extend(status_indices[: allocations[status]])
+    rng.shuffle(result)
+    return result
+
+
 def _choose_groups_near_target(
     group_counts: dict[tuple, int], test_fraction: float, seed: int
 ) -> set[tuple]:
@@ -184,14 +245,41 @@ def split_by_groups(
         groups_by_map: dict[int, dict[tuple, int]] = defaultdict(dict)
         for key, indices in grouped.items():
             groups_by_map[int(key[0])][key] = len(indices)
+        single_block_groups: list[tuple] = []
         for map_id, counts in sorted(groups_by_map.items()):
             if len(counts) < 2:
-                raise ValueError(
-                    f"Map {map_id} has only one spatial block; decrease --block-size-m."
-                )
+                single_block_groups.extend(counts)
+                continue
             test_groups.update(
                 _choose_groups_near_target(counts, test_fraction, seed + 10_007 * map_id)
             )
+        if single_block_groups:
+            # A one-block map cannot appear on both sides without spatial leakage.
+            # Assign each such block wholly to the side that best preserves the
+            # requested global test fraction.
+            rng = random.Random(seed + 97_531)
+            rng.shuffle(single_block_groups)
+            target_test_count = len(group_keys) * test_fraction
+            current_test_count = sum(len(grouped[key]) for key in test_groups)
+            for key in single_block_groups:
+                candidate_count = current_test_count + len(grouped[key])
+                if abs(candidate_count - target_test_count) < abs(
+                    current_test_count - target_test_count
+                ):
+                    test_groups.add(key)
+                    current_test_count = candidate_count
+            print(
+                f"single_block_maps={len(single_block_groups)} "
+                f"single_blocks_assigned_to_test={sum(key in test_groups for key in single_block_groups)} "
+                "policy=whole_block_global_balance",
+                flush=True,
+            )
+        if not test_groups:
+            smallest = min(grouped, key=lambda key: len(grouped[key]))
+            test_groups.add(smallest)
+        if len(test_groups) == len(grouped):
+            largest = max(test_groups, key=lambda key: len(grouped[key]))
+            test_groups.remove(largest)
     else:
         if strata is None:
             counts = {key: len(indices) for key, indices in grouped.items()}
@@ -329,10 +417,15 @@ def summarize_split(
     parsed_ids: Sequence[tuple[int, int, int]],
     coordinates: Sequence[tuple[float, float, float]],
     block_keys: Sequence[tuple[int, int, int]],
+    require_complete_partition: bool = True,
 ) -> dict:
     train_set = set(train)
     test_set = set(test)
-    if train_set & test_set or train_set | test_set != set(range(len(group_ids))):
+    if train_set & test_set:
+        raise ValueError(f"{name} train/test selections overlap.")
+    if not train_set | test_set <= set(range(len(group_ids))):
+        raise ValueError(f"{name} contains an out-of-range sample index.")
+    if require_complete_partition and train_set | test_set != set(range(len(group_ids))):
         raise ValueError(f"{name} does not form an exact, disjoint partition.")
     train_statuses = Counter(statuses[index] for index in train)
     test_statuses = Counter(statuses[index] for index in test)
@@ -342,7 +435,8 @@ def summarize_split(
     summary = {
         "train_count": len(train),
         "test_count": len(test),
-        "test_fraction": len(test) / len(group_ids),
+        "test_fraction": len(test) / max(len(train) + len(test), 1),
+        "unused_candidate_count": len(group_ids) - len(train) - len(test),
         "train_los_count": train_statuses["los"],
         "train_nlos_count": train_statuses["nlos"],
         "test_los_count": test_statuses["los"],
@@ -398,6 +492,23 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=23_421)
     parser.add_argument("--block-size-m", type=float, default=32.0)
     parser.add_argument(
+        "--candidate-samples",
+        type=int,
+        help=(
+            "LoS/NLoS-stratified candidate pool selected before coordinate loading. "
+            "Use more than train-samples + test-samples to leave room for whole-block assignment."
+        ),
+    )
+    parser.add_argument("--train-samples", type=int, help="Exact saved train size per split.")
+    parser.add_argument("--test-samples", type=int, help="Exact saved test size per split.")
+    parser.add_argument(
+        "--split-types",
+        nargs="+",
+        choices=("random", "spatial_block", "scenario_disjoint"),
+        default=("random", "spatial_block", "scenario_disjoint"),
+        help="Only calculate and save the requested split types.",
+    )
+    parser.add_argument(
         "--manifest-only",
         action="store_true",
         help="Write group-ID memberships and diagnostics without duplicating the large .pt payload.",
@@ -412,11 +523,32 @@ def main() -> None:
         raise ValueError("--test-fraction must be between zero and one.")
     if args.block_size_m <= 0.0:
         raise ValueError("--block-size-m must be positive.")
+    if args.candidate_samples is not None and args.candidate_samples <= 0:
+        raise ValueError("--candidate-samples must be positive.")
+    if args.train_samples is not None and args.train_samples <= 0:
+        raise ValueError("--train-samples must be positive.")
+    if args.test_samples is not None and args.test_samples <= 0:
+        raise ValueError("--test-samples must be positive.")
+    requested_total = (args.train_samples or 0) + (args.test_samples or 0)
+    if args.candidate_samples is not None and requested_total > args.candidate_samples:
+        raise ValueError(
+            "--candidate-samples must be at least --train-samples + --test-samples."
+        )
 
     print(f"loading_input={args.input} mmap=true", flush=True)
-    samples = torch.load(args.input, map_location="cpu", weights_only=False, mmap=True)
-    if not isinstance(samples, list) or len(samples) < 2:
+    all_samples = torch.load(args.input, map_location="cpu", weights_only=False, mmap=True)
+    if not isinstance(all_samples, list) or len(all_samples) < 2:
         raise ValueError(f"Expected a sample list with at least two entries in {args.input}.")
+    original_input_count = len(all_samples)
+    all_statuses = [los_status(sample) for sample in all_samples]
+    candidate_indices = subsample_stratified(
+        range(original_input_count),
+        all_statuses,
+        args.candidate_samples,
+        args.seed - 1,
+    )
+    samples = [all_samples[index] for index in candidate_indices]
+    del all_samples
     group_ids = [str(getattr(sample, "group_id", "")).strip() for sample in samples]
     if any(not group_id for group_id in group_ids):
         raise ValueError("The input contains a sample without group_id.")
@@ -433,30 +565,41 @@ def main() -> None:
 
     coordinates = load_coordinates(args.d2los_root, parsed_ids)
     block_keys = spatial_block_keys(parsed_ids, coordinates, args.block_size_m)
-    random_train, random_test = split_random_stratified(
-        statuses, args.test_fraction, args.seed
-    )
-    spatial_train, spatial_test = split_by_groups(
-        block_keys, args.test_fraction, args.seed + 100, per_map=True
-    )
-    scenario_keys = [(map_id,) for map_id, _, _ in parsed_ids]
-    scenario_train, scenario_test = split_by_groups(
-        scenario_keys,
-        args.test_fraction,
-        args.seed + 200,
-        per_map=False,
-        strata=statuses,
-    )
-    splits = {
-        "random": (random_train, random_test),
-        "spatial_block": (spatial_train, spatial_test),
-        "scenario_disjoint": (scenario_train, scenario_test),
-    }
+    splits = {}
+    if "random" in args.split_types:
+        splits["random"] = split_random_stratified(
+            statuses, args.test_fraction, args.seed
+        )
+    if "spatial_block" in args.split_types:
+        splits["spatial_block"] = split_by_groups(
+            block_keys, args.test_fraction, args.seed + 100, per_map=True
+        )
+    if "scenario_disjoint" in args.split_types:
+        scenario_keys = [(map_id,) for map_id, _, _ in parsed_ids]
+        splits["scenario_disjoint"] = split_by_groups(
+            scenario_keys,
+            args.test_fraction,
+            args.seed + 200,
+            per_map=False,
+            strata=statuses,
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summaries = {}
     outputs = {}
     for name, (train, test) in splits.items():
+        train = subsample_stratified(
+            train,
+            statuses,
+            args.train_samples,
+            args.seed + 1_000 + sum(map(ord, name)),
+        )
+        test = subsample_stratified(
+            test,
+            statuses,
+            args.test_samples,
+            args.seed + 2_000 + sum(map(ord, name)),
+        )
         write_id_file(args.output_dir / f"{name}_train_group_ids.txt", train, group_ids)
         write_id_file(args.output_dir / f"{name}_test_group_ids.txt", test, group_ids)
         summaries[name] = summarize_split(
@@ -468,6 +611,9 @@ def main() -> None:
             parsed_ids,
             coordinates,
             block_keys,
+            require_complete_partition=(
+                args.train_samples is None and args.test_samples is None
+            ),
         )
         if not args.manifest_only:
             outputs[name] = save_split_samples(
@@ -477,7 +623,12 @@ def main() -> None:
     manifest = {
         "input": str(args.input),
         "d2los_root": str(args.d2los_root),
-        "input_count": len(samples),
+        "input_count": original_input_count,
+        "candidate_count": len(samples),
+        "candidate_samples_requested": args.candidate_samples,
+        "train_samples_requested": args.train_samples,
+        "test_samples_requested": args.test_samples,
+        "split_types": list(args.split_types),
         "seed": args.seed,
         "requested_test_fraction": args.test_fraction,
         "spatial_block_size_m": args.block_size_m,
@@ -485,7 +636,8 @@ def main() -> None:
             "random": "LoS/NLoS-stratified sample-level random split.",
             "spatial_block": (
                 "Whole (map, floor(x/block_size), floor(y/block_size)) receiver blocks "
-                "are assigned to one side only; every map contributes train and test blocks."
+                "are assigned to one side only. Multi-block maps contribute both sides; "
+                "a map represented by one block is assigned wholly to one side."
             ),
             "scenario_disjoint": (
                 "Whole maps are assigned to one side only; map selection jointly "

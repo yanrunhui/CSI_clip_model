@@ -1,0 +1,68 @@
+train:
+  data_path: artifacts/d2los_siso_1x1_bw100m_nf128_splits/spatial_block_train.pt
+  output_dir: artifacts/pretrain_d2los_siso_1x1_bw100m_nf128
+  save_every: 10
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  epochs: 100
+  temperature: 0.07
+  token_norm_mode: std
+
+  # Native SISO samples contain [1, 2, 128] tokens.  No virtual antenna is added.
+  use_power_branch: true
+  use_array_invariant_delay_encoder: true
+  use_delay_specific_encoder: false
+  use_continuous_config_encoding: true
+  array_token_dropout: 0.0
+  array_token_min_tokens: 1
+
+  # A single antenna has no observable spatial-angle information.
+  use_los_angle_context_encoder: false
+  use_first_path_angle_context_encoder: false
+  los_angle_weight: 0.0
+  first_path_angle_weight: 0.0
+  first_path_angle_nlos_weight: 0.0
+
+  # SISO mode removes ray-count, angular, and interaction fields from semantics.
+  semantic_key_mode: siso
+  csi_to_text_weight: 1.0
+  prototype_weight: 1.0
+  text_prototype_weight: 1.0
+  text_mode: prototype
+  prototype_warmup_epochs: 0
+  freeze_text_prototypes: true
+  semantic_classifier_weight: 0.5
+  semantic_classifier_class_weight: none
+  semantic_classifier_logit_adjustment: 0.0
+  attribute_classifier_weight: 0.0
+  attribute_classifier_fields: []
+
+  # Only SISO-observable frequency/power targets are supervised.
+  aux_regression_weight: 0.005
+  aux_regression_targets:
+    - delay_spread_ns
+    - k_factor_db
+    - first_path_delay_ns
+    - first_path_power_dbw
+  delay_spread_weight: 0.05
+  delay_spread_raw_weight: 0.0005
+  delay_spread_raw_beta_ns: 20.0
+  first_path_delay_weight: 0.08
+  first_path_delay_raw_weight: 0.001
+  first_path_delay_fused_raw_weight: 0.02
+  first_path_delay_raw_beta_ns: 20.0
+  first_path_power_bin_classifier_weight: 0.03
+  first_path_power_bin_position_weight: 0.1
+
+  # Interaction counts remain stored as simulation metadata but are never targets.
+  reflection_count_classifier_weight: 0.0
+  reflection_count_regression_weight: 0.0
+  reflection_path_count_regression_weight: 0.0
+  interaction_count_classifier_weight: 0.0
+  interaction_count_regression_weight: 0.0
+
+  warmup_epochs: 5
+  min_lr: 1.0e-5
+  min_class_size: 5
+  min_class_size_for_multipositive: 2

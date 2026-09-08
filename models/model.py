@@ -195,10 +195,11 @@ class PDPLatentAuxEncoder(nn.Module):
         latent_dim: int = 16,
         token_norm_mode: str = "std",
         hidden_dim: int = 256,
+        d_token: int = 8,
     ):
         super().__init__()
         self.csi = CSIEncoder(
-            d_token=8,
+            d_token=d_token,
             d_model=384,
             d_clip=256,
             token_norm_mode=token_norm_mode,
@@ -236,10 +237,11 @@ class CSIAngleContextEncoder(nn.Module):
         out_dim: int = CSI_DELAY_CONTEXT_DIM,
         token_norm_mode: str = "std",
         hidden_dim: int = 256,
+        d_token: int = 8,
     ):
         super().__init__()
         self.csi = CSIEncoder(
-            d_token=8,
+            d_token=d_token,
             d_model=384,
             d_clip=256,
             token_norm_mode=token_norm_mode,
@@ -532,13 +534,14 @@ class CSIDelaySpecificEncoder(nn.Module):
         hidden_dim: int = 96,
         eps: float = 1e-6,
         continuous_spacing_encoding: bool = False,
+        d_token: int = 8,
     ):
         super().__init__()
         self.eps = eps
         self.continuous_spacing_encoding = bool(continuous_spacing_encoding)
-        self.input_norm = nn.LayerNorm(8)
+        self.input_norm = nn.LayerNorm(d_token)
         self.initial_conv = nn.Sequential(
-            nn.Conv1d(8, hidden_dim, kernel_size=3, padding=1),
+            nn.Conv1d(d_token, hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
             nn.GELU(),
@@ -880,6 +883,7 @@ class CSIClip(nn.Module):
                 nn.init.zeros_(final_linear.weight)
                 nn.init.zeros_(final_linear.bias)
         self.power_feature_encoder = PowerFeatureEncoder()
+        d_token = int(csi_encoder.input_proj.spatial_linear.in_features)
         continuous_spacing_encoding = bool(
             getattr(csi_encoder, "use_continuous_config_encoding", False)
         )
@@ -889,15 +893,20 @@ class CSIClip(nn.Module):
         elif use_delay_specific_encoder:
             self.csi_delay_context_encoder = CSIDelaySpecificEncoder(
                 continuous_spacing_encoding=continuous_spacing_encoding,
+                d_token=d_token,
             )
             self.first_path_delay_context_encoder = CSIDelaySpecificEncoder(
                 continuous_spacing_encoding=continuous_spacing_encoding,
+                d_token=d_token,
             )
         else:
             self.csi_delay_context_encoder = CSIDelayContextEncoder()
             self.first_path_delay_context_encoder = CSIDelayContextEncoder()
         self.los_angle_context_encoder = (
-            CSIAngleContextEncoder(token_norm_mode=los_angle_context_token_norm_mode)
+            CSIAngleContextEncoder(
+                token_norm_mode=los_angle_context_token_norm_mode,
+                d_token=d_token,
+            )
             if use_los_angle_context_encoder
             else None
         )
@@ -915,6 +924,7 @@ class CSIClip(nn.Module):
                 latent_dim=pdp_latent_dim,
                 token_norm_mode=pdp_latent_token_norm_mode,
                 hidden_dim=pdp_latent_hidden_dim,
+                d_token=d_token,
             )
             self.pdp_latent_context_proj = nn.Sequential(
                 nn.LayerNorm(pdp_latent_dim),

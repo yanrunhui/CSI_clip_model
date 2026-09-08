@@ -646,6 +646,20 @@ def build_components_from_samples(
     tokenizer_word2id: dict[str, int] | None = None,
 ):
     source_samples = samples if isinstance(samples, list) else samples.samples
+    if not source_samples:
+        raise ValueError("Cannot build a model from an empty sample collection.")
+    token_shapes = {tuple(sample.tokens.shape[1:]) for sample in source_samples}
+    if len(token_shapes) != 1:
+        raise ValueError(
+            "All training samples must use the same [d_token, n_freq] shape; "
+            f"found {sorted(token_shapes)}."
+        )
+    d_token, _ = next(iter(token_shapes))
+    if d_token <= 0 or d_token % 2 != 0:
+        raise ValueError(
+            "CSI d_token must be a positive even number containing real channels "
+            f"followed by imaginary channels; got d_token={d_token}."
+        )
     tokenizer = CaptionTokenizer()
     if tokenizer_word2id is not None:
         tokenizer.word2id = dict(tokenizer_word2id)
@@ -681,7 +695,7 @@ def build_components_from_samples(
     )
 
     csi_encoder = CSIEncoder(
-        d_token=8,
+        d_token=d_token,
         d_model=384,
         d_clip=256,
         token_norm_mode=token_norm_mode,

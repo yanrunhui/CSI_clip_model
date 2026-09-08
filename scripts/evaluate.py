@@ -1208,6 +1208,33 @@ def evaluate(
             f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
         )
     samples = limited_samples
+    token_shapes = {tuple(sample.tokens.shape[1:]) for sample in samples}
+    if len(token_shapes) != 1:
+        raise ValueError(
+            "All evaluation samples must use the same [d_token, n_freq] shape; "
+            f"found {sorted(token_shapes)}."
+        )
+    d_token, _ = next(iter(token_shapes))
+    if d_token <= 0 or d_token % 2 != 0:
+        raise ValueError(
+            "CSI d_token must be a positive even number containing real channels "
+            f"followed by imaginary channels; got d_token={d_token}."
+        )
+    if checkpoint is not None:
+        checkpoint_input_weight = checkpoint.get("model_state", {}).get(
+            "csi.input_proj.spatial_linear.weight"
+        )
+        if (
+            isinstance(checkpoint_input_weight, torch.Tensor)
+            and checkpoint_input_weight.ndim == 2
+            and int(checkpoint_input_weight.shape[1]) != d_token
+        ):
+            raise ValueError(
+                "Evaluation data/checkpoint token width mismatch: "
+                f"data d_token={d_token}, checkpoint d_token={checkpoint_input_weight.shape[1]}. "
+                "Evaluate native SISO data with a native SISO checkpoint; use "
+                "--checkpoint only during training when transferring array weights."
+            )
     samples, checkpoint_prototype_keys = align_samples_to_checkpoint_prototypes(
         samples,
         checkpoint,
@@ -1231,7 +1258,7 @@ def evaluate(
     )
     model = CSIClip(
         CSIEncoder(
-            d_token=8,
+            d_token=d_token,
             d_model=384,
             d_clip=256,
             token_norm_mode=token_norm_mode,
@@ -1705,6 +1732,7 @@ def evaluate(
         delay_spread_bin_positions=delay_spread_bin_positions if use_delay_spread_bin_head else None,
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
         raw_beta_ns=delay_spread_raw_beta_ns,
         verbose=verbose_diagnostics,
     )
@@ -3460,6 +3488,7 @@ def _print_delay_spread_diagnostics(
     delay_spread_bin_positions: torch.Tensor | None,
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
     raw_beta_ns: float,
     verbose: bool = False,
 ) -> None:
@@ -3549,6 +3578,47 @@ def _print_delay_spread_diagnostics(
             print("delay_context_spread_raw_huber=nan")
     final_delay_spread_mae = float((masked_final_raw - masked_target_raw).abs().mean())
     print(f"delay_spread_MAE={final_delay_spread_mae:.4f}")
+
+    if len(semantic_keys) != len(physics_raw_targets):
+        raise ValueError(
+            "semantic_keys count must match delay-spread prediction count: "
+            f"{len(semantic_keys)} != {len(physics_raw_targets)}"
+        )
+    los_mask = torch.tensor(
+        [key.los_status == "los" for key in semantic_keys],
+        dtype=torch.bool,
+        device=delay_spread_mask.device,
+    )
+
+    def print_los_group(prefix: str, status_mask: torch.Tensor) -> None:
+        mask = delay_spread_mask & status_mask
+        count = int(mask.sum().item())
+        print(f"{prefix}_delay_spread_count={count}")
+        if count == 0:
+            print(f"{prefix}_delay_spread_MAE=nan")
+            print(f"{prefix}_delay_spread_RMSE=nan")
+            print(f"{prefix}_delay_spread_signed_mean=nan")
+            print(f"{prefix}_delay_spread_pearson=nan")
+            return
+        group_prediction = final_physics_raw_predictions[mask, delay_spread_idx]
+        group_target = physics_raw_targets[mask, delay_spread_idx]
+        group_error = group_prediction - group_target
+        print(f"{prefix}_delay_spread_MAE={float(group_error.abs().mean()):.4f}")
+        print(
+            f"{prefix}_delay_spread_RMSE="
+            f"{float(torch.sqrt(group_error.square().mean())):.4f}"
+        )
+        print(
+            f"{prefix}_delay_spread_signed_mean="
+            f"{float(group_error.mean()):.4f}"
+        )
+        print(
+            f"{prefix}_delay_spread_pearson="
+            f"{_safe_pearson(group_prediction, group_target):.4f}"
+        )
+
+    print_los_group("los", los_mask)
+    print_los_group("nlos", ~los_mask)
     if verbose:
         print(f"final_delay_spread_MAE={final_delay_spread_mae:.4f}")
         print(

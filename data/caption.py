@@ -144,6 +144,7 @@ SLOT_VOCAB = {
         "nlos": ["non-line-of-sight", "NLoS", "obstructed"],
     },
     "richness": {
+        "any": ["unspecified"],
         "low": ["low", "sparse", "few"],
         "moderate": ["moderate", "medium", "several"],
         "high": ["high", "rich", "many"],

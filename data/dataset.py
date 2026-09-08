@@ -19,6 +19,7 @@ from .tokenizer import CaptionTokenizer
 
 SEMANTIC_KEY_MODES = (
     "full",
+    "siso",
     "coarse",
     "coarse_delay",
     "coarse_angle",
@@ -320,6 +321,20 @@ def semantic_key_for_mode(
 ) -> SemanticKey:
     if mode == "full":
         return key
+    if mode == "siso":
+        return SemanticKey(
+            env_type=key.env_type,
+            los_status=key.los_status,
+            path_richness="any",
+            ds_bin=key.ds_bin,
+            as_az_bin="any",
+            k_factor_bin=normalize_k_factor_bin(key.k_factor_bin),
+            first_delay_bin=key.first_delay_bin,
+            first_power_bin=key.first_power_bin,
+            first_angle_bin="any",
+            reflection_bin="any",
+            diffraction_bin="any",
+        )
     path_richness = (
         normalize_path_richness(discretize(float(n_paths), PROP_DISC["n_paths"]))
         if n_paths is not None
